@@ -14,7 +14,7 @@ from face_detection import (
     decode_frame, detect_faces, compute_ear, compute_head_pose,
     compute_eye_tilt_rad, compute_brow_heights, estimate_expression,
     check_black_screen, compute_brightness_histogram, landmarks_to_serializable,
-    compute_passive_liveness,
+    compute_passive_liveness, get_face_roi,
 )
 from liveness_checks import (
     check_depth_displacement, check_micro_expressions,
@@ -100,30 +100,29 @@ def process_frame(session: LivenessSession, frame_bytes: bytes, identity_callbac
     pts_478 = face["pts_478"]
     face_width = face["face_width"]
 
-    # ── AGENT VERIFICATION (Every 10 seconds) ──
-    if session.agent_embedding is not None and identity_callback is not None:
-        import time
-        now = time.time()
-        # Initialize check time if 0
-        if session.last_agent_check_time == 0:
-            session.last_agent_check_time = now - 5.0 # Check soon after start
-            
-        if now - session.last_agent_check_time > 10.0:
-            # We use the current image to verify identity
-            is_match = identity_callback(img, session.agent_embedding)
-            session.last_agent_check_time = now
-            if not is_match:
-                print(f"❌ Identity Mismatch: Session person does not match selected agent {session.agent_label}")
-                return {
-                    "status": "processing",
-                    "error": True,
-                    "detail": "Identity Mismatch: User is not the selected agent",
-                    "step": session.step,
-                    "progress": session.progress_pct,
-                    "landmarks": landmarks_to_serializable(pts_68),
-                    "mesh": landmarks_to_serializable(pts_478),
-                    "is_suspicious": True
-                }
+    # ── AGENT VERIFICATION (Disabled) ──
+    # if session.agent_embedding is not None and identity_callback is not None:
+    #     now = time.time()
+    #     # Initialize check time if 0
+    #     if session.last_agent_check_time == 0:
+    #         session.last_agent_check_time = now - 5.0 # Check soon after start
+    #         
+    #     if now - session.last_agent_check_time > 10.0:
+    #         # We use the current image to verify identity
+    #         is_match = identity_callback(img, session.agent_embedding)
+    #         session.last_agent_check_time = now
+    #         if not is_match:
+    #             print(f"❌ Identity Mismatch: Session person does not match selected agent {session.agent_label}")
+    #             return {
+    #                 "status": "processing",
+    #                 "error": True,
+    #                 "detail": "Identity Mismatch: User is not the selected agent",
+    #                 "step": session.step,
+    #                 "progress": session.progress_pct,
+    #                 "landmarks": landmarks_to_serializable(pts_68),
+    #                 "mesh": landmarks_to_serializable(pts_478),
+    #                 "is_suspicious": True
+    #             }
 
     # Store landmarks for history
     session.landmark_history.append(pts_68)
@@ -185,7 +184,6 @@ def process_frame(session: LivenessSession, frame_bytes: bytes, identity_callbac
             session.digital_screen_fail_count = 0
 
     # ── TEMPORAL HISTORY UPDATE ──
-    from face_detection import get_face_roi
     roi = get_face_roi(img, pts_68)
     face_bbox = (int(min([p["x"] for p in pts_68])), int(min([p["y"] for p in pts_68])), 
                  int(face_width), int(max([p["y"] for p in pts_68]) - min([p["y"] for p in pts_68])))

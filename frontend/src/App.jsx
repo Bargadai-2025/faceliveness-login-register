@@ -3,32 +3,15 @@ import FaceMatch from "./FaceMatch";
 import FaceRegister from "./FaceRegister";
 import LoginPage from "./loginpage";
 
-const AUTH_STORAGE_KEY = "facematch_auth";
-
-function readStoredUser() {
-  try {
-    const raw = localStorage.getItem(AUTH_STORAGE_KEY);
-    if (!raw) return null;
-    const data = JSON.parse(raw);
-    if (data && typeof data.email === "string") {
-      return { 
-        email: data.email,
-        agentLabel: data.agentLabel || null
-      };
-    }
-  } catch {
-    /* ignore */
-  }
-  return null;  
-}
-
 function App() {
-  const [user, setUser] = useState(null);
+  // Default user to bypass login
+  const [user, setUser] = useState({ 
+    email: "agent@bargad.ai", 
+    agentLabel: "Authorized Agent" 
+  });
   const [currentPath, setCurrentPath] = useState(window.location.pathname);
 
   useEffect(() => {
-    setUser(readStoredUser());
-    
     // Listen for path changes
     const handleLocationChange = () => {
       setCurrentPath(window.location.pathname);
@@ -40,23 +23,37 @@ function App() {
   const handleLogin = (email, agentLabel) => {
     const next = { email, agentLabel };
     setUser(next);
-    localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(next));
+    // Removed localStorage.setItem as per user request
   };
 
   const handleLogout = () => {
     setUser(null);
-    localStorage.removeItem(AUTH_STORAGE_KEY);
+    // Removed localStorage.removeItem as per user request
   };
 
-  if (!user) {
+  // Routing logic
+  if (currentPath === "/login") {
     return <LoginPage onLogin={handleLogin} />;
   }
 
   if (currentPath === "/register") {
-    return <FaceRegister userEmail={user.email} userAgentLabel={user.agentLabel} onLogout={handleLogout} />;
+    return (
+      <FaceRegister
+        userEmail={user?.email}
+        userAgentLabel={user?.agentLabel}
+        onLogout={handleLogout}
+      />
+    );
   }
 
-  return <FaceMatch userEmail={user.email} userAgentLabel={user.agentLabel} onLogout={handleLogout} />;
+  // Default to FaceMatch
+  return (
+    <FaceMatch
+      userEmail={user?.email}
+      userAgentLabel={user?.agentLabel}
+      onLogout={handleLogout}
+    />
+  );
 }
 
 export default App;

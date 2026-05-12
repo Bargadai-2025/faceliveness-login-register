@@ -53,12 +53,12 @@ const CHALLENGE_UI = {
   raise_eyebrows_hold: { label: "Raise brows & HOLD", icon: Activity },
 };
 
+let sessionDeviceId = null;
 function getOrCreateDeviceId() {
-  try {
-    let id = localStorage.getItem(DEVICE_KEY);
-    if (!id) { id = crypto.randomUUID(); localStorage.setItem(DEVICE_KEY, id); }
-    return id;
-  } catch { return `anon_${Date.now()}`; }
+  if (!sessionDeviceId) {
+    sessionDeviceId = `session_${crypto.randomUUID().slice(0, 8)}`;
+  }
+  return sessionDeviceId;
 }
 
 const getColor = (conf) => {
@@ -677,12 +677,7 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
 
       if (data.error) {
         console.error("❌ Match error from backend:", data.error);
-        if (data.error.includes("Digital screen") || data.error.includes("Security Alert")) {
-          setErrcount(prev => prev + 10);
-          setRejectionError(data.error);
-        } else {
-          setError(data.error);
-        }
+        setError(data.error);
         setProgress(0);
       } else {
         console.log("✅ Match successful", data.matches?.length, "results");
@@ -1005,7 +1000,7 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
         {error && <div className="fm-error"><AlertTriangle size={16} style={{ marginRight: 8 }} /> {error}</div>}
 
         {results.length > 0 && !loading ? (
-          (results[0].confidence * 100).toFixed(0) >= 60 ? (
+          (results[0].confidence * 100).toFixed(0) >= 70 ? (
             <div>
               <div className="fm-verification-summary-bar">
                 <div className="fm-verified-badge">
@@ -1143,17 +1138,7 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
           )
         ) : null}
 
-        {rejectionError && (
-          <div className="fm-modal fm-rejection-modal" onClick={() => setRejectionError(null)}>
-            <div className="fm-modal-box fm-rejection-box" onClick={(e) => e.stopPropagation()}>
-              <div className="fm-rejection-icon"><AlertOctagon size={64} color="#ff0000" /></div>
-              <h2>Security Rejection</h2>
-              <p>{rejectionError}</p>
-              <div className="fm-rejection-warning">Our system has detected a potential fraud attempt using an electronic device or non-live media. Access to biometric matching is blocked.</div>
-              <button className="fm-modal-close fm-rejection-close" onClick={() => setRejectionError(null)}>✕ Close</button>
-            </div>
-          </div>
-        )}
+        {/* Rejection Modal Removed as per user request to show inline table instead */}
       </div>
       <div className="fm-footer-branding"><img src={bargadBranding} alt="Bargad" /></div>
     </div>

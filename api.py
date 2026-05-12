@@ -144,7 +144,7 @@ async def _shutdown():
 @app.get("/agents/list")
 async def list_agents():
     """Returns a list of 5 specific agents for the login demo."""
-    agent_labels = ["Angel Mary","Topendra Sir","Bhakti Shelar", "Divya Pratap", "Manish Kalantre","Pranali Patil", "Tauheed Ahmed", "Yash Jadhav", "Yogesh Shivtarkar" ,"Manas Vellalore", "Atal_Bihari_Vajpayee"]
+    agent_labels = ["Angel Mary","Topendra Sir","Bhakti Shelar", "Divya Pratap", "Manish Kalantre","Pranali Patil", "Tauheed Ahmed", "Yash Jadhav", "Yogesh Shivtarkar" ,"Manas Vellalore", "Atal_Bihari_Vajpayee", "salman khan"]
     
     # Fetch details from DB
     agents = await get_faces_by_labels(agent_labels)
@@ -652,9 +652,9 @@ async def match_face(
                 for r in results:
                     r["confidence"] = max(0.0, round(r["confidence"] - penalty, 3))
             
-            # HARD REJECTION: If total match after penalty is still too low despite high similarity
-            if errcount >= 20:
-                return {"error": "Security Alert: High risk of digital spoofing detected during session. Matching blocked."}
+            # Removed hard rejection as per user request to show penalty table instead
+            # if errcount >= 20:
+            #     return {"error": "Security Alert: High risk of digital spoofing detected during session. Matching blocked."}
             
             # Re-sort results
             results.sort(key=lambda x: x["confidence"], reverse=True)
@@ -674,19 +674,19 @@ async def match_face(
         if not results:
             return {"error": "No confident match found in the dataset."}
 
-        # Identity Verification Check
-        if expected_label and results:
-            top_label = results[0]["label"].lower().strip()
-            target_label = expected_label.lower().strip()
-            # Handle underscores/spaces mismatch
-            top_label = top_label.replace("_", " ")
-            target_label = target_label.replace("_", " ")
-            
-            if top_label != target_label:
-                print(f"❌ Identity Mismatch: Expected '{target_label}', but matched '{top_label}' ({results[0]['confidence']*100:.0f}%)")
-                return {
-                    "error": f"Identity mismatch. You are matched as {results[0]['label']} ({results[0]['confidence']*100:.0f}%), but you are logged in as {expected_label}. Please use the correct account."
-                }
+        # Identity Verification Check (Disabled as per user request to allow anyone to match)
+        # if expected_label and results:
+        #     top_label = results[0]["label"].lower().strip()
+        #     target_label = expected_label.lower().strip()
+        #     # Handle underscores/spaces mismatch
+        #     top_label = top_label.replace("_", " ")
+        #     target_label = target_label.replace("_", " ")
+        #     
+        #     if top_label != target_label:
+        #         print(f"❌ Identity Mismatch: Expected '{target_label}', but matched '{top_label}' ({results[0]['confidence']*100:.0f}%)")
+        #         return {
+        #             "error": f"Identity mismatch. You are matched as {results[0]['label']} ({results[0]['confidence']*100:.0f}%), but you are logged in as {expected_label}. Please use the correct account."
+        #         }
 
         if liveness_session_id:
             await update_liveness_session_status(

@@ -54,12 +54,12 @@ const CHALLENGE_UI = {
   raise_eyebrows_hold: { label: "Raise brows & HOLD", icon: Activity },
 };
 
+let sessionDeviceId = null;
 function getOrCreateDeviceId() {
-  try {
-    let id = localStorage.getItem(DEVICE_KEY);
-    if (!id) { id = crypto.randomUUID(); localStorage.setItem(DEVICE_KEY, id); }
-    return id;
-  } catch { return `anon_${Date.now()}`; }
+  if (!sessionDeviceId) {
+    sessionDeviceId = `session_${crypto.randomUUID().slice(0, 8)}`;
+  }
+  return sessionDeviceId;
 }
 
 export default function FaceRegister({ userEmail, userAgentLabel, onLogout }) {
