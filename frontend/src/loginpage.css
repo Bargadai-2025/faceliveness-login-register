@@ -22,10 +22,34 @@
   border-color: rgba(255, 255, 255, 0.35);
   border-style: solid;
 }
-.lp-corner-tl { top: 0; left: 0; border-width: 2px 0 0 2px; border-radius: 16px 0 0 0; }
-.lp-corner-tr { top: 0; right: 0; border-width: 2px 2px 0 0; border-radius: 0 16px 0 0; }
-.lp-corner-bl { bottom: 0; left: 0; border-width: 0 0 2px 2px; border-radius: 0 0 0 16px; }
-.lp-corner-br { bottom: 0; right: 0; border-width: 0 2px 2px 0; border-radius: 0 0 16px 0; }
+
+.lp-corner-tl {
+  top: 0;
+  left: 0;
+  border-width: 2px 0 0 2px;
+  border-radius: 16px 0 0 0;
+}
+
+.lp-corner-tr {
+  top: 0;
+  right: 0;
+  border-width: 2px 2px 0 0;
+  border-radius: 0 16px 0 0;
+}
+
+.lp-corner-bl {
+  bottom: 0;
+  left: 0;
+  border-width: 0 0 2px 2px;
+  border-radius: 0 0 0 16px;
+}
+
+.lp-corner-br {
+  bottom: 0;
+  right: 0;
+  border-width: 0 2px 2px 0;
+  border-radius: 0 0 16px 0;
+}
 
 .lp-shields {
   position: absolute;
@@ -85,9 +109,11 @@
   outline: none;
   transition: border-color 0.2s;
 }
+
 .lp-input::placeholder {
   color: #4b5563;
 }
+
 .lp-input:focus {
   border-color: #24aa4d;
 }
@@ -110,6 +136,7 @@
   align-items: center;
   justify-content: center;
 }
+
 .lp-toggle-eye:hover {
   color: #fff;
 }
@@ -146,9 +173,11 @@
   box-shadow: 0 5px 20px rgba(36, 170, 77, 0.28);
   transition: transform 0.15s, filter 0.15s;
 }
+
 .lp-btn-login:hover {
   filter: brightness(1.06);
 }
+
 .lp-btn-login:active {
   transform: scale(0.99);
 }
@@ -186,4 +215,49 @@
   border: 4px solid #000;
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
   color: #000;
+}
+
+/* Agent Select Styles */
+.lp-select-wrap {
+  position: relative;
+  width: 100%;
+}
+
+.lp-select {
+  appearance: none;
+  cursor: pointer;
+  background: rgba(36, 170, 77, 0.08);
+  border: 1px solid rgba(36, 170, 77, 0.4);
+}
+
+.lp-select:hover {
+  border-color: #24aa4d;
+  background: rgba(36, 170, 77, 0.12);
+}
+
+.lp-select-icon {
+  position: absolute;
+  right: 18px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: #24aa4d;
+  font-size: 10px;
+  pointer-events: none;
+}
+
+.lp-badge {
+  background: #24aa4d;
+  color: #fff;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 8px;
+  margin-left: 6px;
+  vertical-align: middle;
+}
+
+@media screen and (max-width: 768px) {
+  .lp-frame {
+    position: relative;
+    padding: 48px 12px 56px;
+  }
 }

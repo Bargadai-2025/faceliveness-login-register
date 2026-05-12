@@ -1,0 +1,373 @@
+"""
+Liveness verification checks: depth, micro-expression, gestures, light, timing, device detection.
+"""
+import time
+import math
+import cv2
+import numpy as np
+from typing import Dict, List, Optional, Any, Tuple
+
+from face_detection import (
+    compute_ear, compute_mar, compute_head_pose, compute_eye_tilt_rad,
+    compute_brow_heights, compute_lip_pucker_ratio, estimate_expression,
+    compute_brightness_histogram,
+)
+
+SUSTAINED_FRAMES = 3
+HOLD_DURATION_SEC = 1.0
+
+
+# ═══════════════════════════════════════════════════════
+# DEPTH ESTIMATION (Step 2)
+# ═══════════════════════════════════════════════════════
+def check_depth_displacement(landmark_history: List[List[Dict]]) -> Tuple[bool, float]:
+    """
+    Compare displacement of nose_tip vs eyes vs ears across frames.
+    Real face: nose > eye > ear displacement (parallax).
+    Flat screen: all ~equal.
+    """
+    if len(landmark_history) < 5:
+        return True, 1.0  # Not enough data yet
+
+    def displacement(pts_list, idx):
+        xs = [pts[idx]["x"] for pts in pts_list[-10:]]
+        ys = [pts[idx]["y"] for pts in pts_list[-10:]]
+        return math.hypot(max(xs) - min(xs), max(ys) - min(ys))
+
+    nose_d = displacement(landmark_history, 30)
+    left_eye_d = displacement(landmark_history, 36)
+    right_eye_d = displacement(landmark_history, 45)
+    eye_avg = (left_eye_d + right_eye_d) / 2
+
+    # For a real face with natural movement, nose moves more than eyes
+    if nose_d < 1.0 and eye_avg < 1.0:
+        return True, 0.5  # Too little movement to judge
+
+    ratio = nose_d / (eye_avg + 1e-6)
+    # Real face: ratio > 1.15, flat: ratio ≈ 1.0
+    # Stricter check for screen/print spoofing
+    is_3d = ratio > 1.15
+    score = min(ratio / 1.5, 1.0)
+    return is_3d, round(score, 3)
+
+
+# ═══════════════════════════════════════════════════════
+# MICRO EXPRESSION (Step 4)
+# ═══════════════════════════════════════════════════════
+def check_micro_expressions(landmark_history: List[List[Dict]]) -> Tuple[bool, float]:
+    """
+    Track eye jitter, lip twitch, micro-blink — natural micro-movements.
+    Photos/replays lack these subtle variations.
+    """
+    if len(landmark_history) < 15:
+        return True, 0.5
+
+    recent = landmark_history[-15:]
+
+    # Eye jitter — small random movement in eye landmarks
+    left_eye_xs = [pts[37]["x"] for pts in recent]
+    left_eye_ys = [pts[37]["y"] for pts in recent]
+    jitter_x = float(np.std(left_eye_xs))
+    jitter_y = float(np.std(left_eye_ys))
+    jitter = math.hypot(jitter_x, jitter_y)
+
+    # Lip micro-movement
+    lip_ys = [pts[62]["y"] for pts in recent]
+    lip_var = float(np.std(lip_ys))
+
+    # Nose tip micro-movement (natural head sway)
+    nose_xs = [pts[30]["x"] for pts in recent]
+    nose_ys = [pts[30]["y"] for pts in recent]
+    nose_var = math.hypot(float(np.std(nose_xs)), float(np.std(nose_ys)))
+
+    # Combined micro-movement score
+    total_variance = jitter + lip_var * 0.5 + nose_var * 0.3
+
+    # Very still = suspicious (photo/replay)
+    has_micro = total_variance > 0.55
+    score = min(total_variance / 2.0, 1.0)
+    return has_micro, round(score, 3)
+
+
+# ═══════════════════════════════════════════════════════
+# LIGHT CHALLENGE (Step 3)
+# ═══════════════════════════════════════════════════════
+def check_light_response(
+    pre_stats: List[Dict[str, float]],
+    post_stats: List[Dict[str, float]],
+    challenge_color: str,
+) -> Tuple[bool, float]:
+    """
+    Compare brightness/color before and after light flash.
+    Real face reflects light differently; screens show minimal change.
+    """
+    if not pre_stats or not post_stats:
+        return True, 0.5
+
+    pre_bright = np.mean([s["brightness"] for s in pre_stats])
+    post_bright = np.mean([s["brightness"] for s in post_stats])
+    bright_delta = abs(post_bright - pre_bright)
+
+    pre_sat = np.mean([s["saturation"] for s in pre_stats])
+    post_sat = np.mean([s["saturation"] for s in post_stats])
+    sat_delta = abs(post_sat - pre_sat)
+
+    # Real skin reflects flash → brightness changes noticeably
+    if challenge_color in ("white_flash", "brightness_up"):
+        passed = bright_delta > 3.0
+    elif challenge_color in ("blue_flash", "green_flash"):
+        passed = bright_delta > 2.0 or sat_delta > 2.0
+    else:
+        passed = bright_delta > 2.5
+
+    score = min((bright_delta + sat_delta) / 20.0, 1.0)
+    return passed, round(score, 3)
+
+
+# ═══════════════════════════════════════════════════════
+# REACTION TIMING (Step 6)
+# ═══════════════════════════════════════════════════════
+def check_reaction_timing(reaction_times: List[float]) -> Tuple[bool, str]:
+    """
+    Verify reaction times are human-like (300ms - 2000ms).
+    Too fast = bot/script; Too slow = may be replaying.
+    """
+    if not reaction_times:
+        return True, "no_data"
+    for rt in reaction_times:
+        if rt < 0.15:
+            return False, f"Too fast: {rt:.3f}s"
+        if rt > 8.0:
+            return False, f"Too slow: {rt:.3f}s"
+    return True, "ok"
+
+
+# ═══════════════════════════════════════════════════════
+# GESTURE EVALUATION (Step 5) — All 31 gestures
+# ═══════════════════════════════════════════════════════
+def evaluate_gesture(
+    gesture_id: str,
+    pts_68: List[Dict],
+    baseline: Dict[str, Any],
+    session: Any,
+) -> bool:
+    """Evaluate whether the current frame satisfies the given gesture."""
+    face_w = baseline.get("face_width", 100)
+    base_nose_cx = baseline.get("nose_center_x", 0)
+    base_nose_y = baseline.get("nose_tip_y", 0)
+    base_left_ear = baseline.get("left_ear", 0.25)
+    base_right_ear = baseline.get("right_ear", 0.25)
+    base_eye_angle = baseline.get("eye_angle", 0)
+    base_left_brow_y = baseline.get("left_brow_y", 0)
+    base_right_brow_y = baseline.get("right_brow_y", 0)
+    base_face_width = baseline.get("face_width", 100)
+
+    face_center_x = (pts_68[0]["x"] + pts_68[16]["x"]) / 2
+    nose_offset = pts_68[30]["x"] - face_center_x
+    cur_nose_y = pts_68[30]["y"]
+
+    left_ear_val = compute_ear(pts_68, 36)
+    right_ear_val = compute_ear(pts_68, 42)
+    mar_val = compute_mar(pts_68)
+    expr = estimate_expression(pts_68, baseline)
+    cur_eye_angle = compute_eye_tilt_rad(pts_68)
+    cur_face_w = abs(pts_68[16]["x"] - pts_68[0]["x"])
+    pose = compute_head_pose(pts_68, (480, 640))  # approx
+
+    # Helper
+    def _threshold(frac, minimum):
+        return max(minimum, face_w * frac)
+
+    # ── Original 18 gestures ──
+    if gesture_id == "turn_left":
+        delta = nose_offset - base_nose_cx
+        return delta > _threshold(0.045, 3)
+
+    elif gesture_id == "turn_right":
+        delta = base_nose_cx - nose_offset
+        return delta > _threshold(0.045, 3)
+
+    elif gesture_id == "nod":
+        delta = cur_nose_y - base_nose_y
+        return delta > _threshold(0.04, 4)
+
+    elif gesture_id == "look_up":
+        delta = base_nose_y - cur_nose_y
+        return delta > _threshold(0.04, 4)
+
+    elif gesture_id == "smile":
+        return expr["smile_score"] > 0.22
+
+    elif gesture_id == "surprised":
+        return expr["surprised"] > 0.22
+
+    elif gesture_id == "mouth_open":
+        return mar_val > 0.25
+
+
+    elif gesture_id == "wide_eyes":
+        return (left_ear_val > base_left_ear * 1.05 and
+                right_ear_val > base_right_ear * 1.05)
+
+    elif gesture_id == "blink_both":
+        is_closed = (left_ear_val < base_left_ear * 0.92 or
+                     right_ear_val < base_right_ear * 0.92)
+        return is_closed
+
+    elif gesture_id == "raise_eyebrows":
+        lb, rb = compute_brow_heights(pts_68)
+        left_move = base_left_brow_y - lb
+        right_move = base_right_brow_y - rb
+        thresh = face_w * 0.025
+        return left_move > thresh and right_move > thresh
+
+    elif gesture_id == "pucker_lips":
+        ratio = compute_lip_pucker_ratio(pts_68)
+        return ratio > 0.25
+
+    elif gesture_id == "frown":
+        # Detect by mouth corner droop or brow lowering
+        corner_y = (pts_68[48]["y"] + pts_68[54]["y"]) / 2
+        center_y = pts_68[62]["y"]
+        return corner_y > center_y + face_w * 0.015
+
+    elif gesture_id == "move_closer":
+        return cur_face_w > base_face_width * 1.12
+
+    elif gesture_id == "move_farther":
+        return cur_face_w < base_face_width * 0.88
+
+    elif gesture_id == "shake_head":
+        session.shake_history.append(nose_offset)
+        if len(session.shake_history) > 20:
+            session.shake_history = session.shake_history[-20:]
+        if len(session.shake_history) >= 12:
+            amp = max(session.shake_history) - min(session.shake_history)
+            if amp > face_w * 0.10:
+                last = session.shake_history[-1]
+                prev = session.shake_history[-3] if len(session.shake_history) >= 3 else 0
+                if (last > 0 and prev < 0) or (last < 0 and prev > 0):
+                    session.shake_completed = True
+        return session.shake_completed
+
+    # ── Advanced anti-spoof 13 ──
+    elif gesture_id == "blink_twice_fast":
+        is_closed = (left_ear_val < base_left_ear * 0.9 or
+                     right_ear_val < base_right_ear * 0.9)
+        if is_closed and not session.was_blink_closed:
+            session.blink_count += 1
+            session.was_blink_closed = True
+        elif not is_closed:
+            session.was_blink_closed = False
+        return session.blink_count >= 2
+
+    elif gesture_id in ("look_left_hold", "look_right_hold",
+                        "look_up_hold", "look_down_hold"):
+        direction = gesture_id.replace("look_", "").replace("_hold", "")
+        if direction == "left":
+            ok = (nose_offset - base_nose_cx) > _threshold(0.045, 3)
+        elif direction == "right":
+            ok = (base_nose_cx - nose_offset) > _threshold(0.045, 3)
+        elif direction == "up":
+            ok = (base_nose_y - cur_nose_y) > _threshold(0.035, 3)
+        else:  # down
+            ok = (cur_nose_y - base_nose_y) > _threshold(0.035, 3)
+        if ok:
+            if session.hold_start_time is None:
+                session.hold_start_time = time.time()
+            return (time.time() - session.hold_start_time) >= HOLD_DURATION_SEC
+        else:
+            session.hold_start_time = None
+            return False
+
+    elif gesture_id == "head_forward":
+        return cur_face_w > base_face_width * 1.12
+
+    elif gesture_id == "head_backward":
+        return cur_face_w < base_face_width * 0.88
+
+    elif gesture_id == "eye_left_right":
+        # Detect rapid eye movement (look left then right)
+        session.shake_history.append(nose_offset)
+        if len(session.shake_history) > 15:
+            session.shake_history = session.shake_history[-15:]
+        if len(session.shake_history) >= 8:
+            amp = max(session.shake_history) - min(session.shake_history)
+            return amp > face_w * 0.05
+        return False
+
+    elif gesture_id == "smile_then_blink":
+        # We use session.was_blink_closed as a 'smile detected' latch
+        if not session.was_blink_closed:
+            # Phase 1: detect smile first
+            if expr["smile_score"] > 0.4:
+                session.was_blink_closed = True
+                return False
+        else:
+            # Phase 2: now detect blink
+            is_closed = (left_ear_val < base_left_ear * 0.88 or
+                         right_ear_val < base_right_ear * 0.88)
+            if is_closed:
+                return True
+        return False
+
+    elif gesture_id == "blink_then_turn_left":
+        if not session.was_blink_closed:
+            is_closed = (left_ear_val < base_left_ear * 0.85 and
+                         right_ear_val < base_right_ear * 0.85)
+            if is_closed:
+                session.was_blink_closed = True
+                session.hold_start_time = time.time()
+        else:
+            delta = base_nose_cx - nose_offset
+            if delta > _threshold(0.075, 4):
+                return True
+        return False
+
+    elif gesture_id == "raise_eyebrows_hold":
+        lb, rb = compute_brow_heights(pts_68)
+        left_move = base_left_brow_y - lb
+        right_move = base_right_brow_y - rb
+        thresh = face_w * 0.035
+        ok = left_move > thresh and right_move > thresh
+        if ok:
+            if session.hold_start_time is None:
+                session.hold_start_time = time.time()
+            return (time.time() - session.hold_start_time) >= HOLD_DURATION_SEC
+        else:
+            session.hold_start_time = None
+            return False
+
+
+    return False
+
+
+# ── Advanced Anti-Screen / Emissive Detection ──
+
+def check_temporal_flicker(luminance_history: List[float], fps: float = 15.0) -> Tuple[bool, float]:
+    """
+    Run FFT on luminance history to detect peaks in 50-70Hz range (aliasing).
+    Screens often alias with camera shutter.
+    """
+    if len(luminance_history) < 20: return False, 0.0
+    
+    # Detrend
+    y = np.array(luminance_history)
+    y = y - np.mean(y)
+    
+    n = len(y)
+    freqs = np.fft.rfftfreq(n, d=1/fps)
+    magnitudes = np.abs(np.fft.rfft(y))
+    
+    # Looking for flickering signal (e.g. 50Hz/60Hz aliased to lower frequencies)
+    # Most aliasing appears in 0.5Hz - 5Hz range in short windows
+    mask = (freqs > 0.5) & (freqs < 6.0)
+    if not np.any(mask): return False, 0.0
+    
+    peak_val = np.max(magnitudes[mask])
+    total_val = np.sum(magnitudes) + 1e-6
+    ratio = peak_val / total_val
+    
+    # Peak power threshold
+    is_flickering = ratio > 0.42
+    return is_flickering, round(float(ratio), 3)

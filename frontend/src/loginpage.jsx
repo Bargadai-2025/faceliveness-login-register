@@ -1,27 +1,6 @@
 import React, { useState } from "react";
 import "./loginpage.css";
 
-/** Allowed logins (client-side only — credentials ship in the bundle). */
-const ALLOWED_USERS = [
-  { email: "support@bargad.ai", password: "Bargad@2025" },
-  {
-    email: "srenivas.venkiteswaran@poonawallafincorp.com",
-    password: "Srenivas.v@2026",
-  },
-];
-
-function normalizeEmail(s) {
-  return String(s || "").trim().toLowerCase();
-}
-
-function validateLogin(emailRaw, passwordRaw) {
-  const email = normalizeEmail(emailRaw);
-  const password = String(passwordRaw || "");
-  return ALLOWED_USERS.some(
-    (u) => normalizeEmail(u.email) === email && u.password === password
-  );
-}
-
 function ShieldSVG({ large }) {
   const size = large ? 64 : 32;
   return (
@@ -42,22 +21,6 @@ function ShieldSVG({ large }) {
   );
 }
 
-function EyeIcon({ open }) {
-  if (open) {
-    return (
-      <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="1.5">
-        <path strokeLinecap="round" strokeLinejoin="round" d="M3.98 8.223A10.477 10.477 0 0 0 1.934 12C3.226 16.338 7.244 19.5 12 19.5c4.756 0 8.773-3.162 10.065-7.777a10.44 10.44 0 0 0-2.044-3.777M6.228 6.228A10.45 10.45 0 0 1 12 4.5c4.756 0 8.773 3.162 10.065 7.777a10.46 10.46 0 0 1-1.67 3.05M6.228 6.228 3 3m3.228 3.228 3.65 3.65m7.894 7.894L21 21m-3.228-3.228-3.65-3.65m0 0a3 3 0 1 0-4.244-4.244m4.242 4.242L9.88 9.88" />
-      </svg>
-    );
-  }
-  return (
-    <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="1.5">
-      <path strokeLinecap="round" strokeLinejoin="round" d="M2.036 12.322a1.012 1.012 0 0 1 0-.639C3.423 7.51 7.36 4.5 12 4.5c4.638 0 8.573 3.007 9.963 7.178.07.207.07.431 0 .639C20.577 16.49 16.64 19.5 12 19.5c-4.638 0-8.573-3.007-9.963-7.178Z" />
-      <path strokeLinecap="round" strokeLinejoin="round" d="M15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z" />
-    </svg>
-  );
-}
-
 function FingerprintIcon() {
   return (
     <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" width="28" height="28">
@@ -71,29 +34,46 @@ function FingerprintIcon() {
 }
 
 /**
- * @param {{ onLogin: (email: string) => void }} props
+ * @param {{ onLogin: (email: string, agentLabel: string) => void }} props
+ */
+/**
+ * @param {{ onLogin: (email: string, agentLabel: string) => void }} props
  */
 export default function LoginPage({ onLogin }) {
-  const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("");
-  const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState("");
+  
+  const [agents, setAgents] = useState([]);
+  const [selectedAgent, setSelectedAgent] = useState("");
+  const [loadingAgents, setLoadingAgents] = useState(true);
+
+  const API_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
+
+  React.useEffect(() => {
+    async function fetchAgents() {
+      try {
+        const res = await fetch(`${API_URL}/agents/list`);
+        if (!res.ok) throw new Error("Failed to load agents");
+        const data = await res.json();
+        setAgents(data);
+        if (data.length > 0) setSelectedAgent(data[0].label);
+      } catch (e) {
+        console.error("Agent fetch error:", e);
+      } finally {
+        setLoadingAgents(false);
+      }
+    }
+    fetchAgents();
+  }, [API_URL]);
 
   const handleSubmit = (e) => {
     e.preventDefault();
     setError("");
-    if (!email.trim() || !password) {
-      setError("Enter email and password.");
+    if (!selectedAgent) {
+      setError("Please select an agent to proceed.");
       return;
     }
-    if (!validateLogin(email, password)) {
-      setError("Invalid email or password.");
-      return;
-    }
-    const canonical = ALLOWED_USERS.find(
-      (u) => normalizeEmail(u.email) === normalizeEmail(email)
-    );
-    onLogin(canonical ? canonical.email : email.trim());
+    // Log in using the agent's label as their identity
+    onLogin(selectedAgent, selectedAgent);
   };
 
   return (
@@ -111,67 +91,52 @@ export default function LoginPage({ onLogin }) {
         </div>
 
         <div className="lp-card">
-          <h2 className="lp-title">Login</h2>
+          <h2 className="lp-title">Agent Portal</h2>
 
           <form onSubmit={handleSubmit}>
             <div className="lp-field">
-              <label className="lp-label" htmlFor="lp-email">
-                Email
+              <label className="lp-label" htmlFor="lp-agent">
+                Select Identity <span className="lp-badge">Authorized</span>
               </label>
-              <input
-                id="lp-email"
-                type="email"
-                autoComplete="username"
-                className="lp-input"
-                placeholder="Enter your email"
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-              />
-            </div>
-
-            <div className="lp-field">
-              <label className="lp-label" htmlFor="lp-password">
-                Password
-              </label>
-              <div className="lp-password-wrap">
-                <input
-                  id="lp-password"
-                  type={showPassword ? "text" : "password"}
-                  autoComplete="current-password"
-                  className="lp-input"
-                  placeholder="Enter your password"
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  style={{ paddingRight: 48 }}
-                />
-                <button
-                  type="button"
-                  className="lp-toggle-eye"
-                  aria-label={showPassword ? "Hide password" : "Show password"}
-                  onClick={() => setShowPassword((v) => !v)}
+              <div className="lp-select-wrap">
+                <select
+                  id="lp-agent"
+                  className="lp-input lp-select"
+                  value={selectedAgent}
+                  onChange={(e) => setSelectedAgent(e.target.value)}
+                  disabled={loadingAgents}
                 >
-                  <EyeIcon open={showPassword} />
-                </button>
+                  {loadingAgents ? (
+                    <option>Loading authorized agents...</option>
+                  ) : (
+                    agents.map((a) => (
+                      <option key={a.label} value={a.label} style={{ color: "#000" }}>
+                        {a.label}
+                      </option>
+                    ))
+                  )}
+                </select>
+                <div className="lp-select-icon">▼</div>
               </div>
             </div>
 
             <div className="lp-row-options">
               <label className="lp-remember">
-                <input type="checkbox" disabled style={{ accentColor: "#24aa4d" }} />
-                Remember me
+                <input type="checkbox" checked readOnly style={{ accentColor: "#24aa4d" }} />
+                Secure Session
               </label>
-              <span style={{ opacity: 0.6 }}>Forgot password?</span>
+              <span style={{ opacity: 0.6 }}>Auth-V2</span>
             </div>
 
             {error ? <div className="lp-error">{error}</div> : null}
 
-            <button type="submit" className="lp-btn-login">
-              Login
+            <button type="submit" className="lp-btn-login" disabled={loadingAgents}>
+              Proceed to Dashboard
             </button>
           </form>
 
           <p className="lp-help">
-            Please contact administrator, in case you are unable to login
+            Select your assigned agent ID to begin liveness verification.
           </p>
         </div>
 

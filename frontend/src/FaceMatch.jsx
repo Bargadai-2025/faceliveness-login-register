@@ -1,11 +1,17 @@
 import React, { useState, useRef, useEffect, useCallback } from "react";
-import * as faceapi from "face-api.js";
 import "./FaceMatch.css";
 import bargadLogo from "./bargad-logo.png";
 import bargadBranding from "./bargad-branding (1).svg?url";
 import { MapContainer, TileLayer, Marker } from "react-leaflet";
 import "leaflet/dist/leaflet.css";
 import L from "leaflet";
+import {
+  Target, Layers, Sun, Activity,
+  ArrowLeft, ArrowRight, ArrowUp, ArrowDown,
+  Smile, Eye, Maximize, UserCheck, AlertOctagon, Info,
+  Camera, MapPin, AlertTriangle,
+  Search
+} from "lucide-react";
 
 delete L.Icon.Default.prototype._getIconUrl;
 L.Icon.Default.mergeOptions({
@@ -15,192 +21,144 @@ L.Icon.Default.mergeOptions({
 });
 
 const API_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
-/** Match API can be slow (Render cold start, large DB scan). */
-const MATCH_REQUEST_TIMEOUT_MS = 30_000;
-
 const DEVICE_KEY = "facematch_device_id";
-const SUSTAINED_FRAMES = 4;
-/** Fewer calibration frames = faster start; median still stabilizes pose. */
-const CALIBRATION_FRAMES = 10;
-/** Faster liveness sampling (ms). */
-const LIVENESS_INTERVAL_MS = 100;
-/** Mesh redraw less often so landmark+expression work gets more CPU budget. */
-const MESH_INTERVAL_MS = 650;
-/** Larger TinyFaceDetector input = stabler landmarks for tilt / eyes (tradeoff: more GPU/CPU). */
-const LIVENESS_FACE_INPUT_SIZE = 416;
-const MESH_FACE_INPUT_SIZE = 288;
-const LIVENESS_SCORE_THRESHOLD = 0.28;
+const FRAME_INTERVAL_MS = 120;
 
-/** Gesture ids are issued by the server; labels here must stay in sync with `ALL_GESTURE_IDS` in api.py. */
-const CHALLENGE_TEXT = {
-  turn_left: "↩️ Turn your head LEFT",
-  turn_right: "↪️ Turn your head RIGHT",
-  nod: "↕️ NOD your head down",
-  look_up: "⬆️ LOOK slightly up",
-  smile: "😊 Please SMILE",
-  surprised: "😲 Look SURPRISED",
-  mouth_open: "😮 OPEN your mouth wide",
-  tilt_head: "↔️ TILT head toward one shoulder (one brow slightly higher)",
-  wide_eyes: "👀 OPEN your eyes wide (look alert)",
+const CHALLENGE_UI = {
+  turn_left: { label: "Turn your head LEFT", icon: ArrowLeft },
+  turn_right: { label: "Turn your head RIGHT", icon: ArrowRight },
+  nod: { label: "NOD your head down", icon: ArrowDown },
+  look_up: { label: "LOOK slightly up", icon: ArrowUp },
+  smile: { label: "SMILE", icon: Smile },
+  // surprised: { label: "Look SURPRISED", icon: Smile },
+  mouth_open: { label: "OPEN your mouth wide", icon: Smile },
+  // wide_eyes: { label: "OPEN eyes wide", icon: Eye },
+  blink_both: { label: "BLINK both eyes", icon: Eye },
+  // raise_eyebrows: { label: "Raise your EYEBROWS", icon: Activity },
+  // pucker_lips: { label: "PUCKER your lips", icon: Smile },
+  // frown: { label: "FROWN (sad face)", icon: Smile },
+  move_closer: { label: "Move CLOSER", icon: Maximize },
+  move_farther: { label: "Move FARTHER", icon: Maximize },
+  shake_head: { label: "Shake head NO", icon: Activity },
+  // blink_twice_fast: { label: "BLINK twice fast", icon: Eye },
+  look_left_hold: { label: "Look LEFT & HOLD", icon: ArrowLeft },
+  look_right_hold: { label: "Look RIGHT & HOLD", icon: ArrowRight },
+  look_up_hold: { label: "Look UP & HOLD", icon: ArrowUp },
+  look_down_hold: { label: "Look DOWN & HOLD", icon: ArrowDown },
+  head_forward: { label: "Move head FORWARD", icon: ArrowUp },
+  head_backward: { label: "Move head BACKWARD", icon: ArrowDown },
+  // eye_left_right: { label: "Move eyes L to R", icon: Eye },
+  // smile_then_blink: { label: "SMILE then BLINK", icon: Smile },
+  // blink_then_turn_left: { label: "BLINK then turn LEFT", icon: Eye },
+  raise_eyebrows_hold: { label: "Raise brows & HOLD", icon: Activity },
 };
 
 function getOrCreateDeviceId() {
   try {
     let id = localStorage.getItem(DEVICE_KEY);
-    if (!id) {
-      id = crypto.randomUUID();
-      localStorage.setItem(DEVICE_KEY, id);
-    }
+    if (!id) { id = crypto.randomUUID(); localStorage.setItem(DEVICE_KEY, id); }
     return id;
-  } catch {
-    return `anon_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`;
-  }
+  } catch { return `anon_${Date.now()}`; }
 }
 
-function landmarkEAR(pts, startIdx) {
-  const p = (i) => pts[startIdx + i];
-  const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
-  const v1 = dist(p(1), p(5));
-  const v2 = dist(p(2), p(4));
-  const h = dist(p(0), p(3));
-  return (v1 + v2) / (2 * h + 1e-6);
-}
+const getColor = (conf) => {
+  if (conf > 0.85) return "#00ffaa";
+  if (conf > 0.7) return "#00ddff";
+  if (conf > 0.5) return "#ffcc00";
+  return "#ff4444";
+};
 
-function eyeTiltAngleRad(pts) {
-  return Math.atan2(pts[45].y - pts[36].y, pts[45].x - pts[36].x);
-}
+const getLabel = (conf) => {
+  if (conf > 0.85) return "High Confidence";
+  if (conf > 0.7) return "Strong Match";
+  if (conf > 0.5) return "Partial Match";
+  return "Low Confidence";
+};
 
-/** Smallest absolute difference between two orientations (radians). */
-function headTiltDeltaRad(current, baseline) {
-  let d = current - baseline;
-  while (d > Math.PI) d -= 2 * Math.PI;
-  while (d < -Math.PI) d += 2 * Math.PI;
-  return Math.abs(d);
-}
-
-/** Brow vertical asymmetry / face width — rises on head roll toward shoulder (68-pt model). */
-function eyebrowRollAsymmetry(pts, faceW) {
-  const leftBrow = (pts[19].y + pts[21].y) / 2;
-  const rightBrow = (pts[24].y + pts[26].y) / 2;
-  return Math.abs(leftBrow - rightBrow) / Math.max(faceW, 1e-6);
-}
-
-async function captureBurstFromVideo(video, count, delayMs) {
-  const c = document.createElement("canvas");
-  c.width = video.videoWidth;
-  c.height = video.videoHeight;
-  const ctx = c.getContext("2d");
-  const out = [];
-  for (let i = 0; i < count; i++) {
-    ctx.drawImage(video, 0, 0);
-    const blob = await new Promise((res) => c.toBlob((b) => res(b), "image/jpeg", 0.52));
-    if (blob) out.push(blob);
-    await new Promise((r) => setTimeout(r, delayMs));
-  }
-  return out;
-}
-
-function UserAvatarIcon() {
-  return (
-    <svg
-      className="fm-profile-avatar-svg"
-      viewBox="0 0 24 24"
-      fill="none"
-      xmlns="http://www.w3.org/2000/svg"
-      aria-hidden
-    >
-      <path
-        d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v1c0 .55.45 1 1 1h14c.55 0 1-.45 1-1v-1c0-2.66-5.33-4-8-4z"
-        fill="currentColor"
-      />
-    </svg>
-  );
-}
-
-export default function FaceMatch({ userEmail, onLogout }) {
+export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
   const [preview, setPreview] = useState(null);
   const [file, setFile] = useState(null);
   const [results, setResults] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [dragging, setDragging] = useState(false);
-  const [hoverCardIndex, setHoverCardIndex] = useState(null);
-  const [selectedImg, setSelectedImg] = useState(null);
-  const [progress, setProgress] = useState(0);
   const [showCamera, setShowCamera] = useState(false);
   const [stream, setStream] = useState(null);
 
-  // Liveness + Geo states
-  const [modelsLoaded, setModelsLoaded] = useState(false);
   const [challengeIndex, setChallengeIndex] = useState(0);
   const [completedChallenges, setCompletedChallenges] = useState([]);
   const [livenessLive, setLivenessLive] = useState(false);
   const [challengeMsg, setChallengeMsg] = useState("");
-  const [geoData, setGeoData] = useState(null);
-  const [geoError, setGeoError] = useState(null);
-  const [geoAddress, setGeoAddress] = useState(null);
-  const [profileMenuOpen, setProfileMenuOpen] = useState(false);
-  const profileMenuRef = useRef(null);
   const [sessionChallenges, setSessionChallenges] = useState([]);
   const [livenessSessionLoading, setLivenessSessionLoading] = useState(false);
   const [canMatch, setCanMatch] = useState(false);
+  const [livenessStep, setLivenessStep] = useState("idle");
+  const [lightOverlay, setLightOverlay] = useState(null);
+  const [errcount, setErrcount] = useState(0);
 
-  // Refs
+  // Premium UI features
+  const [progress, setProgress] = useState(0);
+  const [geoData, setGeoData] = useState(null);
+  const [geoError, setGeoError] = useState(null);
+  const [geoAddress, setGeoAddress] = useState(null);
+  const [processedPreview, setProcessedPreview] = useState(null);
+  const [capturedImage, setCapturedImage] = useState(null);
+  const [profileMenuOpen, setProfileMenuOpen] = useState(false);
+  const [backendLandmarks, setBackendLandmarks] = useState(null);
+  const [backendMesh, setBackendMesh] = useState(null);
+  const [rejectionError, setRejectionError] = useState(null);
+  const [multiPersonError, setMultiPersonError] = useState(false);
+  const [currentSessionId, setCurrentSessionId] = useState(null);
+  const [registrationSuccess, setRegistrationSuccess] = useState(null);
+  const [showAllResults, setShowAllResults] = useState(false);
+  const [toastStep, setToastStep] = useState(null);
+  const [toastVisible, setToastVisible] = useState(false);
+  const [completedSteps, setCompletedSteps] = useState([]);
+  const [toasts, setToasts] = useState([]);
+  const [penaltyDetails, setPenaltyDetails] = useState([]);
+
+  const addToast = useCallback((msg, type = "success") => {
+    const id = Date.now();
+    setToasts(prev => [...prev, { id, msg, type }]);
+    setTimeout(() => {
+      setToasts(prev => prev.filter(t => t.id !== id));
+    }, 3500);
+  }, []);
+
   const videoRef = useRef();
   const canvasRef = useRef();
   const overlayCanvasRef = useRef();
   const inputRef = useRef();
-  const intervalRef = useRef(null);
-  const meshIntervalRef = useRef(null);
-  const challengeIndexRef = useRef(0);
-  const completedRef = useRef([]);
-  const isDetectingRef = useRef(false);
-  const isMeshDetectingRef = useRef(false);
-  const baselineRef = useRef(null);
-  const noseYHistoryRef = useRef([]);
-  const noseCenterXHistoryRef = useRef([]);
-  const faceWidthHistoryRef = useRef([]);
-  const calEyeAngRef = useRef([]);
-  const calBrowAsymRef = useRef([]);
-  const calLeftEarRef = useRef([]);
-  const calRightEarRef = useRef([]);
-  const faceLostCountRef = useRef(0);
-  const challengeCooldownRef = useRef(false); // prevent double-firing
-  const sessionChallengesRef = useRef([]);
+  const frameIntervalRef = useRef(null);
   const livenessSessionIdRef = useRef(null);
   const livenessCompletedRef = useRef(false);
-  const sustainCountRef = useRef(0);
-  const postVerifyRunningRef = useRef(false);
+  const streamingRef = useRef(false);
+  const profileMenuRef = useRef(null);
+  const lastToastTimeRef = useRef(0);
 
-  // Load face-api models once
+  // Click outside profile menu
   useEffect(() => {
-    const load = async () => {
-      try {
-        await Promise.all([
-          faceapi.nets.tinyFaceDetector.loadFromUri("/models"),
-          faceapi.nets.faceLandmark68Net.loadFromUri("/models"),
-          faceapi.nets.faceExpressionNet.loadFromUri("/models"),
-        ]);
-        setModelsLoaded(true);
-        console.log("✅ face-api models loaded");
-      } catch (e) {
-        console.warn("face-api models failed to load:", e);
+    function handleClickOutside(event) {
+      if (profileMenuRef.current && !profileMenuRef.current.contains(event.target)) {
+        setProfileMenuOpen(false);
       }
-    };
-    load();
+    }
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
   }, []);
 
+  // 20-second registered user check
   useEffect(() => {
-    if (!profileMenuOpen) return;
-    const onDocMouseDown = (e) => {
-      const el = profileMenuRef.current;
-      if (el && !el.contains(e.target)) setProfileMenuOpen(false);
-    };
-    document.addEventListener("mousedown", onDocMouseDown);
-    return () => document.removeEventListener("mousedown", onDocMouseDown);
-  }, [profileMenuOpen]);
+    let timer;
+    if (showCamera && !livenessLive) {
+      timer = setTimeout(() => {
+        addToast("Verification taking longer than usual. Please ensure you are a registered user.", "warning");
+      }, 20000);
+    }
+    return () => clearTimeout(timer);
+  }, [showCamera, livenessLive, addToast]);
 
-  // High accuracy geo capture
+  // ── Geo-location capture ──
   const captureGeo = useCallback(() => {
     return new Promise((resolve) => {
       if (!navigator.geolocation) return resolve(null);
@@ -216,7 +174,6 @@ export default function FaceMatch({ userEmail, onLogout }) {
     });
   }, []);
 
-  // Reverse geocode — BigDataCloud (free, no key)
   const reverseGeocode = useCallback(async (lat, long) => {
     try {
       const res = await fetch(
@@ -231,706 +188,596 @@ export default function FaceMatch({ userEmail, onLogout }) {
         full: data.localityInfo?.administrative?.map((a) => a.name).filter(Boolean).join(", ") || parts.join(", "),
         short: parts.join(", "),
       };
-    } catch {
-      return null;
-    }
+    } catch { return null; }
   }, []);
 
-  // ── MESH DRAW (visual only) ──
-  const drawFaceMesh = (detection, video) => {
+  // ── Face skeleton connection map (68-pt landmark indices) ──
+  const FACE_CONNECTIONS = [
+    // Jawline
+    [0, 1], [1, 2], [2, 3], [3, 4], [4, 5], [5, 6], [6, 7], [7, 8], [8, 9], [9, 10], [10, 11], [11, 12], [12, 13], [13, 14], [14, 15], [15, 16],
+    // Left eyebrow
+    [17, 18], [18, 19], [19, 20], [20, 21],
+    // Right eyebrow
+    [22, 23], [23, 24], [24, 25], [25, 26],
+    // Nose bridge
+    [27, 28], [28, 29], [29, 30],
+    // Nose bottom
+    [31, 32], [32, 33], [33, 34], [34, 35], [31, 35],
+    // Left eye
+    [36, 37], [37, 38], [38, 39], [39, 40], [40, 41], [41, 36],
+    // Right eye
+    [42, 43], [43, 44], [44, 45], [45, 46], [46, 47], [47, 42],
+    // Outer mouth
+    [48, 49], [49, 50], [50, 51], [51, 52], [52, 53], [53, 54], [54, 55], [55, 56], [56, 57], [57, 58], [58, 59], [59, 48],
+    // Inner mouth
+    [60, 61], [61, 62], [62, 63], [63, 64], [64, 65], [65, 66], [66, 67], [67, 60],
+  ];
+
+  // Mesh Drawing Logic — dense holographic mesh
+  useEffect(() => {
     const canvas = overlayCanvasRef.current;
-    if (!canvas || !video) return;
-    canvas.width  = video.videoWidth;
-    canvas.height = video.videoHeight;
+    if (!canvas || !backendLandmarks) return;
+
+    const SRC_W = 640, SRC_H = 480;
+    if (canvas.width !== SRC_W) canvas.width = SRC_W;
+    if (canvas.height !== SRC_H) canvas.height = SRC_H;
+
     const ctx = canvas.getContext("2d");
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    if (!detection) return;
+    if (!ctx) return;
+    ctx.clearRect(0, 0, SRC_W, SRC_H);
 
-    const pts = detection.landmarks.positions;
-    const connections = [
-      [0,1],[1,2],[2,3],[3,4],[4,5],[5,6],[6,7],[7,8],
-      [8,9],[9,10],[10,11],[11,12],[12,13],[13,14],[14,15],[15,16],
-      [17,18],[18,19],[19,20],[20,21],
-      [22,23],[23,24],[24,25],[25,26],
-      [27,28],[28,29],[29,30],
-      [30,31],[31,32],[32,33],[33,34],[34,35],
-      [36,37],[37,38],[38,39],[39,40],[40,41],[41,36],
-      [42,43],[43,44],[44,45],[45,46],[46,47],[47,42],
-      [48,49],[49,50],[50,51],[51,52],[52,53],[53,54],
-      [54,55],[55,56],[56,57],[57,58],[58,59],[59,48],
-      [60,61],[61,62],[62,63],[63,64],[64,65],[65,66],[66,67],[67,60],
-    ];
+    const pts = backendLandmarks;
+    const mesh = backendMesh;
 
-    ctx.strokeStyle = "rgba(0, 255, 170, 0.65)";
-    ctx.lineWidth = 1.5;
-    connections.forEach(([a, b]) => {
+    // 1. Draw Dense Mesh Connections (Holographic look)
+    if (mesh && mesh.length > 0) {
       ctx.beginPath();
-      ctx.moveTo(pts[a].x, pts[a].y);
-      ctx.lineTo(pts[b].x, pts[b].y);
-      ctx.stroke();
-    });
+      ctx.strokeStyle = "rgba(0, 255, 170, 0.15)";
+      ctx.lineWidth = 0.5;
 
-    pts.forEach((pt) => {
-      ctx.beginPath();
-      ctx.arc(pt.x, pt.y, 2.5, 0, 2 * Math.PI);
-      ctx.fillStyle = "rgba(0, 255, 170, 0.9)";
-      ctx.fill();
-    });
-
-    // Yellow highlight on active challenge region
-    const challengeColor = "rgba(255, 215, 0, 0.9)";
-    const list = sessionChallengesRef.current;
-    const challenge = list[challengeIndexRef.current];
-    if (challenge === "smile" || challenge === "surprised" || challenge === "mouth_open") {
-      ctx.beginPath();
-      pts.slice(48, 68).forEach((p, i) => (i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y)));
-      ctx.strokeStyle = challengeColor;
-      ctx.lineWidth = 2.5;
-      ctx.stroke();
-    } else if (
-      challenge === "turn_left" ||
-      challenge === "turn_right" ||
-      challenge === "nod" ||
-      challenge === "look_up"
-    ) {
-      [27, 28, 29, 30].forEach((idx) => {
-        ctx.beginPath();
-        ctx.arc(pts[idx].x, pts[idx].y, 5, 0, 2 * Math.PI);
-        ctx.fillStyle = challengeColor;
-        ctx.fill();
-      });
-    } else if (challenge === "tilt_head") {
-      ctx.beginPath();
-      ctx.moveTo(pts[36].x, pts[36].y);
-      ctx.lineTo(pts[45].x, pts[45].y);
-      ctx.strokeStyle = challengeColor;
-      ctx.lineWidth = 3;
-      ctx.stroke();
-    } else if (challenge === "wide_eyes") {
-      [36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47].forEach((idx) => {
-        ctx.beginPath();
-        ctx.arc(pts[idx].x, pts[idx].y, 3.5, 0, 2 * Math.PI);
-        ctx.fillStyle = challengeColor;
-        ctx.fill();
-      });
-    }
-  };
-
-  // ── MESH LOOP — purely visual, slow 500ms ──
-  const runMeshLoop = useCallback(async () => {
-    if (isMeshDetectingRef.current) return;
-    if (!videoRef.current || videoRef.current.readyState < 2) return;
-    isMeshDetectingRef.current = true;
-    try {
-      const detection = await faceapi
-        .detectSingleFace(
-          videoRef.current,
-          new faceapi.TinyFaceDetectorOptions({
-            inputSize: MESH_FACE_INPUT_SIZE,
-            scoreThreshold: LIVENESS_SCORE_THRESHOLD,
-          })
-        )
-        .withFaceLandmarks();
-      drawFaceMesh(detection || null, videoRef.current);
-    } catch (_) {}
-    isMeshDetectingRef.current = false;
-  }, []);
-
-  const markChallengeDoneRef = useRef(() => {});
-  markChallengeDoneRef.current = (name) => {
-    if (challengeCooldownRef.current) return;
-    challengeCooldownRef.current = true;
-    setTimeout(() => {
-      challengeCooldownRef.current = false;
-    }, 1000);
-
-    sustainCountRef.current = 0;
-
-    const newCompleted = [...completedRef.current, name];
-    completedRef.current = newCompleted;
-    const nextIndex = challengeIndexRef.current + 1;
-    challengeIndexRef.current = nextIndex;
-    setCompletedChallenges([...newCompleted]);
-    setChallengeIndex(nextIndex);
-
-    const total = sessionChallengesRef.current.length;
-    if (nextIndex >= total) {
-      clearInterval(intervalRef.current);
-      clearInterval(meshIntervalRef.current);
-      intervalRef.current = null;
-      meshIntervalRef.current = null;
-      if (!postVerifyRunningRef.current && livenessSessionIdRef.current) {
-        postVerifyRunningRef.current = true;
-        setChallengeMsg("Verifying motion…");
-        (async () => {
-          try {
-            const deviceId = getOrCreateDeviceId();
-            const video = videoRef.current;
-            if (!video || video.readyState < 2) {
-              setError("Video not ready for verification.");
-              postVerifyRunningRef.current = false;
-              return;
-            }
-            const blobs = await captureBurstFromVideo(video, 6, 130);
-            const fd = new FormData();
-            fd.append("session_id", livenessSessionIdRef.current);
-            fd.append("device_id", deviceId);
-            blobs.forEach((b) => fd.append("files", b, "frame.jpg"));
-            const tr = await fetch(`${API_URL}/liveness/temporal`, { method: "POST", body: fd });
-            const tj = await tr.json().catch(() => ({}));
-            if (!tr.ok || !tj.ok) {
-              setError(
-                typeof tj.detail === "string"
-                  ? tj.detail
-                  : "Motion/replay check failed. Please try again (use live camera, not a screen recording)."
-              );
-              postVerifyRunningRef.current = false;
-              const media = videoRef.current?.srcObject;
-              if (media && "getTracks" in media) media.getTracks().forEach((t) => t.stop());
-              setStream(null);
-              setShowCamera(false);
-              setSessionChallenges([]);
-              sessionChallengesRef.current = [];
-              livenessSessionIdRef.current = null;
-              livenessCompletedRef.current = false;
-              setCanMatch(false);
-              return;
-            }
-            const cr = await fetch(`${API_URL}/liveness/session/complete`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ session_id: livenessSessionIdRef.current }),
-            });
-            if (!cr.ok) {
-              const ej = await cr.json().catch(() => ({}));
-              setError(typeof ej.detail === "string" ? ej.detail : "Could not complete liveness session.");
-              postVerifyRunningRef.current = false;
-              setCanMatch(false);
-              const media2 = videoRef.current?.srcObject;
-              if (media2 && "getTracks" in media2) media2.getTracks().forEach((t) => t.stop());
-              setStream(null);
-              setShowCamera(false);
-              return;
-            }
-            livenessCompletedRef.current = true;
-            setCanMatch(true);
-            setLivenessLive(true);
-            setChallengeMsg("✅ Liveness confirmed! Click Capture.");
-          } catch {
-            setError("Verification request failed.");
-            const media3 = videoRef.current?.srcObject;
-            if (media3 && "getTracks" in media3) media3.getTracks().forEach((t) => t.stop());
-            setStream(null);
-            setShowCamera(false);
-          } finally {
-            postVerifyRunningRef.current = false;
+      // Draw a "web" by connecting nearby points in the mesh
+      // To keep it performant, we skip points
+      for (let i = 0; i < mesh.length; i += 7) {
+        const p1 = mesh[i];
+        for (let j = i + 1; j < Math.min(i + 30, mesh.length); j += 5) {
+          const p2 = mesh[j];
+          const dist = Math.hypot(p1.x - p2.x, p1.y - p2.y);
+          if (dist < 25) {
+            ctx.moveTo(p1.x, p1.y);
+            ctx.lineTo(p2.x, p2.y);
           }
-        })();
+        }
       }
-    } else {
-      const nextId = sessionChallengesRef.current[nextIndex];
-      setChallengeMsg(`✅ Done! Now: ${CHALLENGE_TEXT[nextId] || nextId}`);
-    }
-  };
+      ctx.stroke();
 
-  const registerSustained = (ok, name, minFrames = SUSTAINED_FRAMES) => {
-    if (ok) {
-      sustainCountRef.current += 1;
-      if (sustainCountRef.current >= minFrames) {
-        markChallengeDoneRef.current(name);
-        sustainCountRef.current = 0;
+      // Draw all mesh points as tiny glowing dots
+      ctx.fillStyle = "rgba(0, 255, 170, 0.4)";
+      for (let i = 0; i < mesh.length; i += 2) {
+        const p = mesh[i];
+        ctx.fillRect(p.x, p.y, 1, 1);
       }
-    } else {
-      sustainCountRef.current = 0;
     }
-  };
 
-  // ── LIVENESS LOOP — detection only, no mesh, fast 150ms ──
-  const runLivenessLoop = useCallback(async () => {
-    if (isDetectingRef.current) return;
-    if (!videoRef.current || videoRef.current.readyState < 2) return;
-    const seqLen = sessionChallengesRef.current.length;
-    if (seqLen === 0 || challengeIndexRef.current >= seqLen) return;
+    // 2. Draw Main Skeleton (the 68-pt connections)
+    if (pts && pts.length >= 68) {
+      ctx.strokeStyle = "rgba(0, 255, 170, 0.8)";
+      ctx.lineWidth = 1.8;
+      ctx.shadowBlur = 5;
+      ctx.shadowColor = "rgba(0, 255, 170, 0.5)";
 
-    isDetectingRef.current = true;
+      for (const [a, b] of FACE_CONNECTIONS) {
+        if (!pts[a] || !pts[b]) continue;
+        ctx.beginPath();
+        ctx.moveTo(pts[a].x, pts[a].y);
+        ctx.lineTo(pts[b].x, pts[b].y);
+        ctx.stroke();
+      }
+      ctx.shadowBlur = 0;
+
+      // 3. Draw Main Landmark Dots
+      for (let i = 0; i < pts.length; i++) {
+        const p = pts[i];
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 2.2, 0, Math.PI * 2);
+        ctx.fillStyle = "rgba(0, 255, 170, 1)";
+        ctx.fill();
+        // Inner glow
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 1, 0, Math.PI * 2);
+        ctx.fillStyle = "#fff";
+        ctx.fill();
+      }
+    }
+  }, [backendLandmarks, backendMesh]);
+
+  useEffect(() => {
     const video = videoRef.current;
+    if (!video || !stream) return;
 
-    try {
-      const detection = await faceapi
-        .detectSingleFace(
-          video,
-          new faceapi.TinyFaceDetectorOptions({
-            inputSize: LIVENESS_FACE_INPUT_SIZE,
-            scoreThreshold: LIVENESS_SCORE_THRESHOLD,
-          })
-        )
-        .withFaceLandmarks()
-        .withFaceExpressions();
+    video.srcObject = stream;
 
-      if (detection) {
-        faceLostCountRef.current = 0;
-        const pts = detection.landmarks.positions;
-        const expr = detection.expressions;
+    const handlePlay = () => {
+      if (frameIntervalRef.current) clearInterval(frameIntervalRef.current);
+      frameIntervalRef.current = setInterval(streamFrameToBackend, FRAME_INTERVAL_MS);
+    };
 
-        // ── CALIBRATE BASELINE over 15 frames ──
-        if (!baselineRef.current) {
-          const faceCenterX = (pts[0].x + pts[16].x) / 2;
-          noseYHistoryRef.current.push(pts[30].y);
-          noseCenterXHistoryRef.current.push(pts[30].x - faceCenterX);
-          faceWidthHistoryRef.current.push(Math.abs(pts[16].x - pts[0].x));
-          const fw = Math.abs(pts[16].x - pts[0].x);
-          calEyeAngRef.current.push(eyeTiltAngleRad(pts));
-          calBrowAsymRef.current.push(eyebrowRollAsymmetry(pts, fw));
-          calLeftEarRef.current.push(landmarkEAR(pts, 36));
-          calRightEarRef.current.push(landmarkEAR(pts, 42));
-
-          if (noseYHistoryRef.current.length >= CALIBRATION_FRAMES) {
-            const sortedY = [...noseYHistoryRef.current].sort((a, b) => a - b);
-            const sortedX = [...noseCenterXHistoryRef.current].sort((a, b) => a - b);
-            const sortedFW = [...faceWidthHistoryRef.current].sort((a, b) => a - b);
-            const eyeAngles = [...calEyeAngRef.current].sort((a, b) => a - b);
-            const browAsyms = [...calBrowAsymRef.current].sort((a, b) => a - b);
-            const les = [...calLeftEarRef.current].sort((a, b) => a - b);
-            const res = [...calRightEarRef.current].sort((a, b) => a - b);
-            const mid = Math.floor(sortedY.length / 2);
-            const eMid = Math.floor(eyeAngles.length / 2);
-            const bMid = Math.floor(browAsyms.length / 2);
-
-            baselineRef.current = {
-              noseTipY: sortedY[mid],
-              noseCenterX: sortedX[mid],
-              faceWidth: sortedFW[mid],
-              eyeAngle: eyeAngles[eMid] ?? 0,
-              browAsym: browAsyms[bMid] ?? 0,
-              leftEAR: les[eMid] ?? 0.25,
-              rightEAR: res[eMid] ?? 0.25,
-            };
-            noseYHistoryRef.current = [];
-            noseCenterXHistoryRef.current = [];
-            faceWidthHistoryRef.current = [];
-            calEyeAngRef.current = [];
-            calBrowAsymRef.current = [];
-            calLeftEarRef.current = [];
-            calRightEarRef.current = [];
-            console.log("✅ Baseline ready:", baselineRef.current);
-          } else {
-            console.log(`📊 Calibrating ${noseYHistoryRef.current.length}/${CALIBRATION_FRAMES}...`);
-          }
-          isDetectingRef.current = false;
-          return;
-        }
-
-        const base = baselineRef.current;
-        const challenge = sessionChallengesRef.current[challengeIndexRef.current];
-
-        if (challenge === "turn_left") {
-          const faceCenter = (pts[0].x + pts[16].x) / 2;
-          const noseOffset = pts[30].x - faceCenter;
-          const turnDelta = base.noseCenterX - noseOffset;
-          const threshold = Math.max(4, base.faceWidth * 0.075);
-          registerSustained(turnDelta > threshold, "turn_left");
-        } else if (challenge === "turn_right") {
-          const faceCenter = (pts[0].x + pts[16].x) / 2;
-          const noseOffset = pts[30].x - faceCenter;
-          const turnDelta = noseOffset - base.noseCenterX;
-          const threshold = Math.max(4, base.faceWidth * 0.075);
-          registerSustained(turnDelta > threshold, "turn_right");
-        } else if (challenge === "nod") {
-          const nodDelta = pts[30].y - base.noseTipY;
-          const threshold = Math.max(6, base.faceWidth * 0.055);
-          registerSustained(nodDelta > threshold, "nod");
-        } else if (challenge === "look_up") {
-          const upDelta = base.noseTipY - pts[30].y;
-          const threshold = Math.max(6, base.faceWidth * 0.05);
-          registerSustained(upDelta > threshold, "look_up");
-        } else if (challenge === "smile") {
-          registerSustained(expr.happy > 0.42, "smile");
-        } else if (challenge === "surprised") {
-          registerSustained(expr.surprised > 0.38, "surprised");
-        } else if (challenge === "mouth_open") {
-          const mouthOpen = Math.abs(pts[62].y - pts[66].y);
-          const threshold = Math.max(5, base.faceWidth * 0.055);
-          registerSustained(mouthOpen > threshold, "mouth_open");
-        } else if (challenge === "tilt_head") {
-          const ang = headTiltDeltaRad(eyeTiltAngleRad(pts), base.eyeAngle);
-          const curBrow = eyebrowRollAsymmetry(pts, base.faceWidth);
-          const browDelta = Math.abs(curBrow - (base.browAsym ?? 0));
-          const tiltOk =
-            ang > 0.056 ||
-            browDelta > 0.036 ||
-            (ang > 0.042 && browDelta > 0.02);
-          registerSustained(tiltOk, "tilt_head", 3);
-        } else if (challenge === "wide_eyes") {
-          const le = landmarkEAR(pts, 36);
-          const re = landmarkEAR(pts, 42);
-          const bl = Math.max(base.leftEAR, 0.05);
-          const br = Math.max(base.rightEAR, 0.05);
-          const landmarkWide =
-            le > bl * 1.07 &&
-            re > br * 1.07 &&
-            le > 0.13 &&
-            re > 0.13;
-          const withSurprise =
-            expr.surprised > 0.3 && le > bl * 1.04 && re > br * 1.04 && le > 0.12 && re > 0.12;
-          registerSustained(landmarkWide || withSurprise, "wide_eyes", 3);
-        }
-      } else {
-        faceLostCountRef.current += 1;
-        sustainCountRef.current = 0;
-        if (faceLostCountRef.current > 15) {
-          baselineRef.current = null;
-          noseYHistoryRef.current = [];
-          noseCenterXHistoryRef.current = [];
-          faceWidthHistoryRef.current = [];
-          calEyeAngRef.current = [];
-          calBrowAsymRef.current = [];
-          calLeftEarRef.current = [];
-          calRightEarRef.current = [];
-          faceLostCountRef.current = 0;
-          console.log("🔄 Baseline reset — face lost too long");
-        }
-      }
-    } catch (e) {
-      console.warn("Liveness error:", e);
-    }
-
-    isDetectingRef.current = false;
-  }, []);
-
-  const handleFile = (f) => {
-    if (!f || !f.type.startsWith("image/")) return;
-    setFile(f);
-    setPreview(URL.createObjectURL(f));
-    setResults([]);
-    setError(null);
-  };
-
-  const handleDrop = (e) => {
-    e.preventDefault();
-    setDragging(false);
-    handleFile(e.dataTransfer.files[0]);
-  };
-
-  const resetLiveness = () => {
-    setChallengeIndex(0);
-    challengeIndexRef.current = 0;
-    setCompletedChallenges([]);
-    completedRef.current = [];
-    setLivenessLive(false);
-    const first = sessionChallengesRef.current[0];
-    setChallengeMsg(first ? CHALLENGE_TEXT[first] || first : "");
-    baselineRef.current = null;
-    noseYHistoryRef.current = [];
-    noseCenterXHistoryRef.current = [];
-    faceWidthHistoryRef.current = [];
-    calEyeAngRef.current = [];
-    calBrowAsymRef.current = [];
-    calLeftEarRef.current = [];
-    calRightEarRef.current = [];
-    faceLostCountRef.current = 0;
-    challengeCooldownRef.current = false;
-    sustainCountRef.current = 0;
-    postVerifyRunningRef.current = false;
-  };
-
-  const startCamera = async () => {
-    if (!modelsLoaded) {
-      setError("⏳ Models still loading, wait 3 seconds and try again.");
-      return;
-    }
-    setError(null);
-    setLivenessSessionLoading(true);
-    const deviceId = getOrCreateDeviceId();
-
-    const sessionPromise = fetch(`${API_URL}/liveness/session`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ device_id: deviceId }),
-    }).then(async (r) => ({
-      ok: r.ok,
-      status: r.status,
-      data: await r.json().catch(() => ({})),
-    }));
-
-    const streamPromise = (async () => {
-      try {
-        return await navigator.mediaDevices.getUserMedia({
-          video: {
-            facingMode: "user",
-            width: { ideal: 640 },
-            height: { ideal: 480 },
-          },
+    video.onloadedmetadata = () => {
+      video.play()
+        .then(() => {
+          console.log("Video playing successfully");
+          handlePlay();
+        })
+        .catch(e => {
+          console.error("Video play failed:", e);
+          // Fallback: try playing again on user interaction if needed, 
+          // but 'muted' should handle most cases.
         });
-      } catch (e1) {
-        console.warn("getUserMedia (ideal constraints) failed, retrying with basic video:", e1);
-        return navigator.mediaDevices.getUserMedia({ video: true });
-      }
-    })();
+    };
 
+    return () => {
+      if (frameIntervalRef.current) clearInterval(frameIntervalRef.current);
+      video.onloadedmetadata = null;
+    };
+  }, [stream]);
+
+  async function handleBackendResponse(data) {
+    if (!data) return;
+    // if (data.landmarks) setBackendLandmarks(data.landmarks);
+    if (data.landmarks && Array.isArray(data.landmarks)) {
+      setBackendLandmarks(data.landmarks.map(p => ({ x: p.x, y: p.y })));
+    }
+    if (data.mesh && Array.isArray(data.mesh)) {
+      setBackendMesh(data.mesh.map(p => ({ x: p.x, y: p.y })));
+    }
+    // if (data.step && data.step !== livenessStep) {
+    //   const prevStep = livenessStep;
+    //   setLivenessStep(data.step);
+
+    //   // If we moved forward, show toast
+    //   if (data.step !== "idle" && data.step !== "camera") {
+    //     setToastStep(data.step);
+    //     setToastVisible(true);
+    //     if (prevStep !== "idle" && prevStep !== "camera") {
+    //       setCompletedSteps(prev => [...new Set([...prev, prevStep])]);
+
+    //       const STEP_MAP = {
+    //         calibration: "Face Calibrated",
+    //         depth: "Depth Verified",
+    //         light_challenge: "Light Check Passed",
+    //         micro: "Security Check Passed",
+    //         gesture: "Liveness Verified"
+    //       };
+    //       if (STEP_MAP[prevStep]) addToast(STEP_MAP[prevStep]);
+    //     }
+    //   }
+    // }
+    if (data.step && data.step !== livenessStep) {
+
+      // Skip unwanted phases visually
+      const hiddenSteps = [
+        "calibration",
+        "depth",
+        "light_challenge",
+        "micro"
+      ];
+
+      // Auto jump frontend directly to gesture
+      if (hiddenSteps.includes(data.step)) {
+        setLivenessStep("gesture");
+        return;
+      }
+
+      const prevStep = livenessStep;
+      setLivenessStep(data.step);
+
+      if (data.step !== "idle" && data.step !== "camera") {
+        setToastStep(data.step);
+        setToastVisible(true);
+
+        if (prevStep !== "idle" && prevStep !== "camera") {
+          setCompletedSteps(prev => [...new Set([...prev, prevStep])]);
+
+          const STEP_MAP = {
+            gesture: "Liveness Verified"
+          };
+
+          if (STEP_MAP[prevStep]) addToast(STEP_MAP[prevStep]);
+        }
+      }
+    }
+    if (data.detail) setChallengeMsg(data.detail);
+
+    // Multi-person detection handling
+    if (data.multi_person) {
+      setMultiPersonError(true);
+    } else {
+      setMultiPersonError(false);
+    }
+
+    if (data.step === "gesture" && data.gesture_idx !== undefined) {
+      setChallengeIndex(data.gesture_idx);
+      const completed = [];
+      for (let i = 0; i < data.gesture_idx; i++) completed.push(true);
+      setCompletedChallenges(completed);
+    }
+
+    if (data.status === "verified" || data.step === "complete") {
+      if (!livenessCompletedRef.current) {
+        livenessCompletedRef.current = true;
+        setCompletedSteps(["calibration", "depth", "light_challenge", "micro", "gesture"]);
+        addToast("Security Check Passed");
+        await completeSession();
+      }
+    }
+
+    if (data.status === "rejected" || data.status === "failed") {
+      if (data.status === "rejected") {
+        setErrcount(prev => prev + 10);
+        addToast("Security Alert: Electronic device detected.", "error");
+        // Silently log rejection without stopping camera or showing modal
+        console.warn("Security rejection caught:", data.detail);
+      } else {
+        setError(data.detail || "Liveness check failed");
+      }
+    } else if (data.status === "processing") {
+      const d = data.detail || "";
+
+      // Increment errcount for suspicious activity (e.g. digital screen, identity mismatch)
+      if (data.is_suspicious) {
+        // Increment by 10 per event/frame as requested
+        setErrcount(prev => prev + 10);
+
+        // Show small popup at top
+        const now = Date.now();
+        if (now - lastToastTimeRef.current > 2500) {
+          addToast("Security Warning: Potential device or non-live media detected.", "warning");
+          lastToastTimeRef.current = now;
+        }
+      }
+
+      if (d.includes("blocked") || d.includes("too close") || d.includes("too far") || d.includes("No face")) {
+        setError(d);
+      } else {
+        setError(null);
+      }
+    }
+  }
+
+  async function streamFrameToBackend() {
+    if (streamingRef.current || !videoRef.current || videoRef.current.readyState < 2 || !livenessSessionIdRef.current) return;
+    streamingRef.current = true;
     try {
-      const [sessSettled, streamSettled] = await Promise.allSettled([sessionPromise, streamPromise]);
+      const video = videoRef.current;
+      const c = document.createElement("canvas");
+      c.width = 640; c.height = 480;
+      c.getContext("2d").drawImage(video, 0, 0, 640, 480);
+      const blob = await new Promise((r) => c.toBlob(r, "image/jpeg", 0.9));
+      if (!blob) { streamingRef.current = false; return; }
+      const fd = new FormData();
+      fd.append("session_id", livenessSessionIdRef.current);
+      fd.append("frame", blob, "frame.jpg");
+      const res = await fetch(`${API_URL}/liveness/frame`, { method: "POST", body: fd });
+      const data = await res.json();
+      await handleBackendResponse(data);
+    } catch (e) { console.warn("Stream error:", e); }
+    streamingRef.current = false;
+  }
 
-      let mediaStream = null;
-      if (streamSettled.status === "fulfilled") mediaStream = streamSettled.value;
-      else console.warn("getUserMedia:", streamSettled.reason);
+  async function completeSession() {
+    try {
+      const res = await fetch(`${API_URL}/liveness/session/complete`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: livenessSessionIdRef.current }),
+      });
+      const data = await res.json();
+      if (res.ok && data.ok) { setCanMatch(true); setLivenessLive(true); setLivenessStep("capture"); }
+    } catch { setError("Verification failed"); }
+  }
 
-      let sessionPart = null;
-      if (sessSettled.status === "fulfilled") sessionPart = sessSettled.value;
-      else console.warn("liveness/session:", sessSettled.reason);
-
-      const stopStream = () => {
-        if (mediaStream) mediaStream.getTracks().forEach((t) => t.stop());
-      };
-
-      if (!sessionPart || !sessionPart.ok) {
-        stopStream();
-        const data =
-          sessionPart && typeof sessionPart.data === "object" && sessionPart.data !== null
-            ? sessionPart.data
-            : {};
-        const msg =
-          sessionPart?.status === 409
-            ? typeof data.detail === "string"
-              ? data.detail
-              : "All gesture sequences may be exhausted for this device."
-            : typeof data.detail === "string"
-              ? data.detail
-              : "Could not start liveness session.";
-        setError(sessionPart ? msg : "Could not reach server for liveness session.");
+  async function startCamera() {
+    stopCamera();
+    setError(null);
+    setFile(null);
+    setPreview(null);
+    setResults([]);
+    setPenaltyDetails([]);
+    setLivenessLive(false);
+    setCanMatch(false);
+    setGeoData(null);
+    setGeoAddress(null);
+    setProgress(0);
+    setErrcount(0);
+    setCompletedSteps([]);
+    setLivenessSessionLoading(true);
+    try {
+      let sessData;
+      try {
+        const sessRes = await fetch(`${API_URL}/liveness/session/start`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            device_id: getOrCreateDeviceId(),
+            agent_label: userAgentLabel
+          }),
+        });
+        if (!sessRes.ok) {
+          const errBody = await sessRes.text();
+          throw new Error(`Server error ${sessRes.status}: ${errBody}`);
+        }
+        sessData = await sessRes.json();
+      } catch (e) {
+        setError(`Session failed: ${e.message}`);
         setLivenessSessionLoading(false);
         return;
       }
 
-      const payload =
-        sessionPart.data !== null && typeof sessionPart.data === "object"
-          ? sessionPart.data
-          : {};
-      const session_id = payload.session_id;
-      const gestures = payload.gestures;
-      if (!session_id || !Array.isArray(gestures) || gestures.length === 0) {
-        stopStream();
-        setError("Invalid server response for liveness session.");
+      let mediaStream;
+      try {
+        const constraints = {
+          video: {
+            facingMode: { ideal: "user" },
+            width: { ideal: 640 },
+            height: { ideal: 480 }
+          }
+        };
+        mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
+      } catch (e) {
+        setError(`Camera access denied: ${e.message}`);
         setLivenessSessionLoading(false);
         return;
       }
 
-      if (!mediaStream) {
-        const r = streamSettled.status === "rejected" ? streamSettled.reason : null;
-        const reason =
-          r && typeof r === "object" && "message" in r
-            ? String(r.message)
-            : r
-              ? String(r)
-              : "";
-        setError(
-          reason
-            ? `Camera: ${reason}`
-            : "Camera access denied or unavailable. Please allow the camera and try again."
-        );
-        setLivenessSessionLoading(false);
-        return;
-      }
-
-      livenessSessionIdRef.current = session_id;
-      livenessCompletedRef.current = false;
-      setCanMatch(false);
-      sessionChallengesRef.current = gestures;
-      setSessionChallenges(gestures);
-      resetLiveness();
-
+      livenessSessionIdRef.current = sessData.session_id;
+      setSessionChallenges(sessData.gestures);
       setStream(mediaStream);
       setShowCamera(true);
-      setLivenessSessionLoading(false);
+      setLivenessStep("camera");
+      setChallengeMsg("Waiting for gesture...");
+    } catch (e) { setError(`Unexpected error: ${e.message}`); }
+    finally { setLivenessSessionLoading(false); }
+  }
 
-      setTimeout(() => {
-        if (videoRef.current) {
-          videoRef.current.srcObject = mediaStream;
-          videoRef.current.onloadedmetadata = () => {
-            intervalRef.current = setInterval(runLivenessLoop, LIVENESS_INTERVAL_MS);
-            meshIntervalRef.current = setInterval(runMeshLoop, MESH_INTERVAL_MS);
-          };
-        }
-      }, 50);
-    } catch (err) {
-      console.error("startCamera:", err);
-      setLivenessSessionLoading(false);
-      setError(
-        err?.message
-          ? `Could not start camera session: ${err.message}`
-          : "Could not start camera session. Check the browser console and ensure VITE_API_URL points to your API (e.g. http://localhost:8000)."
-      );
-      sessionChallengesRef.current = [];
-      setSessionChallenges([]);
-      livenessSessionIdRef.current = null;
-      livenessCompletedRef.current = false;
-      setCanMatch(false);
+  function stopCamera() {
+    if (stream) stream.getTracks().forEach(t => t.stop());
+    if (frameIntervalRef.current) {
+      clearInterval(frameIntervalRef.current);
+      frameIntervalRef.current = null;
     }
-  };
-
-  const stopMediaOnly = () => {
-    if (stream) stream.getTracks().forEach((t) => t.stop());
-    clearInterval(intervalRef.current);
-    clearInterval(meshIntervalRef.current);
-    intervalRef.current = null;
-    meshIntervalRef.current = null;
     setStream(null);
     setShowCamera(false);
-    setLivenessLive(false);
-    const canvas = overlayCanvasRef.current;
-    if (canvas) canvas.getContext("2d").clearRect(0, 0, canvas.width, canvas.height);
-  };
 
-  const stopCamera = () => {
-    stopMediaOnly();
-    setSessionChallenges([]);
-    sessionChallengesRef.current = [];
-    livenessSessionIdRef.current = null;
-    livenessCompletedRef.current = false;
-    setCanMatch(false);
-    resetLiveness();
-  };
+    // Only reset liveness if it wasn't completed
+    if (!canMatch) {
+      setLivenessLive(false);
+      livenessSessionIdRef.current = null;
+      livenessCompletedRef.current = false;
+      setLivenessStep("idle");
+    }
+
+    setBackendLandmarks(null);
+    setBackendMesh(null);
+    setChallengeMsg("");
+    setError(null);
+  }
 
   const takeSelfie = () => {
+    console.log("📸 Capture button clicked");
     const canvas = canvasRef.current;
     const video = videoRef.current;
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-    const ctx = canvas.getContext("2d");
-    ctx.drawImage(video, 0, 0);
-    canvas.toBlob((blob) => {
-      const f = new File([blob], "selfie.jpg", { type: "image/jpeg" });
-      handleFile(f);
-      stopMediaOnly();
-    }, "image/jpeg");
-  };
-
-  const handleMatch = async () => {
-    if (!file) return;
-    if (!livenessSessionIdRef.current || !livenessCompletedRef.current || !canMatch) {
-      setError("Complete the camera liveness check first, then capture a selfie (or use your verified flow).");
+    if (!canvas || !video) {
+      console.warn("Canvas or video ref missing");
       return;
     }
+
+    // 1. Capture the frame first
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    canvas.getContext("2d").drawImage(video, 0, 0);
+
+    canvas.toBlob((blob) => {
+      if (!blob) {
+        console.error("Failed to create blob from canvas");
+        setError("Capture failed: Could not process image.");
+        return;
+      }
+      console.log("✅ Blob created, triggering match...");
+      const f = new File([blob], "selfie.jpg", { type: "image/jpeg" });
+      const currentSessionId = livenessSessionIdRef.current;
+
+      setFile(f);
+      setPreview(URL.createObjectURL(f));
+
+      // 2. Stop camera and streaming immediately
+      stopCamera();
+
+      // 3. Trigger match with the saved session ID
+      handleMatch(f, currentSessionId);
+    }, "image/jpeg", 0.95);
+
+  };
+
+  const handleMatch = async (fileOverride = null, sessionIdOverride = null) => {
+    const fileToUse = fileOverride || file;
+    const sessionIdToUse = sessionIdOverride || livenessSessionIdRef.current;
+
+    console.log("🔍 Starting Match process", {
+      hasFile: !!fileToUse,
+      hasSession: !!sessionIdToUse,
+      canMatch
+    });
+
+    // If we are overriding with a direct file from capture, we bypass the state-based canMatch 
+    // because liveness is already verified to reach the capture button.
+    const isDirectCapture = !!fileOverride;
+
+    if (!fileToUse) {
+      setError("Please upload an image or take a selfie first.");
+      return;
+    }
+
+    // Liveness is recommended but no longer strictly required for uploaded files in the UI
+    // It remains mandatory for direct camera capture (which is handled by isDirectCapture being true)
+    // Allow matching if session is technically complete, even if not perfectly 'verified'
+    const isSessionComplete = livenessStep === "complete" || livenessStep === "capture";
+
+    if (!canMatch && isDirectCapture && !isSessionComplete) {
+      setError("Liveness verification failed. Please try the camera flow again.");
+      return;
+    }
+
     setLoading(true);
     setError(null);
     setResults([]);
+    setPenaltyDetails([]);
     setProgress(0);
     setGeoError(null);
 
+    // Geo capture
+    console.log("📍 Capturing Geo...");
     const geo = await captureGeo();
     setGeoData(geo);
-    setGeoAddress(null);
     if (!geo) {
-      setGeoError("⚠ Location unavailable — proceeding without geo.");
+      console.warn("Geo capture failed or denied");
+      setGeoError("⚠ Location unavailable.");
     } else {
-      reverseGeocode(geo.lat, geo.long).then((addr) => setGeoAddress(addr));
+      reverseGeocode(geo.lat, geo.long).then(addr => {
+        console.log("🌍 Geo Address:", addr);
+        setGeoAddress(addr);
+      });
     }
 
-    const interval = setInterval(() => {
-      setProgress((p) => {
-        if (p >= 90) { clearInterval(interval); return 90; }
-        return p + Math.random() * 12;
-      });
+    // Progress bar simulation
+    const pInterval = setInterval(() => {
+      setProgress(p => (p >= 90 ? 90 : p + Math.random() * 12));
     }, 300);
 
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), MATCH_REQUEST_TIMEOUT_MS);
-
-    const formData = new FormData();
-    formData.append("file", file);
-    formData.append("top_k", 10);
-    formData.append("device_id", getOrCreateDeviceId());
-    if (livenessSessionIdRef.current) {
-      formData.append("liveness_session_id", livenessSessionIdRef.current);
+    const fd = new FormData();
+    fd.append("file", fileToUse);
+    fd.append("device_id", getOrCreateDeviceId());
+    if (sessionIdToUse) {
+      fd.append("liveness_session_id", sessionIdToUse);
     }
     if (geo) {
-      formData.append("geo_lat", geo.lat);
-      formData.append("geo_long", geo.long);
-      formData.append("geo_timestamp", geo.timestamp);
+      fd.append("geo_lat", geo.lat);
+      fd.append("geo_long", geo.long);
+      fd.append("geo_timestamp", geo.timestamp);
     }
 
+    if (errcount > 0) {
+      fd.append("errcount", errcount);
+    }
+    if (userAgentLabel && isDirectCapture) {
+      fd.append("expected_label", userAgentLabel);
+    }
     try {
-      const res = await fetch(`${API_URL}/match`, {
-        method: "POST",
-        body: formData,
-        signal: controller.signal,
-      });
-      clearTimeout(timeout);
+      console.log(`📤 Sending match request to ${API_URL}/match ...`);
+      console.log("Data: ", fd);
+      const res = await fetch(`${API_URL}/match`, { method: "POST", body: fd });
       const data = await res.json();
+      clearInterval(pInterval);
+
       if (data.error) {
-        setError(data.error);
+        console.error("❌ Match error from backend:", data.error);
+        if (data.error.includes("Digital screen") || data.error.includes("Security Alert")) {
+          setErrcount(prev => prev + 10);
+          setRejectionError(data.error);
+        } else {
+          setError(data.error);
+        }
         setProgress(0);
       } else {
-        setResults(data.matches);
+        console.log("✅ Match successful", data.matches?.length, "results");
+        setResults(data.matches || []);
+        setPenaltyDetails(data.security_penalty_breakdown || []);
+        if (data.processed_image) setProcessedPreview(data.processed_image);
+        if (data.captured_image) setCapturedImage(data.captured_image);
         setProgress(100);
-        livenessSessionIdRef.current = null;
-        livenessCompletedRef.current = false;
-        setCanMatch(false);
-        setSessionChallenges([]);
-        sessionChallengesRef.current = [];
       }
     } catch (err) {
-      clearTimeout(timeout);
+      console.error("❌ Match request failed:", err);
+      setError("Match request failed. Please check your connection.");
       setProgress(0);
-      if (err.name === "AbortError") {
-        setError("Request timed out. Try again.");
-      } else {
-        setError("Cannot connect to backend.");
-      }
+      clearInterval(pInterval);
     } finally {
-      clearInterval(interval);
       setLoading(false);
     }
   };
 
-  const getColor = (score) => {
-    if (score >= 0.90) return "#24aa4d";
-    if (score >= 0.75) return "#ffbf01";
-    return "#ff0000";
-  };
+  const handleRegister = async () => {
+    if (!file || !registerName) {
+      setError("Please provide a name and capture a selfie first.");
+      return;
+    }
+    setLoading(true);
+    setError(null);
+    setRegistrationSuccess(null);
 
-  const getLabel = (score) => {
-    if (score >= 0.90) return "High";
-    if (score >= 0.75) return "Medium";
-    return "Low";
+    const fd = new FormData();
+    fd.append("file", file);
+    fd.append("name", registerName);
+    fd.append("liveness_session_id", currentSessionId);
+    fd.append("device_id", getOrCreateDeviceId());
+    fd.append("errcount", errcount);
+
+    try {
+      console.log(`📤 Sending registration request to ${API_URL}/register ...`);
+      const res = await fetch(`${API_URL}/register`, { method: "POST", body: fd });
+      const data = await res.json();
+      if (data.error) {
+        setError(data.error);
+      } else {
+        setRegistrationSuccess(`Successfully registered ${registerName}!`);
+        setRegisterMode(false);
+        setRegisterName("");
+        setCanMatch(false);
+        setLivenessStep("idle");
+      }
+    } catch (err) {
+      setError("Registration failed. Please try again.");
+    } finally {
+      setLoading(false);
+    }
   };
 
   return (
     <div className="fm-page">
+      {/* Toast Notification Pipeline */}
+      <div className="fm-toast-pipeline">
+        {toasts.map(t => (
+          <div key={t.id} className={`fm-floating-toast ${t.type || "success"}`}>
+            <div className="fm-toast-icon">
+              {t.type === "warning" ? <AlertTriangle size={18} color="#ffbf01" /> :
+                t.type === "error" ? <AlertOctagon size={18} color="#ff4444" /> :
+                  <UserCheck size={18} color="#24aa4d" />}
+            </div>
+            <span>{t.msg}</span>
+          </div>
+        ))}
+      </div>
+
       <header className="fm-header-banner">
-        <img src={bargadLogo} alt="Bargad" className="fm-header-logo" />
+        <div className="fm-header-left">
+          <img src={bargadLogo} alt="Bargad" className="fm-header-logo" />
+        </div>
         <div className="fm-header-profile" ref={profileMenuRef}>
-          <button
-            type="button"
-            className="fm-profile-btn"
-            onClick={() => setProfileMenuOpen((o) => !o)}
-            aria-expanded={profileMenuOpen}
-            aria-haspopup="true"
-            aria-label="Account menu"
-          >
-            <span className="fm-profile-avatar-wrap" aria-hidden>
-              <UserAvatarIcon />
-            </span>
-            <span className="fm-profile-chevron" aria-hidden>
-              {profileMenuOpen ? "▲" : "▼"}
-            </span>
-          </button>
+          <div className="fm-profile-avatar-wrap" onClick={() => setProfileMenuOpen(!profileMenuOpen)}>
+            {/* <div className="fm-profile-info">
+              <span className="fm-profile-name">{userAgentLabel || "Agent"}</span>
+            </div> */}
+            <svg className="fm-profile-avatar-svg" viewBox="0 0 24 24" fill="currentColor">
+              <path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v1c0 .55.45 1 1 1h14c.55 0 1-.45 1-1v-1c0-2.66-5.33-4-8-4z" />
+            </svg>
+          </div>
+
           {profileMenuOpen && (
-            <div className="fm-profile-dropdown" role="menu">
-              {userEmail ? (
-                <div className="fm-profile-email" title={userEmail}>
-                  {userEmail}
-                </div>
-              ) : null}
-              <button
-                type="button"
-                className="fm-profile-logout"
-                role="menuitem"
-                onClick={() => {
-                  setProfileMenuOpen(false);
-                  onLogout?.();
-                }}
-              >
-                Logout
+            <div className="fm-profile-dropdown">
+              <div className="fm-dropdown-header">
+                <div className="fm-user-email">{userEmail || "Session active"}</div>
+                <div className="fm-user-label">{userAgentLabel || "Authorized Agent"}</div>
+              </div>
+              <div className="fm-dropdown-divider" />
+              <button className="fm-dropdown-item logout" onClick={onLogout}>
+                <svg className="fm-logout-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9" /></svg>
+                Log Out
               </button>
             </div>
           )}
@@ -939,255 +786,376 @@ export default function FaceMatch({ userEmail, onLogout }) {
 
       <div className={`fm-container ${showCamera ? "fm-container-wide" : ""}`}>
 
-        <div className="fm-header">
-          <div className="fm-logo">⬡</div>
-          <div>
-            <h1>Face Match</h1>
-            <p>
-              Complete the camera liveness flow, then capture or choose an image — Find Matches requires a verified
-              session.
-            </p>
+        {
+          showCamera &&
+          <div className="cancel-btn-top-liveness-steps">
+            <button className="fm-cancel-btn1" onClick={stopCamera}><ArrowLeft /> Cancel</button>
           </div>
-        </div>
+        }
+        {
+          !showCamera &&
+          <div className="fm-header">
+            <div className="fm-logo">⬡</div>
+            <div>
+              <h1>Face Match</h1>
+              <p>Complete liveness flow, then capture or upload to find matches.</p>
+            </div>
+          </div>
+        }
+
 
         <div className={showCamera ? "fm-upload-camera-row" : ""}>
+          {
+            !showCamera &&
 
-          {/* Left col — dropzone + buttons */}
-          <div className="fm-left-col">
-            <div
-              className={`fm-dropzone ${dragging ? "active" : ""} ${preview ? "has-preview" : ""}`}
-              onClick={() => inputRef.current.click()}
-              onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
-              onDragLeave={() => setDragging(false)}
-              onDrop={handleDrop}
-            >
-              <input
-                ref={inputRef}
-                type="file"
-                accept="image/*"
-                hidden
-                onChange={(e) => handleFile(e.target.files[0])}
-              />
-              {preview ? (
-                <div className="fm-preview">
-                  <img src={preview} alt="Preview" />
-                  <div className="fm-preview-overlay">Click to change</div>
-                </div>
-              ) : (
-                <div className="fm-drop-content">
-                  <div className="fm-drop-icon">📁</div>
-                  <p>Drag & drop or <span>click to upload</span></p>
-                  <small>JPG, PNG, WEBP supported</small>
-                </div>
-              )}
+            <div className="fm-left-col">
+              <div
+                className={`fm-dropzone ${preview ? "has-preview" : ""} ${dragging ? "dragging" : ""}`}
+                onClick={() => inputRef.current.click()}
+                onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
+                onDragLeave={() => setDragging(false)}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  setDragging(false);
+                  const droppedFile = e.dataTransfer.files[0];
+                  if (droppedFile && droppedFile.type.startsWith("image/")) {
+                    setFile(droppedFile);
+                    setPreview(URL.createObjectURL(droppedFile));
+                    setError(null);
+                    setResults([]);
+                  }
+                }}
+              >
+                <input ref={inputRef} type="file" accept="image/*" hidden onChange={(e) => {
+                  const selectedFile = e.target.files[0];
+                  if (selectedFile) {
+                    setFile(selectedFile);
+                    setPreview(URL.createObjectURL(selectedFile));
+                    setError(null);
+                    setResults([]);
+                  }
+                }} />
+                {preview ? <img src={preview} alt="Preview" style={{ width: "100%", height: "100%", objectFit: "contain" }} /> : <div className="fm-drop-content"><p>Drag & drop or <span>click to upload</span></p></div>}
+                {preview && !loading && (
+                  <button className="fm-clear-preview" onClick={(e) => {
+                    e.stopPropagation();
+                    setFile(null);
+                    setPreview(null);
+                    setResults([]);
+                    setError(null);
+                  }}>✕</button>
+                )}
+              </div>
+              <div className="fm-btn-row">
+                <button className="fm-btn" onClick={() => handleMatch()} disabled={loading || results.length > 0} style={{width: "100%"}}>
+                  {loading ? <div className="fm-spinner" /> : null}
+                  {loading ? "Searching..." : results.length > 0 ? "Results Ready" : "Find Matches"}
+                </button>
+                <button className="fm-camera-btn" onClick={showCamera ? stopCamera : startCamera}>
+                  {showCamera ? "✕ Cancel" : "Take Selfie Instead"}
+                </button>
+              </div>
             </div>
+          }
 
-            <div className="fm-btn-row">
-              <button className="fm-btn" onClick={handleMatch} disabled={!file || loading || !canMatch}>
-                {loading ? <><span className="fm-spinner" /> Searching Faces...</> : "Find Matches"}
-              </button>
-              <button className="fm-camera-btn" onClick={showCamera ? stopCamera : startCamera}>
-                {showCamera ? "✕ Cancel" : "Take Selfie Instead"}
-              </button>
-            </div>
-          </div>
-
-          {/* Right col — camera + liveness panel */}
           {showCamera && (
             <div className="fm-right-col">
               <div className="fm-camera-outer">
-                <div className="fm-camera-wrapper">
-                  <video ref={videoRef} autoPlay playsInline className="fm-camera-feed" />
-                  <canvas ref={overlayCanvasRef} className="fm-mesh-overlay" />
-                  <canvas ref={canvasRef} hidden />
+                <div className="fm-camera-container">
+                  <div className="fm-main-camera-contianer-relative">
+
+                    <video ref={videoRef} autoPlay playsInline muted className="fm-camera-feed" />
+                    <canvas ref={overlayCanvasRef} className="fm-mesh-overlay" />
+                    <canvas ref={canvasRef} style={{ display: "none" }} />
+                    <div className="fm-main-camera-contianer-absolute">
+                      {showCamera && (
+                        <div className="fm-liveness-overlay">
+                          {/* Secure Scan State */}
+                          {["calibration", "depth", "light_challenge", "micro"].includes(livenessStep) && (
+                            <div className="fm-gesture-pill">
+                              <div className="fm-gesture-icon-wrap" style={{ background: '#24aa4d' }}>
+                                <Activity size={18} />
+                              </div>
+                              <span className="fm-gesture-text">Secure Scan...</span>
+                            </div>
+                          )}
+
+                          {/* Active Gesture Pill */}
+                          {livenessStep === "gesture" && sessionChallenges[challengeIndex] && (
+                            <div className="fm-gesture-pill-container">
+                              <div className="fm-gesture-pill">
+                                <div className="fm-gesture-icon-wrap">
+                                  {(() => {
+                                    const IconComp = CHALLENGE_UI[sessionChallenges[challengeIndex]]?.icon || Activity;
+                                    return <IconComp size={18} />;
+                                  })()}
+                                </div>
+                                <span className="fm-gesture-text">
+                                  {CHALLENGE_UI[sessionChallenges[challengeIndex]]?.label}
+                                </span>
+                              </div>
+                              <div className="fm-gesture-dots">
+                                {sessionChallenges.map((_, idx) => (
+                                  <div
+                                    key={idx}
+                                    className={`fm-gesture-dot ${idx === challengeIndex ? 'active' : ''} ${idx < challengeIndex ? 'completed' : ''}`}
+                                  />
+                                ))}
+                              </div>
+                            </div>
+                          )}
+
+                          {/* Verification Complete Card */}
+                          {/* {
+                            setTimeout(() => {
+                              {
+                                (livenessLive || livenessStep === "complete" || livenessStep === "capture") && (
+                                  <div className="fm-gesture-pill" style={{ background: 'linear-gradient(135deg, #1b5e20 0%, #2e7d32 100%)' }}>
+                                    <div className="fm-gesture-icon-wrap" style={{ background: '#4caf50' }}>
+                                      <UserCheck size={18} />
+                                    </div>
+                                    <span className="fm-gesture-text">Verification Complete</span>
+                                  </div>
+                                )
+                              }
+                            }, 1200)
+                          } */}
+
+                          {/* Helper message */}
+                          {/* {challengeMsg && !livenessLive && !error && (
+                            <div className="fm-liveness-status-msg" style={{ marginTop: 10, background: 'rgba(0,0,0,0.5)', padding: '4px 12px', borderRadius: 99, fontSize: 12 }}>
+                              <span>{challengeMsg}</span>
+                            </div>
+                          )} */}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* High-tech Viewfinder Corners */}
+                  <div className="fm-viewfinder-corner top-left"></div>
+                  <div className="fm-viewfinder-corner top-right"></div>
+                  <div className="fm-viewfinder-corner bottom-left"></div>
+                  <div className="fm-viewfinder-corner bottom-right"></div>
+
+                  {/* Animated Scanline */}
+                  <div className="fm-scanline"></div>
+
+                  {error && <div className="fm-camera-error-overlay">{error}</div>}
+
+                  {/* Multi-person Toast Alert */}
+                  {multiPersonError && (
+                    <div className="fm-multi-person-toast">
+                      <AlertOctagon size={18} />
+                      <span>Multiple people detected — only one person allowed</span>
+                    </div>
+                  )}
+
                   <div className="fm-camera-actions">
-                    {livenessLive && (
+                    {(livenessLive || livenessStep === "complete" || livenessStep === "capture") && !multiPersonError && (
                       <button className="fm-capture-btn" onClick={takeSelfie}>
-                        📸 Capture
+                        <Camera size={18} /> Capture Selfie
                       </button>
                     )}
-                  </div>
-                  <div className="fm-scan-line" />
-                  <div className="fm-scan-corners">
-                    <span className="corner tl" /><span className="corner tr" />
-                    <span className="corner bl" /><span className="corner br" />
                   </div>
                 </div>
               </div>
 
-              {/* Liveness panel beside camera */}
-              <div className="fm-liveness-panel fm-liveness-beside">
-                {!livenessLive ? (
-                  <>
-                    <div className="fm-liveness-title">
-                      {livenessSessionLoading
-                        ? "⏳ Issuing challenge…"
-                        : modelsLoaded
-                          ? "🔍 Liveness Check"
-                          : "⏳ Loading models…"}
-                    </div>
-                    <div className="fm-liveness-steps">
-                      {sessionChallenges.length === 0 ? (
-                        <div className="fm-liveness-msg">Steps load when the session starts.</div>
-                      ) : (
-                        sessionChallenges.map((c, i) => (
-                          <div
-                            key={`${c}-${i}`}
-                            className={`fm-liveness-step ${
-                              completedChallenges.includes(c) ? "done" :
-                              i === challengeIndex ? "active" : "pending"
-                            }`}
-                          >
-                            {completedChallenges.includes(c) ? "✅" : i === challengeIndex ? "▶" : "○"}
-                            &nbsp;{CHALLENGE_TEXT[c] || c}
-                          </div>
-                        ))
-                      )}
-                    </div>
-                    {challengeMsg && <div className="fm-liveness-msg">{challengeMsg}</div>}
-                  </>
-                ) : (
-                  <div className="fm-liveness-success">✅ Liveness Verified!<br />Click 📸 Capture</div>
-                )}
-              </div>
             </div>
           )}
+
+
+
         </div>
 
         {/* Geo card */}
         {geoData && (
           <div className="fm-geo-card">
             <div className="fm-geo-map">
-              <MapContainer
-                center={[parseFloat(geoData.lat), parseFloat(geoData.long)]}
-                zoom={16}
-                style={{ width: "120px", height: "110px" }}
-                zoomControl={false}
-                dragging={false}
-                scrollWheelZoom={false}
-                doubleClickZoom={false}
-                attributionControl={false}
-              >
-                <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
-                <Marker position={[parseFloat(geoData.lat), parseFloat(geoData.long)]} />
+              <MapContainer center={[parseFloat(geoData.lat), parseFloat(geoData.long)]} zoom={16} style={{ width: "120px", height: "110px" }} zoomControl={false} dragging={false} scrollWheelZoom={false} doubleClickZoom={false} attributionControl={false}>
+                <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" /><Marker position={[parseFloat(geoData.lat), parseFloat(geoData.long)]} />
               </MapContainer>
             </div>
             <div className="fm-geo-details">
-              <div className="fm-geo-city">
-                📍 {geoAddress ? geoAddress.short : "Fetching address..."} 🇮🇳
-              </div>
-              {geoAddress?.full && (
-                <div className="fm-geo-full-address">{geoAddress.full}</div>
-              )}
-              <div className="fm-geo-coords">
-                Lat {parseFloat(geoData.lat).toFixed(6)}° &nbsp; Long {parseFloat(geoData.long).toFixed(6)}°
-              </div>
-              <div className="fm-geo-time">
-                {new Date(geoData.timestamp).toLocaleString("en-IN", {
-                  weekday: "long", day: "2-digit", month: "2-digit",
-                  year: "numeric", hour: "2-digit", minute: "2-digit",
-                  timeZoneName: "short",
-                })}
-              </div>
+              <div className="fm-geo-city"><MapPin size={12} style={{ marginRight: 4 }} /> {geoAddress ? geoAddress.short : "Fetching..."} 🇮🇳</div>
+              {geoAddress && geoAddress.full && <div className="fm-geo-full-address">{geoAddress.full}</div>}
+              <div className="fm-geo-coords">Lat {parseFloat(geoData.lat).toFixed(6)}° &nbsp; Long {parseFloat(geoData.long).toFixed(6)}°</div>
+              <div className="fm-geo-time">{new Date(geoData.timestamp).toLocaleString()}</div>
             </div>
           </div>
         )}
         {geoError && <div className="fm-geo-error">{geoError}</div>}
 
-        {/* Progress Bar */}
         {loading && (
           <div className="fm-progress-wrapper">
-            <div className="fm-progress-bar" style={{ width: `${Math.min(progress, 100)}%` }} />
-            <span>Searching Faces... {Math.min(Math.round(progress), 100)}%</span>
+            <div className="fm-progress-bar" style={{ width: `${progress}%` }} />
+            <span>Searching Faces... {Math.round(progress)}%</span>
           </div>
         )}
 
-        {/* Scanning Animation */}
         {loading && preview && (
           <div className="fm-scan-wrapper">
             <img src={preview} alt="Scanning" className="fm-scan-img" />
             <div className="fm-scan-line" />
-            <div className="fm-scan-corners">
-              <span className="corner tl" /><span className="corner tr" />
-              <span className="corner bl" /><span className="corner br" />
-            </div>
+            <div className="fm-scan-corners"><span className="corner tl" /><span className="corner tr" /><span className="corner bl" /><span className="corner br" /></div>
             <div className="fm-scan-label">Analyzing Face...</div>
           </div>
         )}
 
-        {error && <div className="fm-error">⚠ {error}</div>}
+        {error && <div className="fm-error"><AlertTriangle size={16} style={{ marginRight: 8 }} /> {error}</div>}
 
-        {/* Results */}
-        {results.length > 0 && (
-          <div className="fm-results">
-            <h2>Top {results.length} Matches</h2>
-            <div className="fm-grid">
-              {results.map((match, i) => (
-                <div className="fm-card" key={i} onClick={() => setSelectedImg(match)}>
-                  <div className="fm-rank">#{i + 1}</div>
-                  <div className="fm-card-img">
-                    {match.images && match.images.length > 0 ? (
-                      <>
-                        <div className={`fm-multi-imgs ${hoverCardIndex === i ? "fm-img-hidden" : ""}`}>
-                          {match.images.map((imgUrl, j) => (
-                            <img key={j} src={imgUrl} alt={`match-${j}`} className="fm-multi-img"
-                              onClick={(e) => { e.stopPropagation(); setSelectedImg({ ...match, image_url: imgUrl }); }}
-                            />
-                          ))}
-                        </div>
-                        <img src={preview} alt="Your upload"
-                          className={`fm-img-uploaded ${hoverCardIndex === i ? "fm-img-visible" : ""}`}
-                        />
-                        <button className="fm-compare-btn"
-                          onMouseEnter={() => setHoverCardIndex(i)}
-                          onMouseLeave={() => setHoverCardIndex(null)}
-                          onClick={(e) => e.stopPropagation()}
-                        >Compare</button>
-                      </>
-                    ) : (
-                      <div className="fm-no-img">No Image</div>
-                    )}
-                  </div>
-                  <div className="fm-card-body">
-                    <p className="fm-name">{match.label.replace(/_/g, " ")}</p>
-                    <div className="fm-bar-bg">
-                      <div className="fm-bar-fill"
-                        style={{ width: `${Math.min(match.confidence * 100, 100)}%`, background: getColor(match.confidence) }}
-                      />
-                    </div>
-                    <div className="fm-score-row">
-                      <span className="fm-badge" style={{ background: getColor(match.confidence) }}>
-                        {getLabel(match.confidence)}
-                      </span>
-                      <span className="fm-score fm-score-highlight" style={{ color: getColor(match.confidence) }}>
-                        {(match.confidence * 100).toFixed(1)}%
-                      </span>
-                    </div>
-                  </div>
+        {results.length > 0 && !loading ? (
+          (results[0].confidence * 100).toFixed(0) >= 70 ? (
+            <div>
+              <div className="fm-verification-summary-bar">
+                <div className="fm-verified-badge">
+                  <UserCheck size={18} />
+                  <span>Identity Verified (Doc: {results[0]?.registered_doc_type || "Aadhar"})</span>
                 </div>
-              ))}
+                <div className="fm-match-indicator">
+                  Top Match: <strong>{(results[0].confidence * 100).toFixed(0)}%</strong>
+                </div>
+              </div>
+
+              {/* Results Summary Section */}
+              <div className="fm-results-summary">
+                {registrationSuccess && (
+                  <div className="fm-status-alert success">
+                    <UserCheck size={20} />
+                    <span>{registrationSuccess}</span>
+                  </div>
+                )}
+
+                <div className="fm-results-container">
+                  <div className="fm-grid">
+                    {results
+                      .filter(match => match.label !== "txt")
+                      .slice(0, showAllResults ? undefined : 1)
+                      .map((match, i) => (
+                        <div className="fm-card result-card" key={i}>
+                          <div className="fm-rank">#{i + 1}</div>
+                          <div className="image-compare">
+                            <div className="image-box">
+                              <p>Matched (DB)</p>
+                              <img src={match.matched_image || (match.images && match.images[0])} alt="DB" />
+                            </div>
+                            <div className="image-box">
+                              <p>Captured (Live)</p>
+                              <img src={capturedImage || preview} alt="Live" />
+                            </div>
+                          </div>
+                          <div className="fm-card-body result-info">
+                            <div className="fm-name-row">
+                              <h2 className="fm-match-title">{Math.round(match.confidence * 100)}% Match</h2>
+                              <span className="doc-badge">
+                                VERIFIED (Doc: {match.registered_doc_type || "Aadhar"})
+                              </span>
+                            </div>
+                            <p className="fm-label-name">{(match.label || "Unknown").replace(/_/g, " ")}</p>
+                            <div className="fm-bar-bg">
+                              <div
+                                className="fm-bar-fill"
+                                style={{ width: `${match.confidence * 100}%`, background: getColor(match.confidence) }}
+                              />
+                            </div>
+                            <div className="fm-score-row">
+                              <span className="fm-badge" style={{ background: getColor(match.confidence) }}>
+                                {getLabel(match.confidence)}
+                              </span>
+                            </div>
+                          </div>
+                        </div>
+                      ))}
+                  </div>
+
+                  {results.filter(m => m.label !== "txt").length > 1 && !showAllResults && (
+                    <div className="fm-load-more-container">
+                      <button className="fm-load-more-btn" onClick={() => setShowAllResults(true)}>
+                        Load More Matches
+                      </button>
+                    </div>
+                  )}
+
+                  {penaltyDetails.length > 0 && (
+                    <div className="fm-penalty-container">
+                      <h3 className="fm-penalty-title">Security Penalty Breakdown</h3>
+                      <table className="fm-penalty-table">
+                        <thead>
+                          <tr>
+                            <th>Violation Type</th>
+                            <th>Occurrence</th>
+                            <th>Reduction</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {penaltyDetails.map((p, i) => (
+                            <tr key={i}>
+                              <td>{p.type}</td>
+                              <td>{p.count}x</td>
+                              <td className="fm-penalty-red">-{Math.round(p.penalty * 100)}%</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          ) : (
+            <>
+              <div className="fm-error" style={{ marginTop: 20 }}>
+                <AlertTriangle size={16} style={{ marginRight: 8 }} />
+                Security Check Failed: Match confidence too low ({(results[0].confidence * 100).toFixed(0)}%).
+                Please ensure you are the registered agent and not using a digital screen.
+              </div>
+
+              {penaltyDetails.length > 0 && (
+                <div className="fm-penalty-container">
+                  <h3 className="fm-penalty-title">Security Penalty Breakdown</h3>
+                  <table className="fm-penalty-table">
+                    <thead>
+                      <tr>
+                        <th>Violation Type</th>
+                        <th>Occurrence</th>
+                        <th>Reduction</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {penaltyDetails.map((p, i) => (
+                        <tr key={i}>
+                          <td>{p.type}</td>
+                          <td>{p.count}x</td>
+                          <td className="fm-penalty-red">-{Math.round(p.penalty * 100)}%</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+              <div className="fm-penalty-retry">
+                <p>Verification failed due to high security risk or low similarity. Please try again in a well-lit environment.</p>
+                <button className="fm-btn retry-btn" onClick={startCamera}>
+                  <Camera size={18} /> Retry Verification
+                </button>
+              </div>
+            </>
+          )
+        ) : null}
+
+        {rejectionError && (
+          <div className="fm-modal fm-rejection-modal" onClick={() => setRejectionError(null)}>
+            <div className="fm-modal-box fm-rejection-box" onClick={(e) => e.stopPropagation()}>
+              <div className="fm-rejection-icon"><AlertOctagon size={64} color="#ff0000" /></div>
+              <h2>Security Rejection</h2>
+              <p>{rejectionError}</p>
+              <div className="fm-rejection-warning">Our system has detected a potential fraud attempt using an electronic device or non-live media. Access to biometric matching is blocked.</div>
+              <button className="fm-modal-close fm-rejection-close" onClick={() => setRejectionError(null)}>✕ Close</button>
             </div>
           </div>
         )}
-
-        {selectedImg && (
-          <div className="fm-modal" onClick={() => setSelectedImg(null)}>
-            <div className="fm-modal-box" onClick={(e) => e.stopPropagation()}>
-              <img src={selectedImg.image_url} alt="Match" />
-              <p style={{ color: getColor(selectedImg.confidence) }}>
-                {(selectedImg.confidence * 100).toFixed(1)}% Match
-              </p>
-              <span className="fm-modal-label">{selectedImg.label.replace(/_/g, " ")}</span>
-              <button className="fm-modal-close" onClick={() => setSelectedImg(null)}>✕ Close</button>
-            </div>
-          </div>
-        )}
-
       </div>
-
-      <div className="fm-footer-branding">
-        <img src={bargadBranding} alt="Bargad" />
-      </div>
+      <div className="fm-footer-branding"><img src={bargadBranding} alt="Bargad" /></div>
     </div>
   );
 }

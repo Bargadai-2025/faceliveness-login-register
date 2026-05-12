@@ -5,10 +5,10 @@ import torch
 import numpy as np
 import cloudinary
 import cloudinary.uploader
-from pymongo import MongoClient
 from tqdm import tqdm
 from facenet_pytorch import MTCNN, InceptionResnetV1
 from dotenv import load_dotenv
+from database import execute_sync, insert_face_sync
 
 load_dotenv()
 
@@ -18,11 +18,6 @@ cloudinary.config(
     api_key=os.getenv("CLOUDINARY_API_KEY"),
     api_secret=os.getenv("CLOUDINARY_API_SECRET")
 )
-
-# MongoDB setup
-client = MongoClient(os.getenv("MONGODB_URI"))
-db = client["facematch"]
-collection = db["faces"]
 
 # Tracking files: record which photos are already indexed (so we can append only new ones)
 INDEXED_BARGAD_FILE = "indexed_bargad.txt"
@@ -44,11 +39,11 @@ def append_tracked(path, key):
 # ---- Prompt ----
 confirm_drop = input("🗑️ Drop existing data and rebuild everything? (y/n): ")
 if confirm_drop.lower() == "y":
-    collection.drop()
+    execute_sync("DELETE FROM faces")
     for f in (INDEXED_BARGAD_FILE, INDEXED_LFW_FILE):
         if os.path.exists(f):
             os.remove(f)
-    print("🗑️ Cleared existing collection and tracking files\n")
+    print("🗑️ Cleared existing PostgreSQL rows and tracking files\n")
     index_bargad = True
     append_only = False
 else:
@@ -131,12 +126,12 @@ with torch.no_grad():
                     )
                     image_url = upload["secure_url"]
 
-                    collection.insert_one({
-                        "label": person,
-                        "source": "bargad",
-                        "image_url": image_url,
-                        "embedding": emb.tolist()
-                    })
+                    insert_face_sync(
+                        label=person,
+                        source="bargad",
+                        image_url=image_url,
+                        embedding=emb.tolist(),
+                    )
 
                     total += 1
                     append_tracked(INDEXED_BARGAD_FILE, key)
@@ -214,12 +209,12 @@ with torch.no_grad():
                     )
                     image_url = upload["secure_url"]
 
-                    collection.insert_one({
-                        "label": person,
-                        "source": "lfw",
-                        "image_url": image_url,
-                        "embedding": emb.tolist()
-                    })
+                    insert_face_sync(
+                        label=person,
+                        source="lfw",
+                        image_url=image_url,
+                        embedding=emb.tolist(),
+                    )
 
                     lfw_count += 1
                     total += 1
@@ -239,4 +234,4 @@ with torch.no_grad():
         if append_only:
             print("⚠️ dataset/lfw-deepfunneled not found, skipping LFW.\n")
 
-print(f"\n🎉 Total — {total} faces indexed into MongoDB + Cloudinary")
+print(f"\n🎉 Total — {total} faces indexed into PostgreSQL + Cloudinary")

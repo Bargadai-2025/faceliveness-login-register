@@ -1,18 +1,47 @@
 import os
+import sys
+
+# Ensure venv site-packages are accessible even if uvicorn was started globally
+venv_path = os.path.join(os.path.dirname(__file__), "venv", "Lib", "site-packages")
+if os.path.exists(venv_path) and venv_path not in sys.path:
+    sys.path.insert(0, venv_path)
+
 import cv2
 import torch
 import numpy as np
+import base64
 import uuid
 import secrets
 from fastapi import FastAPI, File, UploadFile, Form, Body, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pymongo import MongoClient
-from pymongo.errors import DuplicateKeyError
 from facenet_pytorch import MTCNN, InceptionResnetV1
 from dotenv import load_dotenv
 import uvicorn
 from datetime import datetime, timedelta
 from typing import Optional, List, Tuple, Any, Dict
+import cloudinary
+import cloudinary.uploader
+
+from liveness_session import session_manager, ALL_GESTURE_IDS, LIGHT_CHALLENGES
+from frame_processor import process_frame
+from face_detection import compute_passive_liveness, remove_background
+from liveness_checks import check_reaction_timing
+from database import (
+    close_db_pool,
+    complete_liveness_session_if_valid,
+    create_liveness_session,
+    ensure_indexes,
+    get_face_embedding_by_label,
+    get_faces_by_labels,
+    get_liveness_session,
+    get_valid_completed_liveness_session,
+    init_db_pool,
+    insert_auth_log,
+    insert_face,
+    list_face_labels,
+    list_faces_for_matching,
+    update_liveness_session_status,
+)
 
 load_dotenv()
 
@@ -27,32 +56,15 @@ app.add_middleware(
         "https://www.facematch.bargad.ai",
         "https://face-match-test-xgua.vercel.app",
         "http://localhost:5173",
+        "http://127.0.0.1:5173",
         "http://localhost:3000",
+        "http://127.0.0.1:3000",
     ],
     allow_origin_regex=r"^https://([a-z0-9-]+\.)*bargad\.ai$",
-    allow_credentials=False,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-client = MongoClient(os.getenv("MONGODB_URI"))
-db = client["facematch"]
-collection = db["faces"]
-auth_logs = db["auth_logs"]   # NEW: stores geo + liveness logs
-liveness_sessions = db["liveness_sessions"]
-
-# Must match frontend gesture IDs (pool used for random 4-gesture sessions).
-ALL_GESTURE_IDS = [
-    "turn_left",
-    "turn_right",
-    "nod",
-    "look_up",
-    "smile",
-    "surprised",
-    "mouth_open",
-    "tilt_head",
-    "wide_eyes",
-]
 
 SESSION_TTL_MINUTES = 15
 SESSION_ISSUE_MAX_ATTEMPTS = 50
@@ -61,111 +73,266 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 mtcnn = MTCNN(image_size=160, margin=20, device=DEVICE)
 model = InceptionResnetV1(pretrained='vggface2').eval().to(DEVICE)
 
-MIN_CONFIDENCE_BARGAD = 0.72
+# Cloudinary Setup
+cloudinary.config(
+    cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
+    api_key=os.getenv("CLOUDINARY_API_KEY"),
+    api_secret=os.getenv("CLOUDINARY_API_SECRET")
+)
+
+MIN_CONFIDENCE_BARGAD = 0.65
 MIN_CONFIDENCE_LFW = 0.55
 TOP_K = 50
 
+# ════════════════════════════════════════════════════════════
+# IDENTITY VERIFICATION CALLBACK
+# ════════════════════════════════════════════════════════════
+
+def verify_identity_callback(img_bgr, target_embedding):
+    """
+    Continuous identity check during liveness flow.
+    Compares current frame against the selected agent's stored embedding.
+    """
+    try:
+        # Convert BGR (OpenCV) to RGB (MTCNN expects RGB)
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        
+        # 1. Detect Face & Generate Tensor
+        face_tensor = mtcnn(img_rgb)
+        if face_tensor is None:
+            return False # No face found in this frame
+            
+        # 2. Extract Embedding
+        face_tensor = face_tensor.unsqueeze(0).to(DEVICE)
+        with torch.no_grad():
+            emb = model(face_tensor).cpu().numpy()[0].astype("float32")
+            
+        # 3. Normalize & Compare (Cosine Similarity)
+        emb = emb / (np.linalg.norm(emb) + 1e-6)
+        score = float(np.dot(emb, target_embedding))
+        
+        print(f"👤 Agent Verification — Score: {score:.3f} (Agent Match: {score > 0.60})")
+        
+        # Use 0.60 as a robust threshold for continuous matching (higher = stricter)
+        return score > 0.60
+    except Exception as e:
+        print(f"⚠️ Identity check internal error: {e}")
+        return False
+
 
 @app.on_event("startup")
-def _ensure_liveness_indexes():
+async def _startup():
+    await init_db_pool()
     try:
-        liveness_sessions.create_index(
-            [("device_id", 1), ("sequence_key", 1)],
-            unique=True,
-            name="uniq_device_sequence",
-        )
-        liveness_sessions.create_index(
-            "session_id",
-            unique=True,
-            name="uniq_session_id",
-        )
+        await ensure_indexes()
     except Exception as e:
-        print(f"Liveness index warning: {e}")
+        print(f"PostgreSQL index warning: {e}")
 
 
-def _passive_liveness_from_bgr(img_bgr: np.ndarray) -> Tuple[bool, float, str]:
-    """Texture / sharpness heuristics for print / screen replay (single frame)."""
-    if img_bgr is None or img_bgr.size == 0:
-        return False, 0.0, "Empty image"
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    lap_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-    dft = np.fft.fft2(gray)
-    dft_shift = np.fft.fftshift(dft)
-    magnitude = 20 * np.log(np.abs(dft_shift) + 1)
-    freq_score = float(np.mean(magnitude))
-    sobel_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
-    sobel_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
-    grad_mean = float(np.mean(np.sqrt(sobel_x ** 2 + sobel_y ** 2)))
+@app.on_event("shutdown")
+async def _shutdown():
+    await close_db_pool()
 
-    lap_norm = min(lap_var / 420.0, 1.0)
-    freq_norm = min(freq_score / 95.0, 1.0)
-    grad_norm = min(grad_mean / 35.0, 1.0)
-    score = round(lap_norm * 0.45 + freq_norm * 0.35 + grad_norm * 0.2, 3)
-    # Stricter gate for match path than standalone /liveness demo.
-    is_live = score > 0.42
-    reason = "OK" if is_live else "Possible spoof: low texture / sharpness / edge energy"
-    return is_live, score, reason
+# End of session index setup
+
+# ════════════════════════════════════════════════════════════
+# AGENT SELECTION & VERIFICATION
+# ════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════
+
+@app.get("/agents/list")
+async def list_agents():
+    """Returns a list of 5 specific agents for the login demo."""
+    agent_labels = ["Angel Mary","Topendra Sir","Bhakti Shelar", "Divya Pratap", "Manish Kalantre","Pranali Patil", "Tauheed Ahmed", "Yash Jadhav", "Yogesh Shivtarkar" ,"Manas Vellalore", "Atal_Bihari_Vajpayee"]
+    
+    # Fetch details from DB
+    agents = await get_faces_by_labels(agent_labels)
+    agents_db = {a["label"]: a for a in agents}
+    
+    result = []
+    for label in agent_labels:
+        if label in agents_db:
+            result.append({
+                "label": agents_db[label]["label"],
+                "image_url": agents_db[label].get("image_url")
+            })
+        else:
+            # Fallback for demo if DB is not yet populated with these specific labels
+            result.append({
+                "label": label,
+                "image_url": f"https://ui-avatars.com/api/?name={label.replace(' ', '+')}&background=random"
+            })
+    return result
+
+@app.get("/agents/list")
+async def list_agents():
+    """Returns a unique list of agent names registered in the database."""
+    try:
+        # Get unique labels from PostgreSQL, excluding any "txt" placeholders
+        labels = await list_face_labels()
+        # Return as a list of objects to match the frontend expectation in LoginPage.jsx
+        return [{"label": l} for l in labels]
+    except Exception as e:
+        print(f"❌ Error fetching agent list: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-def _pick_random_gestures_four() -> List[str]:
-    ids = list(ALL_GESTURE_IDS)
-    secrets.SystemRandom().shuffle(ids)
-    return ids[:4]
+# ════════════════════════════════════════════════════════════
+# NEW BACKEND-DRIVEN LIVENESS ENDPOINTS
+# ════════════════════════════════════════════════════════════
 
+@app.post("/liveness/session/start")
+async def start_liveness_session(payload: Dict[str, Any] = Body(...)):
+    """Start a new backend-driven liveness session."""
+    try:
+        device_id = (payload or {}).get("device_id")
+        if not device_id or not isinstance(device_id, str) or len(device_id) > 128:
+            raise HTTPException(status_code=400, detail="Invalid device_id")
 
-@app.post("/liveness/session")
-async def create_liveness_session(payload: Dict[str, Any] = Body(...)):
-    device_id = (payload or {}).get("device_id")
-    if not device_id or not isinstance(device_id, str) or len(device_id) > 128:
-        raise HTTPException(status_code=400, detail="Invalid device_id")
+        agent_label = (payload or {}).get("agent_label")
+        agent_emb = None
+        if agent_label:
+            embedding = await get_face_embedding_by_label(agent_label)
+            if embedding:
+                agent_emb = np.array(embedding, dtype="float32")
+                # Normalize
+                norm = np.linalg.norm(agent_emb)
+                if norm > 0:
+                    agent_emb = agent_emb / norm
 
-    for _ in range(SESSION_ISSUE_MAX_ATTEMPTS):
-        gestures = _pick_random_gestures_four()
-        sequence_key = "|".join(gestures)
-        session_id = str(uuid.uuid4())
-        expires_at = datetime.utcnow() + timedelta(minutes=SESSION_TTL_MINUTES)
-        doc = {
-            "session_id": session_id,
-            "device_id": device_id,
-            "gestures": gestures,
-            "sequence_key": sequence_key,
-            "status": "issued",
-            "expires_at": expires_at,
-            "created_at": datetime.utcnow(),
-        }
+        sess = session_manager.create_session(device_id, agent_label=agent_label, agent_embedding=agent_emb)
+        print(f"🆕 Creating session: {sess.session_id} for device: {device_id} (Agent: {agent_label})")
+
+        # Also log to PostgreSQL for audit
         try:
-            liveness_sessions.insert_one(doc)
-            return {"session_id": session_id, "gestures": gestures}
-        except DuplicateKeyError:
-            continue
+            await create_liveness_session(
+                session_id=sess.session_id,
+                device_id=device_id,
+                gestures=sess.gestures,
+                status="issued",
+                expires_at=datetime.utcnow() + timedelta(minutes=SESSION_TTL_MINUTES),
+                raw_data={
+                    "agent_label": agent_label,
+                    "mode": "backend_driven",
+                },
+            )
+        except Exception as db_err:
+            print(f"⚠️ PostgreSQL liveness log warning: {db_err}")
 
-    raise HTTPException(
-        status_code=409,
-        detail="Could not issue a new gesture sequence for this device (all combinations may be exhausted).",
-    )
+        return {
+            "session_id": sess.session_id,
+            "gestures": sess.gestures,
+            "step": "calibration",
+            "agent_label": agent_label
+        }
+    except Exception as e:
+        print(f"❌ Error in start_liveness_session: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/liveness/frame")
+async def liveness_frame(
+    session_id: str = Form(...),
+    frame: UploadFile = File(...),
+):
+    """Process a single frame through the backend liveness pipeline."""
+    sess = session_manager.get(session_id)
+    if sess is None:
+        raise HTTPException(status_code=400, detail="Invalid or expired session")
+
+    raw = await frame.read()
+    if len(raw) == 0:
+        raise HTTPException(status_code=400, detail="Empty frame")
+
+    result = process_frame(sess, raw, identity_callback=verify_identity_callback)
+    return result
 
 
 @app.post("/liveness/session/complete")
 async def complete_liveness_session(payload: Dict[str, Any] = Body(...)):
+    """Validate and complete a backend-driven liveness session."""
     session_id = (payload or {}).get("session_id")
     if not session_id:
         raise HTTPException(status_code=400, detail="session_id required")
 
-    now = datetime.utcnow()
-    res = liveness_sessions.update_one(
-        {
-            "session_id": session_id,
-            "status": "issued",
-            "expires_at": {"$gt": now},
-        },
-        {"$set": {"status": "completed", "completed_at": now}},
-    )
-    if res.matched_count == 0:
+    sess = session_manager.get(session_id)
+    if sess is None:
+        # Fallback: check PostgreSQL for legacy or already persisted sessions
+        now = datetime.utcnow()
+        updated = await complete_liveness_session_if_valid(
+            session_id=session_id,
+            now=now,
+            raw_updates={"completed_at": now.isoformat()},
+        )
+        if not updated:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid or expired session, or already completed.",
+            )
+        return {"ok": True, "verified": True, "confidence": 0.95}
+
+    # Validate all checks passed
+    if sess.step != "complete":
         raise HTTPException(
             status_code=400,
-            detail="Invalid or expired session, or already completed.",
+            detail=f"Session not complete. Current step: {sess.step}",
         )
-    return {"ok": True}
+
+
+    # Check reaction timing
+    timing_ok, timing_reason = check_reaction_timing(sess.reaction_times)
+
+    # Calculate confidence
+    confidence = 0.5
+    if sess.depth_passed:
+        confidence += 0.15
+    if sess.micro_passed:
+        confidence += 0.15
+    if sess.light_passed:
+        confidence += 0.1
+    if sess.all_gestures_done:
+        confidence += 0.1
+    if timing_ok:
+        confidence += 0.05
+    confidence = min(round(confidence, 2), 1.0)
+
+    if sess.device_detected:
+        print(f"⚠️ Device detected during session ({sess.device_class}), allowing completion with penalty.")
+        # Lower baseline confidence if device was detected during liveness
+        confidence = max(0.1, confidence - 0.3)
+
+    # Update PostgreSQL
+    now = datetime.utcnow()
+    await update_liveness_session_status(
+        session_id=session_id,
+        status="completed",
+        raw_updates={
+            "completed_at": now,
+            "confidence": confidence,
+            "depth_passed": sess.depth_passed,
+            "micro_passed": sess.micro_passed,
+            "light_passed": sess.light_passed,
+            "gestures_completed": sess.current_gesture_idx,
+            "timing_ok": timing_ok,
+        },
+    )
+
+    # Remove from in-memory store (keep in PostgreSQL)
+    # Don't remove yet — /match still needs to verify it
+    sess.step = "verified"
+
+    return {"ok": True, "verified": True, "confidence": confidence}
+
+
+# ════════════════════════════════════════════════════════════
+# LEGACY ENDPOINTS (kept for backward compatibility)
+# ════════════════════════════════════════════════════════════
+
+@app.post("/liveness/session")
+async def create_liveness_session_legacy(payload: Dict[str, Any] = Body(...)):
+    """Legacy session endpoint — redirects to new start."""
+    return await start_liveness_session(payload)
 
 
 @app.post("/liveness/temporal")
@@ -178,11 +345,14 @@ async def liveness_temporal(
     if len(files) < 4:
         raise HTTPException(status_code=400, detail="Need at least 4 frames")
 
-    sess = liveness_sessions.find_one(
-        {"session_id": session_id, "device_id": device_id, "status": "issued"}
+    sess_doc = await get_liveness_session(
+        session_id=session_id,
+        device_id=device_id,
     )
-    if not sess or sess.get("expires_at") < datetime.utcnow():
-        raise HTTPException(status_code=400, detail="Invalid or expired session")
+    if not sess_doc:
+        raise HTTPException(status_code=400, detail="Invalid session")
+    if sess_doc.get("expires_at") and sess_doc["expires_at"] < datetime.utcnow():
+        raise HTTPException(status_code=400, detail="Expired session")
 
     lum: List[float] = []
     lap_vars: List[float] = []
@@ -204,7 +374,6 @@ async def liveness_temporal(
     motion = float(np.std(diffs))
     lap_std = float(np.std(lap_vars)) if len(lap_vars) >= 2 else 0.0
 
-    # Low motion across burst suggests frozen replay; strong periodicity in diffs suggests refresh rate.
     replay_risk = 0.0
     if motion < 0.35:
         replay_risk += 0.45
@@ -216,7 +385,6 @@ async def liveness_temporal(
         spec = np.abs(np.fft.rfft(z))
         spec = spec / (np.max(spec) + 1e-6)
         freqs = np.fft.rfftfreq(len(z), d=1.0)
-        # Rough band for 24–30 Hz if ~10 fps sampling → map to index band
         mask = (freqs > 0.18) & (freqs < 0.45)
         if np.any(mask) and float(np.max(spec[mask])) > 0.55:
             replay_risk += 0.35
@@ -226,7 +394,7 @@ async def liveness_temporal(
     return {"ok": ok, "replay_risk": replay_risk, "motion_std": round(motion, 4)}
 
 
-# ── MODIFIED /match: accepts optional geo fields ──
+# ── /match: accepts optional geo fields ──
 @app.post("/match")
 async def match_face(
     file: UploadFile = File(...),
@@ -235,69 +403,176 @@ async def match_face(
     geo_timestamp: Optional[str] = Form(None),
     liveness_session_id: Optional[str] = Form(None),
     device_id: Optional[str] = Form(None),
+    errcount: Optional[int] = Form(0),
+    expected_label: Optional[str] = Form(None),
 ):
+    print("errcount : ", errcount)
+    penalties_breakdown = []
     temp_path = f"temp_{file.filename}"
     with open(temp_path, "wb") as f:
         f.write(await file.read())
 
     try:
-        img = cv2.imread(temp_path)
-        if img is None:
+        # Optional liveness verification
+        if liveness_session_id and device_id:
+            now = datetime.utcnow()
+            # Check in-memory session first (backend-driven)
+            mem_sess = session_manager.get(liveness_session_id)
+            if mem_sess and mem_sess.step == "verified":
+                pass  # Backend-driven session verified
+            else:
+                # Fallback to PostgreSQL (legacy or already-completed)
+                sess = await get_valid_completed_liveness_session(
+                    session_id=liveness_session_id,
+                    device_id=device_id,
+                    now=now,
+                )
+                if not sess:
+                    return {"error": "Invalid or expired liveness session. Please start the camera flow again."}
+        else:
+            print("⚠️ Match requested without liveness session (optional mode)")
+
+        # 1. READ ORIGINAL IMAGE
+        img_raw = cv2.imread(temp_path)
+        if img_raw is None:
             return {"error": "Could not read image."}
 
-        if not liveness_session_id or not device_id:
-            return {"error": "Liveness verification required. Complete the camera liveness steps, then try again."}
-
-        now = datetime.utcnow()
-        sess = liveness_sessions.find_one(
-            {
-                "session_id": liveness_session_id,
-                "device_id": device_id,
-                "status": "completed",
-                "expires_at": {"$gt": now},
-            }
-        )
-        if not sess:
-            return {"error": "Invalid or expired liveness session. Please start the camera flow again."}
-
-        live_ok, live_score, live_reason = _passive_liveness_from_bgr(img)
-        if not live_ok:
-            return {
-                "error": f"Liveness check failed on selfie ({live_reason}). Score={live_score:.3f}",
-            }
-
-        h, w = img.shape[:2]
-        if max(h, w) > 800:
-            scale = 800 / max(h, w)
-            img = cv2.resize(img, (int(w * scale), int(h * scale)))
-
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-
+        # 3. DETECT FACE ON ORIGINAL IMAGE
+        # Resize for faster/more reliable detection if huge
+        h, w = img_raw.shape[:2]
+        img_detect = img_raw.copy()
+        if max(h, w) > 1024:
+            scale = 1024 / max(h, w)
+            img_detect = cv2.resize(img_raw, (int(w * scale), int(h * scale)))
+        
+        img_detect_rgb = cv2.cvtColor(img_detect, cv2.COLOR_BGR2RGB)
+        
+        face = None
+        face_landmarks_mp = None
         try:
-            face = mtcnn(img)
-        except Exception:
-            return {"error": "Face detection failed. Try another photo."}
+            # Primary detection
+            face = mtcnn(img_detect_rgb)
+            
+            # Use MediaPipe for landmarks (needed for ROI-based liveness)
+            from face_detection import detect_faces
+            mp_faces = detect_faces(img_detect) # detect_faces expects BGR
+            if mp_faces:
+                orig_h, orig_w = img_raw.shape[:2]
+                det_h, det_w = img_detect.shape[:2]
+                scale_x = orig_w / det_w
+                scale_y = orig_h / det_h
+                
+                face_landmarks_mp = []
+                for p in mp_faces[0]["pts_68"]:
+                    face_landmarks_mp.append({
+                        "x": p["x"] * scale_x,
+                        "y": p["y"] * scale_y
+                    })
+                
+            if face is None:
+                # Fallback: MediaPipe detection
+                print("⚠️ MTCNN failed on original, trying MediaPipe fallback...")
+                if mp_faces:
+                    print("✅ MediaPipe found a face. Attempting guided MTCNN...")
+                    pts = mp_faces[0]["pts_68"]
+                    xs = [p["x"] for p in pts]
+                    ys = [p["y"] for p in pts]
+                    x1, y1, x2, y2 = min(xs), min(ys), max(xs), max(ys)
+                    # Expand bbox
+                    w_b, h_b = x2 - x1, y2 - y1
+                    x1 = max(0, int(x1 - w_b * 0.3))
+                    y1 = max(0, int(y1 - h_b * 0.3))
+                    x2 = min(img_detect.shape[1], int(x2 + w_b * 0.3))
+                    y2 = min(img_detect.shape[0], int(y2 + h_b * 0.3))
+                    
+                    crop_bgr = img_detect[y1:y2, x1:x2]
+                    crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+                    face = mtcnn(crop_rgb)
+
+        except Exception as e:
+            print(f"Face detection crash: {e}")
+            return {"error": f"Face detection engine error: {str(e)}"}
 
         if face is None:
-            return {"error": "No face detected in the uploaded image."}
+            return {"error": "No face detected in the uploaded image. Please ensure your face is clearly visible, well-lit, and facing the camera directly."}
 
+        # 4. HARD ANTI-SCREEN DETECTION (YOLO & TEXTURE)
+        # Check for devices (phones, laptops) in the frame
+        from frame_processor import _get_yolo, DEVICE_CLASSES
+        yolo = _get_yolo()
+        if yolo:
+            try:
+                # Use a much lower confidence (0.30) for final capture to catch distant or partial devices
+                results = yolo(img_raw, verbose=False, conf=0.30)
+                for r in results:
+                    for box in r.boxes:
+                        cls_name = r.names[int(box.cls[0])].lower()
+                        if cls_name in DEVICE_CLASSES:
+                            display_name = DEVICE_CLASSES[cls_name]
+                            print(f"🚨 YOLO Hard Detect: {display_name} found in selfie frame!")
+                            # Instead of error, add to errcount penalty
+                            errcount += 30
+                            penalties_breakdown.append({
+                                "type": "Electronic Device Detected",
+                                "penalty": 0.30,
+                                "count": 1,
+                                "detail": f"YOLO detected: {display_name}"
+                            })
+            except Exception as e:
+                print(f"YOLO selfie check error: {e}")
+
+        # Perform ROI-based liveness check (Strict mode for final matching)
+        live_ok, live_score, live_reason = compute_passive_liveness(img_raw, face_landmarks_mp, strict=True)
+        if not live_ok:
+            print(f"⚠️ ROI Liveness failed on selfie: {live_reason}")
+            # Add to penalty instead of blocking
+            errcount += 25
+            penalties_breakdown.append({
+                "type": "Passive Liveness Verification",
+                "penalty": 0.25,
+                "count": 1,
+                "detail": f"ROI Check failed: {live_reason}"
+            })
+
+        # 5. PREPARE PROCESSED IMAGE FOR UI (with background removal)
+        img_processed = remove_background(img_raw)
+        if max(img_processed.shape[:2]) > 800:
+            scale = 800 / max(img_processed.shape[:2])
+            img_processed = cv2.resize(img_processed, (int(img_processed.shape[1] * scale), int(img_processed.shape[0] * scale)))
+
+        # 5. GENERATE EMBEDDING
         face = face.unsqueeze(0).to(DEVICE)
         with torch.no_grad():
             emb = model(face).cpu().numpy()[0].astype("float32")
-        emb = emb / np.linalg.norm(emb)
+        emb = emb / (np.linalg.norm(emb) + 1e-6)
+        if np.isnan(emb).any():
+            return {"error": "Face analysis yielded invalid results. Please check lighting and try again."}
 
-        all_docs = list(collection.find({}, {"label": 1, "source": 1, "image_url": 1, "embedding": 1}))
-        print(f"📦 Loaded {len(all_docs)} docs from MongoDB")
+        all_docs = await list_faces_for_matching()
+        print(f"📦 Loaded {len(all_docs)} faces from PostgreSQL")
 
         raw_results = []
         for doc in all_docs:
+            # Safety check: ensure embedding exists and has the correct length (512)
+            if not doc.get("embedding") or len(doc["embedding"]) != 512:
+                continue
+                
             db_emb = np.array(doc["embedding"], dtype="float32")
-            db_emb = db_emb / np.linalg.norm(db_emb)
+            # Avoid division by zero
+            norm = np.linalg.norm(db_emb)
+            if norm == 0:
+                continue
+                
+            db_emb = db_emb / norm
             score = float(np.dot(emb, db_emb))
+            # PostgreSQL faces currently stores only core matching fields.
+            d_type = doc.get("doc_type") or "Selfie"
+            
             raw_results.append({
                 "label": doc["label"],
                 "source": doc["source"],
                 "image_url": doc["image_url"],
+                "doc_type": d_type,
                 "score": round(score, 3)
             })
 
@@ -306,52 +581,136 @@ async def match_face(
 
         print("\n🔍 Top 5 raw matches:")
         for r in raw_results[:5]:
-            print(f"  {r['label']} ({r['source']}) → {r['score']:.3f}")
+            print(f"  {r['label']} ({r['source']}) → {r['score']:.3f} [Type: {r.get('doc_type')}]")
 
+        print(f"\n🔍 Matching against {len(raw_results)} candidates...")
         seen = {}
         for r in raw_results:
-            key = f"{r['source']}/{r['label']}"
+            # Senior Debug Tip: Normalize labels AND merge across sources for consistent identity tracking
+            normalized_label = " ".join(str(r["label"]).split())
+            key = normalized_label.lower() 
+            
             score = round(float(r["score"]), 3)
-            threshold = MIN_CONFIDENCE_BARGAD if r["source"] == "bargad" else MIN_CONFIDENCE_LFW
+            print(f"  - Checking {key}: Score {score}, Type in raw: {r.get('doc_type')}")
+            
+            threshold = MIN_CONFIDENCE_BARGAD if r["source"] in ["bargad", "frontend_reg"] else MIN_CONFIDENCE_LFW
             if score < threshold:
                 continue
             if key not in seen:
                 seen[key] = {
                     "label": r["label"],
                     "source": r["source"],
+                    "registered_doc_type": r.get("doc_type") or "Selfie",
+                    "verification_type": "Selfie",
                     "confidence": score,
-                    "images": [r["image_url"]],
-                    "image_url": r["image_url"]
+                    "matched_image": r["image_url"],
+                    "images": [r["image_url"]]
                 }
             else:
                 if r["image_url"] not in seen[key]["images"]:
                     seen[key]["images"].append(r["image_url"])
+                
+                # Merging Logic:
+                # 1. Update overall confidence/image if this match is stronger
                 if score > seen[key]["confidence"]:
                     seen[key]["confidence"] = score
-                    seen[key]["image_url"] = r["image_url"]
+                    seen[key]["matched_image"] = r["image_url"]
+                
+                # 2. Update registered_doc_type only if the new record has a specific ID (not Selfie/None)
+                new_type = r.get("doc_type")
+                if new_type and str(new_type).lower() != "selfie":
+                    seen[key]["registered_doc_type"] = new_type
+                elif not seen[key].get("registered_doc_type"):
+                    seen[key]["registered_doc_type"] = "Selfie"
 
         results = list(seen.values())
+        results.sort(key=lambda x: x["confidence"], reverse=True)
 
-        # ── NEW: Log geo data ──
-        if geo_lat and geo_long:
-            auth_logs.insert_one({
-                "timestamp": geo_timestamp or datetime.utcnow().isoformat(),
-                "geo_lat": geo_lat,
-                "geo_long": geo_long,
-                "top_match": results[0]["label"] if results else "no_match",
-                "match_count": len(results),
-                "logged_at": datetime.utcnow()
+        # Apply security penalty from errcount (each point reduces confidence by 1%)
+        if errcount > 0 or True: # Always show breakdown if results exist
+            base_conf = results[0]["confidence"] if results else 0.0
+            # Increase penalty: each errcount point now reduces confidence by 3% (instead of 1%)
+            penalty = float(errcount) * 0.03
+            
+            # Always add base similarity as the first entry
+            penalties_breakdown.insert(0, {
+                "type": "Base Face Similarity",
+                "penalty": 0.0,
+                "count": 1,
+                "detail": f"Raw similarity score: {int(round(base_conf * 100))}%"
             })
+
+            if errcount > 0:
+                print(f"⚠️ Applying security penalty: -{penalty:.3f} (from errcount={errcount})")
+                penalties_breakdown.append({
+                    "type": "Digital Media Detection",
+                    "penalty": round(penalty, 3),
+                    "count": errcount // 10,
+                    "detail": "Suspicious activity patterns detected during liveness flow."
+                })
+
+                for r in results:
+                    r["confidence"] = max(0.0, round(r["confidence"] - penalty, 3))
+            
+            # HARD REJECTION: If total match after penalty is still too low despite high similarity
+            if errcount >= 20:
+                return {"error": "Security Alert: High risk of digital spoofing detected during session. Matching blocked."}
+            
+            # Re-sort results
+            results.sort(key=lambda x: x["confidence"], reverse=True)
+
+        # Log geo data
+        if geo_lat and geo_long:
+            await insert_auth_log(
+                timestamp=geo_timestamp or datetime.utcnow(),
+                geo_lat=geo_lat,
+                geo_long=geo_long,
+                top_match=results[0]["label"] if results else "no_match",
+                match_count=len(results),
+                raw_data={"geo_timestamp": geo_timestamp} if geo_timestamp else {},
+            )
             print(f"📍 Geo logged: {geo_lat}, {geo_long}")
 
         if not results:
             return {"error": "No confident match found in the dataset."}
 
-        liveness_sessions.update_one(
-            {"session_id": liveness_session_id},
-            {"$set": {"status": "consumed", "consumed_at": datetime.utcnow()}},
-        )
-        return {"matches": results}
+        # Identity Verification Check
+        if expected_label and results:
+            top_label = results[0]["label"].lower().strip()
+            target_label = expected_label.lower().strip()
+            # Handle underscores/spaces mismatch
+            top_label = top_label.replace("_", " ")
+            target_label = target_label.replace("_", " ")
+            
+            if top_label != target_label:
+                print(f"❌ Identity Mismatch: Expected '{target_label}', but matched '{top_label}' ({results[0]['confidence']*100:.0f}%)")
+                return {
+                    "error": f"Identity mismatch. You are matched as {results[0]['label']} ({results[0]['confidence']*100:.0f}%), but you are logged in as {expected_label}. Please use the correct account."
+                }
+
+        if liveness_session_id:
+            await update_liveness_session_status(
+                session_id=liveness_session_id,
+                status="consumed",
+                raw_updates={"consumed_at": datetime.utcnow()},
+            )
+            # Clean up in-memory session
+            session_manager.remove(liveness_session_id)
+
+        # Encode processed image to base64 for frontend display
+        _, buffer = cv2.imencode(".jpg", cv2.cvtColor(img_processed, cv2.COLOR_RGB2BGR))
+        processed_b64 = base64.b64encode(buffer).decode("utf-8")
+
+        # Encode the ORIGINAL captured selfie (not background-removed) for comparison
+        _, raw_buffer = cv2.imencode(".jpg", img_raw)
+        captured_b64 = base64.b64encode(raw_buffer).decode("utf-8")
+
+        return {
+            "matches": results,
+            "processed_image": f"data:image/jpeg;base64,{processed_b64}",
+            "captured_image": f"data:image/jpeg;base64,{captured_b64}",
+            "security_penalty_breakdown": penalties_breakdown
+        }
 
     except Exception as e:
         return {"error": f"Server error: {str(e)}"}
@@ -361,7 +720,171 @@ async def match_face(
             os.remove(temp_path)
 
 
-# ── NEW: Passive liveness endpoint ──
+@app.post("/register")
+async def register_user(
+    file: Optional[UploadFile] = File(None),
+    firstName: str = Form(...),
+    middleName: Optional[str] = Form(None),
+    lastName: str = Form(...),
+    docType: str = Form("Aadhar"),
+    document: Optional[UploadFile] = File(None),
+    liveness_session_id: Optional[str] = Form(None),
+    device_id: str = Form(...)
+):
+    """Register a new user. Crops face from image for a cleaner database profile."""
+    
+    primary_file = file or document
+    if not primary_file:
+        return {"error": "No image source provided (Selfie or Document required)"}
+
+    temp_path = f"temp_reg_{primary_file.filename}"
+    with open(temp_path, "wb") as f:
+        f.write(await primary_file.read())
+
+    doc_path = None
+    if document and document != primary_file:
+        doc_path = f"temp_doc_{document.filename}"
+        with open(doc_path, "wb") as f:
+            f.write(await document.read())
+
+    crop_path = f"temp_crop_{primary_file.filename}.jpg"
+
+    try:
+        if file and liveness_session_id:
+            mem_sess = session_manager.get(liveness_session_id)
+            if not mem_sess or mem_sess.step != "verified":
+                return {"error": "Security check required for selfie registration."}
+
+        img_raw = cv2.imread(temp_path)
+        if img_raw is None:
+            return {"error": "Could not read image."}
+
+        img_rgb = cv2.cvtColor(img_raw, cv2.COLOR_BGR2RGB)
+        
+        # Detect and Crop logic
+        face_tensor = mtcnn(img_rgb)
+        
+        # We need the bounding box to crop the original image nicely for the UI
+        boxes, _ = mtcnn.detect(img_rgb)
+        if boxes is not None and len(boxes) > 0:
+            box = boxes[0]
+            x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
+            
+            # Expand crop slightly (30%)
+            bw, bh = x2 - x1, y2 - y1
+            x1, y1 = max(0, int(x1 - bw * 0.3)), max(0, int(y1 - bh * 0.3))
+            x2, y2 = min(img_raw.shape[1], int(x2 + bw * 0.3)), min(img_raw.shape[0], int(y2 + bh * 0.3))
+            
+            face_crop = img_raw[y1:y2, x1:x2]
+            cv2.imwrite(crop_path, face_crop)
+        else:
+            # Fallback to MediaPipe detection if MTCNN fails to find a box
+            from face_detection import detect_faces
+            mp_faces = detect_faces(img_raw)
+            if mp_faces:
+                pts = mp_faces[0]["pts_68"]
+                xs, ys = [p["x"] for p in pts], [p["y"] for p in pts]
+                x1, y1, x2, y2 = int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))
+                bw, bh = x2 - x1, y2 - y1
+                x1, y1 = max(0, int(x1 - bw * 0.4)), max(0, int(y1 - bh * 0.4))
+                x2, y2 = min(img_raw.shape[1], int(x2 + bw * 0.4)), min(img_raw.shape[0], int(y2 + bh * 0.4))
+                face_crop = img_raw[y1:y2, x1:x2]
+                cv2.imwrite(crop_path, face_crop)
+            else:
+                return {"error": "No face detected in photo. Please ensure your face is clearly visible."}
+
+        # Embedding from the cropped/tensorized face
+        if face_tensor is None:
+            # Re-detect on crop if first pass failed
+            crop_rgb = cv2.cvtColor(cv2.imread(crop_path), cv2.COLOR_BGR2RGB)
+            face_tensor = mtcnn(crop_rgb)
+            if face_tensor is None:
+                return {"error": "Face detection failed during processing."}
+
+        face_tensor = face_tensor.unsqueeze(0).to(DEVICE)
+        with torch.no_grad():
+            emb = model(face_tensor).cpu().numpy()[0].astype("float32")
+        emb = emb / np.linalg.norm(emb)
+
+        # 4. UPLOAD TO CLOUDINARY
+        full_name = f"{firstName}_{middleName}_{lastName}" if middleName else f"{firstName}_{lastName}"
+        clean_name = full_name.replace(' ', '_')
+        
+        # Upload the CROPPED face as the main profile image
+        upload = cloudinary.uploader.upload(
+            crop_path,
+            folder=f"facematch/users/{clean_name}",
+            overwrite=True
+        )
+        image_url = upload["secure_url"]
+
+        # Optional: Upload the full original document as a separate reference
+        document_url = None
+        if doc_path:
+            doc_upload = cloudinary.uploader.upload(
+                doc_path,
+                folder=f"facematch/docs/{clean_name}",
+                overwrite=True
+            )
+            document_url = doc_upload["secure_url"]
+        elif not file and primary_file: # If we registered via document, the primary_file IS the document
+            doc_upload = cloudinary.uploader.upload(
+                temp_path,
+                folder=f"facematch/docs/{clean_name}",
+                overwrite=True
+            )
+            document_url = doc_upload["secure_url"]
+
+        # 5. SAVE TO POSTGRESQL
+        # Normalize label to avoid whitespace issues (Senior Dev Best Practice)
+        clean_label = " ".join(f"{firstName} {lastName}".split())
+        
+        await insert_face(
+            label=clean_label,
+            source="frontend_reg",
+            image_url=image_url,
+            embedding=emb.tolist(),
+        )
+
+        # 6. CONSUME SESSION (ONLY IF PROVIDED)
+        if liveness_session_id:
+            session_manager.remove(liveness_session_id)
+            await update_liveness_session_status(
+                session_id=liveness_session_id,
+                status="consumed",
+                raw_updates={
+                    "consumed_at": datetime.utcnow(),
+                    "registration": {
+                        "first_name": firstName.strip(),
+                        "middle_name": middleName.strip() if middleName else None,
+                        "last_name": lastName.strip(),
+                        "doc_type": str(docType or "Selfie"),
+                        "document_url": document_url,
+                    },
+                },
+            )
+
+        return {
+            "success": True,
+            "message": f"Successfully registered {firstName} {lastName}!",
+            "image_url": image_url,
+            "document_url": document_url
+        }
+
+    except Exception as e:
+        print(f"❌ Registration error: {e}")
+        return {"error": f"Registration failed: {str(e)}"}
+
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        if doc_path and os.path.exists(doc_path):
+            os.remove(doc_path)
+        if 'crop_path' in locals() and os.path.exists(crop_path):
+            os.remove(crop_path)
+
+
+# ── Passive liveness endpoint ──
 @app.post("/liveness")
 async def check_liveness(file: UploadFile = File(...)):
     temp_path = f"temp_live_{file.filename}"
@@ -373,7 +896,7 @@ async def check_liveness(file: UploadFile = File(...)):
         if img is None:
             return {"live": False, "score": 0.0, "reason": "Cannot read image"}
 
-        is_live, score, reason = _passive_liveness_from_bgr(img)
+        is_live, score, reason = compute_passive_liveness(img)
         print(f"🧪 Liveness — Score: {score}, live={is_live}")
 
         return {"live": is_live, "score": score, "reason": reason}
