@@ -1005,7 +1005,7 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
         {error && <div className="fm-error"><AlertTriangle size={16} style={{ marginRight: 8 }} /> {error}</div>}
 
         {results.length > 0 && !loading ? (
-          (results[0].confidence * 100).toFixed(0) >= 70 ? (
+          (results[0].confidence * 100).toFixed(0) >= 60 ? (
             <div>
               <div className="fm-verification-summary-bar">
                 <div className="fm-verified-badge">
