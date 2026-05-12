@@ -57,7 +57,14 @@ const CHALLENGE_UI = {
 let sessionDeviceId = null;
 function getOrCreateDeviceId() {
   if (!sessionDeviceId) {
-    sessionDeviceId = `session_${crypto.randomUUID().slice(0, 8)}`;
+    try {
+      const uuid = (typeof crypto !== 'undefined' && crypto.randomUUID) 
+        ? crypto.randomUUID().slice(0, 8) 
+        : Math.random().toString(36).substring(2, 10);
+      sessionDeviceId = `session_${uuid}`;
+    } catch (e) {
+      sessionDeviceId = `session_${Date.now()}`;
+    }
   }
   return sessionDeviceId;
 }
