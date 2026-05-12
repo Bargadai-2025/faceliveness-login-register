@@ -9,7 +9,7 @@ from typing import Any, Dict, Iterable, List, Optional
 import asyncpg
 
 
-DEFAULT_DATABASE_URL = "postgresql://postgres:localhost@localhost:5432/faceliveness"
+DEFAULT_DATABASE_URL = "postgresql://neondb_owner:npg_EqOubih98anL@ep-lively-sunset-aoe01ege-pooler.c-2.ap-southeast-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
 
 _pool: Optional[asyncpg.Pool] = None
 

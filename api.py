@@ -59,6 +59,8 @@ app.add_middleware(
         "http://127.0.0.1:5173",
         "http://localhost:3000",
         "http://127.0.0.1:3000",
+        "https://faceliveness.bargad.ai",
+        "https://faceliveliness.bargad.ai",
     ],
     allow_origin_regex=r"^https://([a-z0-9-]+\.)*bargad\.ai$",
     allow_credentials=True,
