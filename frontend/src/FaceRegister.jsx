@@ -1,4 +1,6 @@
 import React, { useState, useRef, useEffect, useCallback } from "react";
+import { getApiBase } from "./apiBase";
+import { getCoverSourceRect } from "./cameraDrawUtils";
 import "./FaceMatch.css";
 import { ToastContainer, toast } from 'react-toastify';
 import 'react-toastify/dist/ReactToastify.css';
@@ -21,9 +23,11 @@ L.Icon.Default.mergeOptions({
   shadowUrl: "https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png",
 });
 
-const API_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
+const API_URL = getApiBase();
 const DEVICE_KEY = "facematch_device_id";
-const FRAME_INTERVAL_MS = 120;
+const FRAME_INTERVAL_MS = 80;
+const PROCESS_W = 640;
+const PROCESS_H = 480;
 
 const CHALLENGE_UI = {
   turn_left: { label: "Turn your head LEFT", icon: ArrowLeft },
@@ -53,6 +57,18 @@ const CHALLENGE_UI = {
   // blink_then_turn_left: { label: "BLINK then turn LEFT", icon: Eye },
   raise_eyebrows_hold: { label: "Raise brows & HOLD", icon: Activity },
 };
+
+const FACE_CONNECTIONS = [
+  [0, 1], [1, 2], [2, 3], [3, 4], [4, 5], [5, 6], [6, 7], [7, 8], [8, 9], [9, 10], [10, 11], [11, 12], [12, 13], [13, 14], [14, 15], [15, 16],
+  [17, 18], [18, 19], [19, 20], [20, 21],
+  [22, 23], [23, 24], [24, 25], [25, 26],
+  [27, 28], [28, 29], [29, 30],
+  [31, 32], [32, 33], [33, 34], [34, 35], [31, 35],
+  [36, 37], [37, 38], [38, 39], [39, 40], [40, 41], [41, 36],
+  [42, 43], [43, 44], [44, 45], [45, 46], [46, 47], [47, 42],
+  [48, 49], [49, 50], [50, 51], [51, 52], [52, 53], [53, 54], [54, 55], [55, 56], [56, 57], [57, 58], [58, 59], [59, 48],
+  [60, 61], [61, 62], [62, 63], [63, 64], [64, 65], [65, 66], [66, 67], [67, 60],
+];
 
 let sessionDeviceId = null;
 function getOrCreateDeviceId() {
@@ -98,8 +114,6 @@ export default function FaceRegister({ userEmail, userAgentLabel, onLogout }) {
   const [hoverCardIndex, setHoverCardIndex] = useState(null);
   const [selectedImg, setSelectedImg] = useState(null);
   const [profileMenuOpen, setProfileMenuOpen] = useState(false);
-  const [backendLandmarks, setBackendLandmarks] = useState(null);
-  const [backendMesh, setBackendMesh] = useState(null);
   const [rejectionError, setRejectionError] = useState(null);
   const [multiPersonError, setMultiPersonError] = useState(false);
   const [toastStep, setToastStep] = useState(null);
@@ -116,6 +130,8 @@ export default function FaceRegister({ userEmail, userAgentLabel, onLogout }) {
   const videoRef = useRef();
   const canvasRef = useRef();
   const overlayCanvasRef = useRef();
+  const overlayLandmarksRef = useRef(null);
+  const overlayMeshRef = useRef(null);
   const inputRef = useRef();
   const frameIntervalRef = useRef(null);
   const livenessSessionIdRef = useRef(null);
@@ -167,104 +183,73 @@ export default function FaceRegister({ userEmail, userAgentLabel, onLogout }) {
     } catch { return null; }
   }, []);
 
-  // ── Face skeleton connection map (68-pt landmark indices) ──
-  const FACE_CONNECTIONS = [
-    // Jawline
-    [0, 1], [1, 2], [2, 3], [3, 4], [4, 5], [5, 6], [6, 7], [7, 8], [8, 9], [9, 10], [10, 11], [11, 12], [12, 13], [13, 14], [14, 15], [15, 16],
-    // Left eyebrow
-    [17, 18], [18, 19], [19, 20], [20, 21],
-    // Right eyebrow
-    [22, 23], [23, 24], [24, 25], [25, 26],
-    // Nose bridge
-    [27, 28], [28, 29], [29, 30],
-    // Nose bottom
-    [31, 32], [32, 33], [33, 34], [34, 35], [31, 35],
-    // Left eye
-    [36, 37], [37, 38], [38, 39], [39, 40], [40, 41], [41, 36],
-    // Right eye
-    [42, 43], [43, 44], [44, 45], [45, 46], [46, 47], [47, 42],
-    // Outer mouth
-    [48, 49], [49, 50], [50, 51], [51, 52], [52, 53], [53, 54], [54, 55], [55, 56], [56, 57], [57, 58], [58, 59], [59, 48],
-    // Inner mouth
-    [60, 61], [61, 62], [62, 63], [63, 64], [64, 65], [65, 66], [66, 67], [67, 60],
-  ];
-
-  // Mesh Drawing Logic — dense holographic mesh
   useEffect(() => {
+    if (!showCamera) return undefined;
     const canvas = overlayCanvasRef.current;
-    if (!canvas || !backendLandmarks) return;
+    if (!canvas) return undefined;
+    let rafId = 0;
+    const draw = () => {
+      const pts = overlayLandmarksRef.current;
+      const mesh = overlayMeshRef.current;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) {
+        rafId = requestAnimationFrame(draw);
+        return;
+      }
+      if (canvas.width !== PROCESS_W) canvas.width = PROCESS_W;
+      if (canvas.height !== PROCESS_H) canvas.height = PROCESS_H;
+      ctx.clearRect(0, 0, PROCESS_W, PROCESS_H);
 
-    const SRC_W = 640, SRC_H = 480;
-    if (canvas.width !== SRC_W) canvas.width = SRC_W;
-    if (canvas.height !== SRC_H) canvas.height = SRC_H;
-
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    ctx.clearRect(0, 0, SRC_W, SRC_H);
-
-    const pts = backendLandmarks;
-    const mesh = backendMesh;
-
-    // 1. Draw Dense Mesh Connections (Holographic look)
-    if (mesh && mesh.length > 0) {
-      ctx.beginPath();
-      ctx.strokeStyle = "rgba(0, 255, 170, 0.15)";
-      ctx.lineWidth = 0.5;
-
-      // Draw a "web" by connecting nearby points in the mesh
-      // To keep it performant, we skip points
-      for (let i = 0; i < mesh.length; i += 7) {
-        const p1 = mesh[i];
-        for (let j = i + 1; j < Math.min(i + 30, mesh.length); j += 5) {
-          const p2 = mesh[j];
-          const dist = Math.hypot(p1.x - p2.x, p1.y - p2.y);
-          if (dist < 25) {
-            ctx.moveTo(p1.x, p1.y);
-            ctx.lineTo(p2.x, p2.y);
+      if (mesh && mesh.length > 0) {
+        ctx.beginPath();
+        ctx.strokeStyle = "rgba(0, 255, 170, 0.12)";
+        ctx.lineWidth = 0.5;
+        for (let i = 0; i < mesh.length; i += 12) {
+          const p1 = mesh[i];
+          for (let j = i + 1; j < Math.min(i + 24, mesh.length); j += 8) {
+            const p2 = mesh[j];
+            const dist = Math.hypot(p1.x - p2.x, p1.y - p2.y);
+            if (dist < 28) {
+              ctx.moveTo(p1.x, p1.y);
+              ctx.lineTo(p2.x, p2.y);
+            }
           }
         }
-      }
-      ctx.stroke();
-
-      // Draw all mesh points as tiny glowing dots
-      ctx.fillStyle = "rgba(0, 255, 170, 0.4)";
-      for (let i = 0; i < mesh.length; i += 2) {
-        const p = mesh[i];
-        ctx.fillRect(p.x, p.y, 1, 1);
-      }
-    }
-
-    // 2. Draw Main Skeleton (the 68-pt connections)
-    if (pts && pts.length >= 68) {
-      ctx.strokeStyle = "rgba(0, 255, 170, 0.8)";
-      ctx.lineWidth = 1.8;
-      ctx.shadowBlur = 5;
-      ctx.shadowColor = "rgba(0, 255, 170, 0.5)";
-
-      for (const [a, b] of FACE_CONNECTIONS) {
-        if (!pts[a] || !pts[b]) continue;
-        ctx.beginPath();
-        ctx.moveTo(pts[a].x, pts[a].y);
-        ctx.lineTo(pts[b].x, pts[b].y);
         ctx.stroke();
+        ctx.fillStyle = "rgba(0, 255, 170, 0.35)";
+        for (let i = 0; i < mesh.length; i += 3) {
+          const p = mesh[i];
+          ctx.fillRect(p.x, p.y, 1, 1);
+        }
       }
-      ctx.shadowBlur = 0;
 
-      // 3. Draw Main Landmark Dots
-      for (let i = 0; i < pts.length; i++) {
-        const p = pts[i];
-        ctx.beginPath();
-        ctx.arc(p.x, p.y, 2.2, 0, Math.PI * 2);
-        ctx.fillStyle = "rgba(0, 255, 170, 1)";
-        ctx.fill();
-        // Inner glow
-        ctx.beginPath();
-        ctx.arc(p.x, p.y, 1, 0, Math.PI * 2);
-        ctx.fillStyle = "#fff";
-        ctx.fill();
+      if (pts && pts.length >= 68) {
+        ctx.strokeStyle = "rgba(0, 255, 170, 0.85)";
+        ctx.lineWidth = 1.5;
+        for (const [a, b] of FACE_CONNECTIONS) {
+          if (!pts[a] || !pts[b]) continue;
+          ctx.beginPath();
+          ctx.moveTo(pts[a].x, pts[a].y);
+          ctx.lineTo(pts[b].x, pts[b].y);
+          ctx.stroke();
+        }
+        for (let i = 0; i < pts.length; i++) {
+          const p = pts[i];
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, 2, 0, Math.PI * 2);
+          ctx.fillStyle = "rgba(0, 255, 170, 1)";
+          ctx.fill();
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, 0.9, 0, Math.PI * 2);
+          ctx.fillStyle = "#fff";
+          ctx.fill();
+        }
       }
-    }
-  }, [backendLandmarks, backendMesh]);
+      rafId = requestAnimationFrame(draw);
+    };
+    rafId = requestAnimationFrame(draw);
+    return () => cancelAnimationFrame(rafId);
+  }, [showCamera]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -296,12 +281,15 @@ export default function FaceRegister({ userEmail, userAgentLabel, onLogout }) {
 
   async function handleBackendResponse(data) {
     if (!data) return;
-    // if (data.landmarks) setBackendLandmarks(data.landmarks);
-    if (data.landmarks && Array.isArray(data.landmarks)) {
-      setBackendLandmarks(data.landmarks.map(p => ({ x: p.x, y: p.y })));
+    if (Array.isArray(data.landmarks) && data.landmarks.length >= 68) {
+      overlayLandmarksRef.current = data.landmarks.map((p) => ({ x: p.x, y: p.y }));
+    } else if (data.mesh === null) {
+      overlayLandmarksRef.current = null;
     }
-    if (data.mesh && Array.isArray(data.mesh)) {
-      setBackendMesh(data.mesh.map(p => ({ x: p.x, y: p.y })));
+    if (Array.isArray(data.mesh) && data.mesh.length > 0) {
+      overlayMeshRef.current = data.mesh.map((p) => ({ x: p.x, y: p.y }));
+    } else if (data.mesh === null) {
+      overlayMeshRef.current = null;
     }
     if (data.step && data.step !== livenessStep) {
       const prevStep = livenessStep;
@@ -366,8 +354,14 @@ export default function FaceRegister({ userEmail, userAgentLabel, onLogout }) {
     try {
       const video = videoRef.current;
       const c = document.createElement("canvas");
-      c.width = 640; c.height = 480;
-      c.getContext("2d").drawImage(video, 0, 0, 640, 480);
+      c.width = PROCESS_W;
+      c.height = PROCESS_H;
+      const ctx2 = c.getContext("2d");
+      if (!ctx2) { streamingRef.current = false; return; }
+      const vw = video.videoWidth;
+      const vh = video.videoHeight;
+      const { sx, sy, sw, sh } = getCoverSourceRect(vw, vh, PROCESS_W, PROCESS_H);
+      ctx2.drawImage(video, sx, sy, sw, sh, 0, 0, PROCESS_W, PROCESS_H);
       const blob = await new Promise((r) => c.toBlob(r, "image/jpeg", 0.9));
       if (!blob) { streamingRef.current = false; return; }
       const fd = new FormData();
@@ -457,8 +451,8 @@ export default function FaceRegister({ userEmail, userAgentLabel, onLogout }) {
     setLivenessLive(false);
     livenessSessionIdRef.current = null;
     livenessCompletedRef.current = false;
-    setBackendLandmarks(null);
-    setBackendMesh(null);
+    overlayLandmarksRef.current = null;
+    overlayMeshRef.current = null;
     setChallengeMsg("");
     setLivenessStep("idle");
     setError(null);

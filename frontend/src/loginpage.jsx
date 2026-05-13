@@ -1,4 +1,5 @@
 import React, { useState } from "react";
+import { getApiBase } from "./apiBase";
 import "./loginpage.css";
 
 function ShieldSVG({ large }) {
@@ -46,7 +47,7 @@ export default function LoginPage({ onLogin }) {
   const [selectedAgent, setSelectedAgent] = useState("");
   const [loadingAgents, setLoadingAgents] = useState(true);
 
-  const API_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
+  const API_URL = getApiBase();
 
   React.useEffect(() => {
     async function fetchAgents() {
