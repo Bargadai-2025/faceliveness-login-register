@@ -5,11 +5,32 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional
+from urllib.parse import quote_plus
 
 import asyncpg
+from dotenv import load_dotenv
+
+_backend_dir = os.path.dirname(os.path.abspath(__file__))
+_repo_root = os.path.dirname(_backend_dir)
+load_dotenv(os.path.join(_repo_root, ".env"))
+load_dotenv(os.path.join(_backend_dir, ".env"))
 
 
-DEFAULT_DATABASE_URL = "postgresql://neondb_owner:npg_EqOubih98anL@ep-lively-sunset-aoe01ege-pooler.c-2.ap-southeast-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
+def get_database_dsn() -> str:
+    """
+    Resolve Postgres DSN.
+    - DATABASE_URL (non-empty): use as-is (Neon, RDS, etc.).
+    - Else POSTGRES_PASSWORD: local postgres://postgres:PASSWORD@127.0.0.1:5432/faceliveness
+    - Else: passwordless local URL (works only if pg_hba allows trust/peer for local).
+    """
+    explicit = (os.getenv("DATABASE_URL") or "").strip()
+    if explicit:
+        return explicit
+    pw = (os.getenv("POSTGRES_PASSWORD") or "").strip()
+    if pw:
+        return f"postgresql://postgres:{quote_plus(pw)}@127.0.0.1:5432/faceliveness"
+    return "postgresql://postgres@127.0.0.1:5432/faceliveness"
+
 
 _pool: Optional[asyncpg.Pool] = None
 
@@ -38,14 +59,24 @@ async def _init_connection(conn: asyncpg.Connection) -> None:
 async def init_db_pool() -> asyncpg.Pool:
     global _pool
     if _pool is None:
-        database_url = os.getenv("DATABASE_URL") or DEFAULT_DATABASE_URL
-        _pool = await asyncpg.create_pool(
-            dsn=database_url,
-            min_size=int(os.getenv("DB_POOL_MIN_SIZE", "1")),
-            max_size=int(os.getenv("DB_POOL_MAX_SIZE", "10")),
-            command_timeout=float(os.getenv("DB_COMMAND_TIMEOUT", "30")),
-            init=_init_connection,
-        )
+        database_url = get_database_dsn()
+        try:
+            _pool = await asyncpg.create_pool(
+                dsn=database_url,
+                min_size=int(os.getenv("DB_POOL_MIN_SIZE", "1")),
+                max_size=int(os.getenv("DB_POOL_MAX_SIZE", "10")),
+                command_timeout=float(os.getenv("DB_COMMAND_TIMEOUT", "30")),
+                init=_init_connection,
+            )
+        except Exception as e:
+            err_name = type(e).__name__
+            if err_name == "InvalidPasswordError" or "password authentication failed" in str(e).lower():
+                print(
+                    "\n❌ PostgreSQL: password authentication failed.\n"
+                    "   Set POSTGRES_PASSWORD in .env to your local 'postgres' user password (from pgAdmin),\n"
+                    "   or set DATABASE_URL=postgresql://postgres:YOUR_PASSWORD@127.0.0.1:5432/faceliveness\n"
+                )
+            raise
     return _pool
 
 
@@ -174,7 +205,7 @@ async def insert_face(
 
 
 async def _execute_once(query: str, *args: Any) -> str:
-    conn = await asyncpg.connect(dsn=os.getenv("DATABASE_URL") or DEFAULT_DATABASE_URL)
+    conn = await asyncpg.connect(dsn=get_database_dsn())
     await _init_connection(conn)
     try:
         return await conn.execute(query, *args)

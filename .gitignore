@@ -1,14 +1,20 @@
 # Python
 venv/
+backend/venv/
 __pycache__/
+backend/__pycache__/
 *.pyc
 .env
 
-# Dataset
+# Dataset (live under backend/)
 dataset/
+backend/dataset/
 processed_images.txt
+backend/processed_images.txt
 indexed_bargad.txt
 indexed_lfw.txt
+backend/indexed_bargad.txt
+backend/indexed_lfw.txt
 
 
 # Frontend
@@ -18,8 +24,8 @@ frontend/dist/
 frontend/build/
 
 # Currency YOLO weights (large; add via deploy or release asset)
-models/currency/*.pt
-models/currency/**/*.pt
+backend/models/currency/*.pt
+backend/models/currency/**/*.pt
 
 # OS
 .DS_Store

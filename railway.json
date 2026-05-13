@@ -1,9 +1,7 @@
 {
   "build": {
-    "builder": "NIXPACKS",
-    "nixpacksConfigPath": "nixpacks.toml"
+    "builder": "DOCKERFILE",
+    "dockerfilePath": "backend/Dockerfile"
   },
-  "deploy": {
-    "startCommand": "python api.py"
-  }
+  "deploy": {}
 }

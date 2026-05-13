@@ -1,10 +1,25 @@
+import glob
 import os
 import sys
 
-# Ensure venv site-packages are accessible even if uvicorn was started globally
-venv_path = os.path.join(os.path.dirname(__file__), "venv", "Lib", "site-packages")
-if os.path.exists(venv_path) and venv_path not in sys.path:
-    sys.path.insert(0, venv_path)
+_backend_dir = os.path.dirname(os.path.abspath(__file__))
+_repo_root = os.path.dirname(_backend_dir)
+
+# Ensure venv site-packages are accessible even if uvicorn was started globally (Windows + Linux layouts).
+for _venv_base in (os.path.join(_backend_dir, "venv"), os.path.join(_repo_root, "venv")):
+    if not os.path.isdir(_venv_base):
+        continue
+    _candidates = glob.glob(os.path.join(_venv_base, "Lib", "site-packages"))
+    _candidates += glob.glob(os.path.join(_venv_base, "lib", "python*", "site-packages"))
+    for venv_path in _candidates:
+        if os.path.isdir(venv_path) and venv_path not in sys.path:
+            sys.path.insert(0, venv_path)
+
+from dotenv import load_dotenv
+
+# Repo-root .env (typical) then backend/.env overrides.
+load_dotenv(os.path.join(_repo_root, ".env"))
+load_dotenv(os.path.join(_backend_dir, ".env"))
 
 import cv2
 import torch
@@ -15,7 +30,6 @@ import secrets
 from fastapi import FastAPI, File, UploadFile, Form, Body, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from facenet_pytorch import MTCNN, InceptionResnetV1
-from dotenv import load_dotenv
 import uvicorn
 from datetime import datetime, timedelta
 from typing import Optional, List, Tuple, Any, Dict
@@ -32,7 +46,6 @@ from database import (
     create_liveness_session,
     ensure_indexes,
     get_face_embedding_by_label,
-    get_faces_by_labels,
     get_liveness_session,
     get_valid_completed_liveness_session,
     init_db_pool,
@@ -42,8 +55,6 @@ from database import (
     list_faces_for_matching,
     update_liveness_session_status,
 )
-
-load_dotenv()
 
 app = FastAPI()
 
@@ -85,6 +96,9 @@ cloudinary.config(
 MIN_CONFIDENCE_BARGAD = 0.65
 MIN_CONFIDENCE_LFW = 0.55
 TOP_K = 50
+
+# Set FAST_MATCH=1 in .env for local/dev: skips YOLO + MediaPipe background removal on POST /match (much faster).
+FAST_MATCH = os.getenv("FAST_MATCH", "").strip().lower() in ("1", "true", "yes")
 
 # ════════════════════════════════════════════════════════════
 # IDENTITY VERIFICATION CALLBACK
@@ -142,30 +156,6 @@ async def _shutdown():
 # ════════════════════════════════════════════════════════════
 # ════════════════════════════════════════════════════════════
 # ════════════════════════════════════════════════════════════
-
-@app.get("/agents/list")
-async def list_agents():
-    """Returns a list of 5 specific agents for the login demo."""
-    agent_labels = ["Angel Mary","Topendra Sir","Bhakti Shelar", "Divya Pratap", "Manish Kalantre","Pranali Patil", "Tauheed Ahmed", "Yash Jadhav", "Yogesh Shivtarkar" ,"Manas Vellalore", "Atal_Bihari_Vajpayee", "salman khan"]
-    
-    # Fetch details from DB
-    agents = await get_faces_by_labels(agent_labels)
-    agents_db = {a["label"]: a for a in agents}
-    
-    result = []
-    for label in agent_labels:
-        if label in agents_db:
-            result.append({
-                "label": agents_db[label]["label"],
-                "image_url": agents_db[label].get("image_url")
-            })
-        else:
-            # Fallback for demo if DB is not yet populated with these specific labels
-            result.append({
-                "label": label,
-                "image_url": f"https://ui-avatars.com/api/?name={label.replace(' ', '+')}&background=random"
-            })
-    return result
 
 @app.get("/agents/list")
 async def list_agents():
@@ -499,32 +489,37 @@ async def match_face(
             return {"error": "No face detected in the uploaded image. Please ensure your face is clearly visible, well-lit, and facing the camera directly."}
 
         # 4. HARD ANTI-SCREEN DETECTION (YOLO & TEXTURE)
-        # Check for devices (phones, laptops) in the frame
-        from frame_processor import _get_yolo, DEVICE_CLASSES
-        yolo = _get_yolo()
-        if yolo:
-            try:
-                # Use a much lower confidence (0.30) for final capture to catch distant or partial devices
-                results = yolo(img_raw, verbose=False, conf=0.30)
-                for r in results:
-                    for box in r.boxes:
-                        cls_name = r.names[int(box.cls[0])].lower()
-                        if cls_name in DEVICE_CLASSES:
-                            display_name = DEVICE_CLASSES[cls_name]
-                            print(f"🚨 YOLO Hard Detect: {display_name} found in selfie frame!")
-                            # Instead of error, add to errcount penalty
-                            errcount += 30
-                            penalties_breakdown.append({
-                                "type": "Electronic Device Detected",
-                                "penalty": 0.30,
-                                "count": 1,
-                                "detail": f"YOLO detected: {display_name}"
-                            })
-            except Exception as e:
-                print(f"YOLO selfie check error: {e}")
+        # Check for devices (phones, laptops) in the frame — skipped when FAST_MATCH=1 (dev speed).
+        if FAST_MATCH:
+            print("⚡ FAST_MATCH: skipping YOLO device scan on /match")
+        else:
+            from frame_processor import _get_yolo, DEVICE_CLASSES
+            yolo = _get_yolo()
+            if yolo:
+                try:
+                    # Use a much lower confidence (0.30) for final capture to catch distant or partial devices
+                    results = yolo(img_raw, verbose=False, conf=0.30)
+                    for r in results:
+                        for box in r.boxes:
+                            cls_name = r.names[int(box.cls[0])].lower()
+                            if cls_name in DEVICE_CLASSES:
+                                display_name = DEVICE_CLASSES[cls_name]
+                                print(f"🚨 YOLO Hard Detect: {display_name} found in selfie frame!")
+                                # Instead of error, add to errcount penalty
+                                errcount += 30
+                                penalties_breakdown.append({
+                                    "type": "Electronic Device Detected",
+                                    "penalty": 0.30,
+                                    "count": 1,
+                                    "detail": f"YOLO detected: {display_name}"
+                                })
+                except Exception as e:
+                    print(f"YOLO selfie check error: {e}")
 
-        # Perform ROI-based liveness check (Strict mode for final matching)
-        live_ok, live_score, live_reason = compute_passive_liveness(img_raw, face_landmarks_mp, strict=True)
+        # Perform ROI-based liveness check (strict=False when FAST_MATCH for lighter dev path)
+        live_ok, live_score, live_reason = compute_passive_liveness(
+            img_raw, face_landmarks_mp, strict=not FAST_MATCH
+        )
         if not live_ok:
             print(f"⚠️ ROI Liveness failed on selfie: {live_reason}")
             # Add to penalty instead of blocking
@@ -536,11 +531,22 @@ async def match_face(
                 "detail": f"ROI Check failed: {live_reason}"
             })
 
-        # 5. PREPARE PROCESSED IMAGE FOR UI (with background removal)
-        img_processed = remove_background(img_raw)
-        if max(img_processed.shape[:2]) > 800:
-            scale = 800 / max(img_processed.shape[:2])
-            img_processed = cv2.resize(img_processed, (int(img_processed.shape[1] * scale), int(img_processed.shape[0] * scale)))
+        # 5. PREPARE PROCESSED IMAGE FOR UI (with background removal; FAST_MATCH uses a small RGB resize only)
+        if FAST_MATCH:
+            print("⚡ FAST_MATCH: skipping remove_background on /match")
+            h0, w0 = img_raw.shape[:2]
+            mx = 640
+            if max(h0, w0) > mx:
+                s = mx / max(h0, w0)
+                small_bgr = cv2.resize(img_raw, (int(w0 * s), int(h0 * s)))
+            else:
+                small_bgr = img_raw.copy()
+            img_processed = cv2.cvtColor(small_bgr, cv2.COLOR_BGR2RGB)
+        else:
+            img_processed = remove_background(img_raw)
+            if max(img_processed.shape[:2]) > 800:
+                scale = 800 / max(img_processed.shape[:2])
+                img_processed = cv2.resize(img_processed, (int(img_processed.shape[1] * scale), int(img_processed.shape[0] * scale)))
 
         # 5. GENERATE EMBEDDING
         face = face.unsqueeze(0).to(DEVICE)
@@ -553,30 +559,30 @@ async def match_face(
         all_docs = await list_faces_for_matching()
         print(f"📦 Loaded {len(all_docs)} faces from PostgreSQL")
 
-        raw_results = []
+        valid_rows = []
         for doc in all_docs:
-            # Safety check: ensure embedding exists and has the correct length (512)
             if not doc.get("embedding") or len(doc["embedding"]) != 512:
                 continue
-                
             db_emb = np.array(doc["embedding"], dtype="float32")
-            # Avoid division by zero
             norm = np.linalg.norm(db_emb)
             if norm == 0:
                 continue
-                
-            db_emb = db_emb / norm
-            score = float(np.dot(emb, db_emb))
-            # PostgreSQL faces currently stores only core matching fields.
-            d_type = doc.get("doc_type") or "Selfie"
-            
-            raw_results.append({
-                "label": doc["label"],
-                "source": doc["source"],
-                "image_url": doc["image_url"],
-                "doc_type": d_type,
-                "score": round(score, 3)
-            })
+            valid_rows.append((doc, db_emb / norm))
+
+        raw_results = []
+        if valid_rows:
+            matrix = np.stack([r[1] for r in valid_rows], axis=0)
+            scores_vec = matrix @ emb
+            for i, (doc, _) in enumerate(valid_rows):
+                score = float(scores_vec[i])
+                d_type = doc.get("doc_type") or "Selfie"
+                raw_results.append({
+                    "label": doc["label"],
+                    "source": doc["source"],
+                    "image_url": doc["image_url"],
+                    "doc_type": d_type,
+                    "score": round(score, 3),
+                })
 
         raw_results.sort(key=lambda x: x["score"], reverse=True)
         raw_results = raw_results[:TOP_K]

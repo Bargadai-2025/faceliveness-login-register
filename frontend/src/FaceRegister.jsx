@@ -1,6 +1,11 @@
 import React, { useState, useRef, useEffect, useCallback } from "react";
 import { getApiBase } from "./apiBase";
 import { getCoverSourceRect } from "./cameraDrawUtils";
+import {
+  MATCH_REQUEST_TIMEOUT_MS,
+  matchFetchErrorMessage,
+  startIndeterminateMatchProgress,
+} from "./matchUiUtils";
 import "./FaceMatch.css";
 import { ToastContainer, toast } from 'react-toastify';
 import 'react-toastify/dist/ReactToastify.css';
@@ -536,10 +541,9 @@ export default function FaceRegister({ userEmail, userAgentLabel, onLogout }) {
       });
     }
 
-    // Progress bar simulation
-    const pInterval = setInterval(() => {
-      setProgress(p => (p >= 90 ? 90 : p + Math.random() * 12));
-    }, 300);
+    const matchAbort = new AbortController();
+    const matchTimeoutId = setTimeout(() => matchAbort.abort(), MATCH_REQUEST_TIMEOUT_MS);
+    const pInterval = startIndeterminateMatchProgress(setProgress);
 
     const fd = new FormData();
     fd.append("file", fileToUse);
@@ -555,9 +559,10 @@ export default function FaceRegister({ userEmail, userAgentLabel, onLogout }) {
 
     try {
       console.log(`📤 Sending match request to ${API_URL}/match ...`);
-      const res = await fetch(`${API_URL}/match`, { method: "POST", body: fd });
+      const res = await fetch(`${API_URL}/match`, { method: "POST", body: fd, signal: matchAbort.signal });
       const data = await res.json();
       clearInterval(pInterval);
+      clearTimeout(matchTimeoutId);
 
       if (data.error) {
         console.error("❌ Match error from backend:", data.error);
@@ -571,9 +576,10 @@ export default function FaceRegister({ userEmail, userAgentLabel, onLogout }) {
       }
     } catch (err) {
       console.error("❌ Match request failed:", err);
-      setError("Match request failed. Please check your connection.");
+      setError(matchFetchErrorMessage(err));
       setProgress(0);
       clearInterval(pInterval);
+      clearTimeout(matchTimeoutId);
     } finally {
       setLoading(false);
     }
