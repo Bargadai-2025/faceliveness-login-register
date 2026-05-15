@@ -2575,3 +2575,26 @@ body {
   align-items: center;
   justify-content: center;
 }
+
+/* Mobile responsive adjustments for camera and instructions */
+@media screen and (max-width: 768px) {
+  .fm-camera-container {
+    aspect-ratio: 3 / 4 !important;
+    height: auto !important;
+    max-height: 65vh;
+  }
+  .fm-liveness-overlay {
+    bottom: 10px !important;
+    transform: translateX(-50%) scale(0.9);
+  }
+  .cancel-btn-top-liveness-steps {
+    top: 85px !important;
+    left: 10px !important;
+  }
+  .fm-gesture-pill {
+    padding: 8px 16px;
+  }
+  .fm-gesture-text {
+    font-size: 15px;
+  }
+}
