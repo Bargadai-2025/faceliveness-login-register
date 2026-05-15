@@ -38,7 +38,8 @@ import cloudinary.uploader
 
 from liveness_session import session_manager, ALL_GESTURE_IDS, LIGHT_CHALLENGES
 from frame_processor import process_frame
-from face_detection import compute_passive_liveness, remove_background
+from face_detection import remove_background
+from spoof_scoring import analyze_passive_spoof_single_frame
 from liveness_checks import check_reaction_timing
 from database import (
     close_db_pool,
@@ -488,24 +489,64 @@ async def match_face(
         if face is None:
             return {"error": "No face detected in the uploaded image. Please ensure your face is clearly visible, well-lit, and facing the camera directly."}
 
-        # 4. HARD ANTI-SCREEN DETECTION (YOLO & TEXTURE)
-        # Check for devices (phones, laptops) in the frame — skipped when FAST_MATCH=1 (dev speed).
-        if FAST_MATCH:
-            print("⚡ FAST_MATCH: skipping YOLO device scan on /match")
-        else:
-            from frame_processor import _get_yolo, DEVICE_CLASSES
-            yolo = _get_yolo()
-            if yolo:
-                try:
-                    # Use a much lower confidence (0.30) for final capture to catch distant or partial devices
-                    results = yolo(img_raw, verbose=False, conf=0.30)
-                    for r in results:
-                        for box in r.boxes:
-                            cls_name = r.names[int(box.cls[0])].lower()
-                            if cls_name in DEVICE_CLASSES:
-                                display_name = DEVICE_CLASSES[cls_name]
-                                print(f"🚨 YOLO Hard Detect: {display_name} found in selfie frame!")
-                                # Instead of error, add to errcount penalty
+        # 4. HARD ANTI-SCREEN DETECTION (YOLO + face-device overlap + single-frame spoof)
+        # SECURITY: These scans ALWAYS run regardless of FAST_MATCH.
+        # FAST_MATCH only skips cosmetic operations (background removal), NEVER security scans.
+        device_replay_score = 0.0
+        from frame_processor import _get_yolo, _yolo_device_replay_risk, DEVICE_CLASSES
+        yolo = _get_yolo()
+        if yolo:
+            try:
+                # Calculate face bounding box from MediaPipe landmarks
+                face_bbox_match = (0, 0, img_raw.shape[1], img_raw.shape[0])  # fallback
+                if face_landmarks_mp:
+                    lm_xs = [p["x"] for p in face_landmarks_mp]
+                    lm_ys = [p["y"] for p in face_landmarks_mp]
+                    face_bbox_match = (
+                        int(min(lm_xs)), int(min(lm_ys)),
+                        int(max(lm_xs) - min(lm_xs)),
+                        int(max(lm_ys) - min(lm_ys)),
+                    )
+
+                h_raw, w_raw = img_raw.shape[:2]
+                # Use same face-device overlap analysis as the liveness flow
+                dr, device_hard = _yolo_device_replay_risk(img_raw, face_bbox_match, w_raw, h_raw, yolo)
+                device_replay_score = dr
+                print(f"🔒 YOLO device scan: risk={dr:.3f}, hard_overlap={device_hard}")
+
+                if device_hard:
+                    # HARD REJECT: device directly overlapping face
+                    print(f"🚨 HARD REJECT: Device overlapping face in selfie (IoU overlap, dr={dr:.3f})")
+                    return {
+                        "error": "Security Alert: Electronic device (phone/tablet/screen) detected overlapping your face. Please take a direct selfie without any screens in front of you.",
+                        "security_penalty_breakdown": [{
+                            "type": "Electronic Device Blocking Face",
+                            "penalty": 1.0,
+                            "count": 1,
+                            "detail": f"YOLO detected device with high face overlap (risk={dr:.2f})"
+                        }],
+                    }
+
+                if dr > 0.25:
+                    # Device visible near face but not fully overlapping
+                    print(f"⚠️ Device near face in selfie: risk={dr:.3f}")
+                    errcount += 40
+                    penalties_breakdown.append({
+                        "type": "Electronic Device Near Face",
+                        "penalty": 0.40,
+                        "count": 1,
+                        "detail": f"Device detected near face area (risk={dr:.2f})"
+                    })
+
+                # Also do the general YOLO scan for any devices in the full frame
+                yolo_results = yolo(img_raw, verbose=False, conf=0.30)
+                for r in yolo_results:
+                    for box in r.boxes:
+                        cls_name = r.names[int(box.cls[0])].lower()
+                        if cls_name in DEVICE_CLASSES:
+                            display_name = DEVICE_CLASSES[cls_name]
+                            print(f"🚨 YOLO Detect: {display_name} found in selfie frame!")
+                            if dr < 0.25:  # Only add if not already penalized above
                                 errcount += 30
                                 penalties_breakdown.append({
                                     "type": "Electronic Device Detected",
@@ -513,22 +554,37 @@ async def match_face(
                                     "count": 1,
                                     "detail": f"YOLO detected: {display_name}"
                                 })
-                except Exception as e:
-                    print(f"YOLO selfie check error: {e}")
+            except Exception as e:
+                print(f"YOLO selfie check error: {e}")
 
-        # Perform ROI-based liveness check (strict=False when FAST_MATCH for lighter dev path)
-        live_ok, live_score, live_reason = compute_passive_liveness(
-            img_raw, face_landmarks_mp, strict=not FAST_MATCH
+        # Run spoof analysis in SINGLE-FRAME MODE — ALWAYS runs (security critical)
+        # This lets imaging signals (moiré, texture, scanlines) detect screen replay
+        extra_signals_match = {"device_replay": device_replay_score} if device_replay_score > 0.01 else None
+        spoof_detail = analyze_passive_spoof_single_frame(
+            img_raw,
+            face_landmarks_mp,
+            strict=True,
+            roi_luminance_history=None,
+            last_gray_small=None,
+            curr_gray_small=None,
+            landmark_centroid_history=None,
+            extra_signals=extra_signals_match,
+            single_frame_mode=True,  # KEY: relaxed gate for selfie capture
         )
+        live_ok = bool(spoof_detail["is_live"])
+        live_score = max(0.0, min(1.0, 1.0 - spoof_detail["total_spoof_score"] / 100.0))
+        live_reason = "OK" if live_ok else (
+            "Weighted spoof: " + ", ".join(spoof_detail.get("triggered_rules") or [])[:220]
+        )
+        print(f"🔒 Spoof analysis: score={spoof_detail['total_spoof_score']:.1f}/{spoof_detail.get('reject_threshold', 68)}, live={live_ok}, rules={spoof_detail.get('triggered_rules', [])}")
         if not live_ok:
-            print(f"⚠️ ROI Liveness failed on selfie: {live_reason}")
-            # Add to penalty instead of blocking
-            errcount += 25
+            print(f"🚨 Single-frame spoof FAILED: score={spoof_detail['total_spoof_score']}/{spoof_detail.get('reject_threshold', 68)}")
+            errcount += 35
             penalties_breakdown.append({
-                "type": "Passive Liveness Verification",
-                "penalty": 0.25,
+                "type": "Digital Media / Screen Detected",
+                "penalty": 0.35,
                 "count": 1,
-                "detail": f"ROI Check failed: {live_reason}"
+                "detail": f"Spoof score {spoof_detail['total_spoof_score']:.0f}/{spoof_detail.get('reject_threshold', 68):.0f} — " + live_reason[:400],
             })
 
         # 5. PREPARE PROCESSED IMAGE FOR UI (with background removal; FAST_MATCH uses a small RGB resize only)
@@ -717,7 +773,18 @@ async def match_face(
             "matches": results,
             "processed_image": f"data:image/jpeg;base64,{processed_b64}",
             "captured_image": f"data:image/jpeg;base64,{captured_b64}",
-            "security_penalty_breakdown": penalties_breakdown
+            "security_penalty_breakdown": penalties_breakdown,
+            "capture_live_ok": bool(live_ok),
+            "capture_live_score": round(float(live_score), 4),
+            "capture_live_reason": live_reason,
+            "spoof_score": spoof_detail["total_spoof_score"],
+            "spoof_reject_threshold": spoof_detail.get("reject_threshold"),
+            "triggered_rules": spoof_detail.get("triggered_rules", []),
+            "confidence_per_signal": spoof_detail.get("confidence_per_signal", {}),
+            "reflection_classification": spoof_detail.get("reflection_classification"),
+            "final_replay_risk": spoof_detail["total_spoof_score"],
+            "correlation_gate_notes": spoof_detail.get("correlation_gate_notes", []),
+            "extra_signals_used": spoof_detail.get("extra_signals_used", {}),
         }
 
     except Exception as e:
@@ -904,10 +971,21 @@ async def check_liveness(file: UploadFile = File(...)):
         if img is None:
             return {"live": False, "score": 0.0, "reason": "Cannot read image"}
 
-        is_live, score, reason = compute_passive_liveness(img)
-        print(f"🧪 Liveness — Score: {score}, live={is_live}")
+        rep = analyze_passive_spoof_single_frame(img, None, strict=False)
+        is_live = bool(rep["is_live"])
+        score = max(0.0, min(1.0, 1.0 - rep["total_spoof_score"] / 100.0))
+        reason = "OK" if is_live else f"Spoof score {rep['total_spoof_score']}"
+        print(f"🧪 Liveness — spoof={rep['total_spoof_score']}, live={is_live}")
 
-        return {"live": is_live, "score": score, "reason": reason}
+        return {
+            "live": is_live,
+            "score": score,
+            "reason": reason,
+            "spoof_score": rep["total_spoof_score"],
+            "triggered_rules": rep.get("triggered_rules", []),
+            "confidence_per_signal": rep.get("confidence_per_signal", {}),
+            "reflection_classification": rep.get("reflection_classification"),
+        }
 
     except Exception as e:
         return {"live": False, "score": 0.0, "reason": str(e)}

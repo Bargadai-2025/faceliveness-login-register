@@ -371,3 +371,225 @@ def check_temporal_flicker(luminance_history: List[float], fps: float = 15.0) ->
     # Peak power threshold
     is_flickering = ratio > 0.42
     return is_flickering, round(float(ratio), 3)
+
+
+# ═══════════════════════════════════════════════════════
+# FUSION SIGNALS (replay_risk 0 = live, 1 = replay) for spoof_scoring
+# ═══════════════════════════════════════════════════════
+
+def _region_displacement(landmark_history: List[List[Dict]], indices: List[int], window: int = 10) -> float:
+    """Compute average displacement of a set of landmark indices over recent frames."""
+    if len(landmark_history) < 3:
+        return 0.0
+    recent = landmark_history[-window:]
+    total = 0.0
+    for idx in indices:
+        xs = [pts[idx]["x"] for pts in recent]
+        ys = [pts[idx]["y"] for pts in recent]
+        total += math.hypot(max(xs) - min(xs), max(ys) - min(ys))
+    return total / max(1, len(indices))
+
+
+def _region_motion_series(landmark_history: List[List[Dict]], indices: List[int], window: int = 10) -> np.ndarray:
+    """Return per-frame centroid displacement for a region (for cross-correlation analysis)."""
+    if len(landmark_history) < 3:
+        return np.array([])
+    recent = landmark_history[-window:]
+    centroids = []
+    for pts in recent:
+        cx = sum(pts[idx]["x"] for idx in indices) / len(indices)
+        cy = sum(pts[idx]["y"] for idx in indices) / len(indices)
+        centroids.append((cx, cy))
+    # Per-frame displacement
+    disps = []
+    for i in range(1, len(centroids)):
+        d = math.hypot(centroids[i][0] - centroids[i-1][0], centroids[i][1] - centroids[i-1][1])
+        disps.append(d)
+    return np.array(disps) if disps else np.array([])
+
+
+def parallax_replay_risk(landmark_history: List[List[Dict]]) -> float:
+    """
+    ENHANCED: Multi-region parallax analysis.
+    
+    Real 3D faces: nose, jaw, cheeks, eyes move independently (low cross-correlation).
+    Replay screens: all regions move uniformly (high cross-correlation, planar motion).
+    
+    Returns risk in [0, 1] — higher = more likely replay.
+    """
+    if len(landmark_history) < 5:
+        return 0.0
+
+    # Define distinct facial regions
+    nose_region = [30, 31, 35]         # Nose tip + base
+    left_jaw = [2, 3, 4, 5]           # Left jaw contour
+    right_jaw = [11, 12, 13, 14]      # Right jaw contour
+    left_eye = [36, 37, 38, 39]       # Left eye
+    right_eye = [42, 43, 44, 45]      # Right eye
+    chin = [7, 8, 9]                   # Chin
+
+    # 1. Classic depth ratio (nose vs eyes)
+    is_3d, depth_score = check_depth_displacement(landmark_history)
+    classic_risk = 1.0 - float(min(1.0, max(0.0, depth_score)))
+    if is_3d:
+        classic_risk *= 0.35  # Strong 3D evidence reduces risk
+
+    # 2. Cross-correlation analysis between regions
+    nose_motion = _region_motion_series(landmark_history, nose_region)
+    ljaw_motion = _region_motion_series(landmark_history, left_jaw)
+    rjaw_motion = _region_motion_series(landmark_history, right_jaw)
+    leye_motion = _region_motion_series(landmark_history, left_eye)
+
+    correlation_risk = 0.0
+    pairs_checked = 0
+    min_len = 4
+
+    for a, b in [(nose_motion, ljaw_motion), (nose_motion, leye_motion),
+                  (ljaw_motion, rjaw_motion), (leye_motion, rjaw_motion)]:
+        if len(a) >= min_len and len(b) >= min_len:
+            # Normalize
+            a_n = a - np.mean(a)
+            b_n = b - np.mean(b)
+            a_std = np.std(a_n)
+            b_std = np.std(b_n)
+            if a_std > 0.3 and b_std > 0.3:  # Only meaningful if both regions actually move
+                corr = float(np.corrcoef(a_n, b_n)[0, 1])
+                # High correlation = planar (replay-like)
+                if corr > 0.92:
+                    correlation_risk += 0.3
+                elif corr > 0.85:
+                    correlation_risk += 0.15
+                pairs_checked += 1
+
+    if pairs_checked > 0:
+        correlation_risk = min(1.0, correlation_risk)
+    else:
+        correlation_risk = 0.0  # Can't judge without enough motion
+
+    # 3. Jaw asymmetry check — real faces have asymmetric jaw movement
+    ljaw_disp = _region_displacement(landmark_history, left_jaw)
+    rjaw_disp = _region_displacement(landmark_history, right_jaw)
+    if ljaw_disp > 1.0 and rjaw_disp > 1.0:
+        jaw_ratio = min(ljaw_disp, rjaw_disp) / (max(ljaw_disp, rjaw_disp) + 1e-6)
+        # Perfectly symmetric = suspicious (ratio near 1.0)
+        if jaw_ratio > 0.96:
+            correlation_risk = min(1.0, correlation_risk + 0.15)
+
+    # Combine classic depth + correlation analysis
+    risk = 0.5 * classic_risk + 0.5 * correlation_risk
+    return float(min(1.0, max(0.0, risk)))
+
+
+def biological_motion_replay_risk(landmark_history: List[List[Dict]]) -> float:
+    """
+    ENHANCED: Biological motion analysis with asymmetry and coordination tracking.
+    
+    Real faces show:
+    - Natural asymmetry between left/right sides
+    - Micro-delays between eye and head movement
+    - Varied micro-expression timing
+    
+    Replay attacks show:
+    - Synchronized motion (no micro-delays)
+    - Compressed/uniform movement artifacts
+    - Unnaturally still or perfectly mirrored motion
+    
+    Returns risk in [0, 1] — higher = more likely replay.
+    """
+    if len(landmark_history) < 15:
+        return 0.0
+
+    # 1. Classic micro-expression check
+    has_micro, micro_score = check_micro_expressions(landmark_history)
+    micro_risk = 1.0 - float(min(1.0, max(0.0, micro_score)))
+    if has_micro:
+        micro_risk *= 0.30  # Strong micro-expression evidence reduces risk
+
+    recent = landmark_history[-15:]
+
+    # 2. Left/Right asymmetry analysis
+    # Real faces: left and right eye jitter differently (natural asymmetry)
+    left_eye_xs = [pts[37]["x"] for pts in recent]
+    right_eye_xs = [pts[43]["x"] for pts in recent]
+    left_jitter = float(np.std(left_eye_xs))
+    right_jitter = float(np.std(right_eye_xs))
+
+    asymmetry_risk = 0.0
+    if left_jitter > 0.3 and right_jitter > 0.3:
+        jitter_ratio = min(left_jitter, right_jitter) / (max(left_jitter, right_jitter) + 1e-6)
+        # Perfectly symmetric jitter = suspicious
+        if jitter_ratio > 0.95:
+            asymmetry_risk = 0.3
+        elif jitter_ratio > 0.88:
+            asymmetry_risk = 0.1
+    else:
+        # Very low jitter = might be static image
+        if left_jitter < 0.15 and right_jitter < 0.15:
+            asymmetry_risk = 0.2
+
+    # 3. Eye-to-head coordination
+    # Real: slight delay between eye and nose movement
+    nose_xs = np.array([pts[30]["x"] for pts in recent])
+    eye_mid_xs = np.array([(pts[36]["x"] + pts[45]["x"]) / 2 for pts in recent])
+    
+    coordination_risk = 0.0
+    if len(nose_xs) >= 5:
+        nose_diff = np.diff(nose_xs)
+        eye_diff = np.diff(eye_mid_xs)
+        if np.std(nose_diff) > 0.2 and np.std(eye_diff) > 0.2:
+            # Cross-correlation at lag 0 vs lag 1
+            corr_0 = float(np.corrcoef(nose_diff, eye_diff)[0, 1]) if len(nose_diff) >= 3 else 0.0
+            # Perfect zero-lag correlation = suspicious (replay has no natural delay)
+            if corr_0 > 0.97:
+                coordination_risk = 0.25
+            elif corr_0 > 0.93:
+                coordination_risk = 0.1
+
+    # 4. Lip micro-motion variance
+    lip_ys = [pts[62]["y"] for pts in recent]
+    lip_var = float(np.std(lip_ys))
+    lip_risk = 0.0
+    if lip_var < 0.2:
+        lip_risk = 0.15  # Unnaturally still lips
+
+    # Combine all biological signals
+    risk = (0.40 * micro_risk +
+            0.25 * asymmetry_risk +
+            0.20 * coordination_risk +
+            0.15 * lip_risk)
+
+    return float(min(1.0, max(0.0, risk)))
+
+
+def challenge_consistency_replay_risk(session: Any) -> float:
+    """
+    ENHANCED: Reaction time analysis for gesture challenges.
+    
+    Real users show variable reaction times with natural distribution.
+    Scripted replays show unnaturally consistent or fast reactions.
+    
+    Returns risk in [0, 1].
+    """
+    step = getattr(session, "step", "")
+    times = getattr(session, "reaction_times", None) or []
+    if step not in ("gesture", "complete", "micro") or len(times) < 2:
+        return 0.0
+    recent = times[-5:]
+    mean_t = float(np.mean(recent))
+    std_t = float(np.std(recent))
+    cv = std_t / (mean_t + 1e-6)
+
+    risk = 0.0
+
+    # Very low variance + fast reactions = suspicious
+    if cv < 0.03 and mean_t < 0.50:
+        risk = float(min(1.0, (0.05 - cv) * 18.0 + max(0.0, 0.45 - mean_t) * 1.2))
+    # Inhumanly fast reactions
+    elif mean_t < 0.15:
+        risk = 0.6
+    # Very low CV alone (robotic precision)
+    elif cv < 0.02 and len(recent) >= 3:
+        risk = 0.35
+
+    return float(min(1.0, max(0.0, risk)))
+

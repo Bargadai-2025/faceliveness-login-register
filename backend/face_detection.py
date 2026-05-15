@@ -292,171 +292,24 @@ def check_black_screen(img_bgr: np.ndarray, threshold: float = 45) -> bool:
 
 def compute_passive_liveness(img_bgr: np.ndarray, pts_68: Optional[List[Dict]] = None, strict: bool = False) -> Tuple[bool, float, str]:
     """
-    Texture, sharpness, and digital light heuristics for print/screen replay.
-    Now focused on Face ROI to avoid background false-positives.
-    Integrates harder checks: Scanlines, Peak Saturation, Specular Highlights, Color Diversity.
+    Delegates to weighted multi-signal spoof scoring (see spoof_scoring.py).
+    Returns (is_live, health_score 0..1, reason).
     """
     if img_bgr is None or img_bgr.size == 0:
         return False, 0.0, "Empty image"
+    from spoof_scoring import analyze_passive_spoof_single_frame
 
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
-    
-    # Define ROI (Face area or full image)
-    roi_gray = gray
-    roi_hsv = hsv
-    roi_bgr = img_bgr
-    if pts_68:
-        xs = [p["x"] for p in pts_68]
-        ys = [p["y"] for p in pts_68]
-        x1, y1, x2, y2 = int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))
-        h, w = gray.shape
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(w, x2), min(h, y2)
-        if x2 > x1 and y2 > y1:
-            roi_gray = gray[y1:y2, x1:x2]
-            roi_hsv = hsv[y1:y2, x1:x2]
-            roi_bgr = img_bgr[y1:y2, x1:x2]
-    
-    # 1. Texture/Sharpness (Laplacian)
-    lap_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-    
-    # 2. Frequency Analysis (FFT for moiré/periodic patterns)
-    dft = np.fft.fft2(gray)
-    dft_shift = np.fft.fftshift(dft)
-    magnitude = 20 * np.log(np.abs(dft_shift) + 1)
-    
-    # Moiré detection
-    rows, cols = gray.shape
-    crow, ccol = rows // 2, cols // 2
-    mask = np.ones((rows, cols), np.uint8)
-    r = int(min(rows, cols) * 0.15)
-    mask[crow-r:crow+r, ccol-r:ccol+r] = 0
-    high_freq_area = magnitude * mask
-    freq_score = float(np.mean(high_freq_area[high_freq_area > 0]))
-    
-    max_peak = float(np.max(high_freq_area))
-    peak_to_mean = max_peak / (freq_score + 1e-6)
-    
-    # 3. Gradient Analysis (Edges)
-    sobel_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
-    sobel_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
-    grad_mean = float(np.mean(np.sqrt(sobel_x ** 2 + sobel_y ** 2)))
-
-    # 4. Digital Screen Glow (Focused on Face ROI)
-    white_pixels = np.sum(roi_gray > 248)
-    glow_ratio = white_pixels / (roi_gray.size + 1e-6)
-    
-    # 5. Digital Saturation (Relaxed to avoid false positives from warm lights)
-    sat_channel = roi_hsv[:, :, 1]
-    high_sat_pixels = np.sum(sat_channel > 225)
-    sat_spike_ratio = high_sat_pixels / (sat_channel.size + 1e-6)
-
-    # ── HARDER ANTI-SCREEN CHECKS ──
-    # 6. Scanline Artifacts (Banding)
-    scanline_score = detect_scanline_artifacts(img_bgr)
-    
-    # 7. Peak Saturation (Digital Peaks R=G=B=255)
-    peak_ratio = detect_peak_saturation(roi_bgr)
-    
-    # 8. Specular Highlights (Screen Glare)
-    glare_ratio = detect_specular_highlights(roi_bgr)
-    
-    # 9. Color Diversity (Unnatural banding on screens)
-    color_div = compute_color_diversity(roi_bgr)
-
-    # Normalize scores
-    lap_norm = min(lap_var / 420.0, 1.0)
-    freq_norm = min(freq_score / 95.0, 1.0)
-    grad_norm = min(grad_mean / 35.0, 1.0)
-    
-    # Screen detection penalties
-    screen_penalty = 0.0
-    is_digital = False
-    digital_reason = ""
-
-    # 10. Emissive Panel Uniformity Check
-    is_emissive, e_score = check_emissive_uniformity(roi_bgr)
-    if is_emissive:
-        screen_penalty += 0.45
-        is_digital = True
-        digital_reason = "Emissive panel detected"
-
-    # 11. Screen Edge Detection (Rectangles)
-    if pts_68:
-        face_bbox = (int(min(xs)), int(min(ys)), int(x2-x1), int(y2-y1))
-        if check_screen_edges(img_bgr, face_bbox):
-            screen_penalty += 0.50
-            is_digital = True
-            digital_reason = "Digital screen bezel detected"
-
-    # NEW: Environmental Awareness — if the whole room is colorful/saturated/bright,
-    # don't penalize the face specifically.
-    global_sat_channel = hsv[:, :, 1]
-    global_val_channel = hsv[:, :, 2]
-    global_high_sat = np.sum(global_sat_channel > 200) / (global_sat_channel.size + 1e-6)
-    global_high_val = np.sum(global_val_channel > 230) / (global_val_channel.size + 1e-6)
-    
-    # Use stricter thresholds if requested (e.g. for final selfie capture)
-    # Relaxed to prevent false positives from high ambient light
-    g_thresh = 0.18 if strict else 0.25 # Raised from 0.15/0.22
-    s_thresh = 0.20 if strict else 0.28 # Raised from 0.18/0.25
-    
-    if global_high_sat > 0.35 or global_high_val > 0.40:
-        s_thresh += 0.15 # Room is naturally saturated or very bright
-        g_thresh += 0.12 # Room is naturally bright
-    
-    m_thresh = 1.8 if strict else 2.2
-    l_thresh = 0.52 if strict else 0.65
-    p_thresh = 0.06 if strict else 0.12 # Lowered from 0.08/0.15
-    r_thresh = 0.06 if strict else 0.10 # Lowered from 0.08/0.12
-    d_thresh = 0.04 if strict else 0.03 
-    live_gate = 0.55 if strict else 0.42 # Raised from 0.52/0.40
-
-    if glow_ratio > g_thresh: 
-        screen_penalty += 0.35
-        is_digital = True
-        digital_reason = "Screen glow"
-    if sat_spike_ratio > s_thresh: 
-        screen_penalty += 0.30
-        is_digital = True
-        digital_reason = "Unnatural saturation"
-    if peak_to_mean > m_thresh: 
-        screen_penalty += 0.40
-        is_digital = True
-        digital_reason = "Frequency moiré"
-    
-    if scanline_score > l_thresh: 
-        screen_penalty += 0.45
-        is_digital = True
-        digital_reason = "Digital scanlines/banding"
-    if peak_ratio > p_thresh: 
-        screen_penalty += 0.35
-        is_digital = True
-        digital_reason = "Digital screen peak light"
-    if glare_ratio > r_thresh: 
-        screen_penalty += 0.40
-        is_digital = True
-        digital_reason = "Screen reflection/glare"
-    if color_div < d_thresh: 
-        screen_penalty += 0.30
-        is_digital = True
-        digital_reason = "Low color diversity"
-
-    # Weighted score calculation
-    score = round(lap_norm * 0.45 + freq_norm * 0.35 + grad_norm * 0.20 - screen_penalty, 3)
-    
-    # Verification threshold
-    is_live = score > live_gate
-    reason = "OK"
-    
-    if not is_live:
-        if is_digital:
-            reason = f"Digital screen light/glow detected ({digital_reason}) — use a real face"
-        else:
-            reason = "Biometric anomaly: screen/print detected"
-            
-    return is_live, score, reason
+    rep = analyze_passive_spoof_single_frame(img_bgr, pts_68, strict=strict)
+    health = max(0.0, min(1.0, 1.0 - rep["total_spoof_score"] / 100.0))
+    is_live = bool(rep["is_live"])
+    if is_live:
+        reason = "OK"
+    else:
+        rules = ", ".join(rep.get("triggered_rules") or [])[:200]
+        reason = f"Spoof score {rep['total_spoof_score']:.0f}/{rep.get('reject_threshold', 70):.0f}"
+        if rules:
+            reason += f" ({rules})"
+    return is_live, round(health, 3), reason
 
 
 def compute_brightness_histogram(img_bgr: np.ndarray) -> Dict[str, float]:

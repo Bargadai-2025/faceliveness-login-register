@@ -92,6 +92,32 @@ class LivenessSession:
     row_variance_history: List[np.ndarray] = field(default_factory=list)
     last_face_bbox: Optional[Tuple[int, int, int, int]] = None
 
+    # Weighted spoof scoring (temporal + motion)
+    spoof_score_history: List[float] = field(default_factory=list)
+    landmark_centroid_history: List[Tuple[float, float]] = field(default_factory=list)
+    last_gray_small: Optional[np.ndarray] = None
+    spoof_temporal_hits: int = 0
+    replay_risk_ema: float = 0.0
+    fraud_ema_history: List[float] = field(default_factory=list)
+
+    # NEW: Cooldown recovery — prevents false spikes from cascading
+    fraud_cooldown_frames: int = 0  # Counts frames since last low-score frame
+
+    # NEW: Per-signal rolling history for debugging and analysis
+    per_signal_history: Dict[str, List[float]] = field(default_factory=lambda: {
+        "depth_parallax": [],
+        "biological": [],
+        "device_replay": [],
+        "challenge": [],
+        "texture_degraded": [],
+        "moire": [],
+        "reflection": [],
+        "flicker": [],
+    })
+
+    # NEW: Fraud rejection reasons for audit trail
+    fraud_rejection_reasons: List[str] = field(default_factory=list)
+
     # Agent Verification (New)
     agent_label: Optional[str] = None
     agent_embedding: Optional[np.ndarray] = None

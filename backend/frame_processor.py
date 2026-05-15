@@ -14,11 +14,21 @@ from face_detection import (
     decode_frame, detect_faces, compute_ear, compute_head_pose,
     compute_eye_tilt_rad, compute_brow_heights, estimate_expression,
     check_black_screen, compute_brightness_histogram, landmarks_to_serializable,
-    compute_passive_liveness, get_face_roi,
+    get_face_roi,
 )
 from liveness_checks import (
     check_depth_displacement, check_micro_expressions,
     check_light_response, evaluate_gesture, SUSTAINED_FRAMES,
+    parallax_replay_risk,
+    biological_motion_replay_risk,
+    challenge_consistency_replay_risk,
+)
+from spoof_scoring import (
+    analyze_passive_spoof_single_frame,
+    streaming_temporal_decision,
+    centroid_of_landmarks,
+    downsample_gray,
+    load_thresholds,
 )
 
 # YOLO device detection — load lazily
@@ -43,6 +53,46 @@ def _get_yolo():
         except Exception as e:
             print(f"⚠️ YOLO load failed (device detection disabled): {e}")
     return _yolo_model
+
+
+def _yolo_device_replay_risk(
+    img: np.ndarray,
+    face_bbox: Tuple[int, int, int, int],
+    w: int,
+    h: int,
+    yolo,
+) -> Tuple[float, bool]:
+    """
+    Face–device overlap → replay_risk in [0,1].
+    hard_overlap: only true for very high IoU (obvious phone covering face).
+    """
+    fx, fy, fw, fh = face_bbox
+    max_risk = 0.0
+    hard_overlap = False
+    try:
+        yolo_results = yolo(img, verbose=False, conf=0.48)
+        for r in yolo_results:
+            for box in r.boxes:
+                cls_name = r.names[int(box.cls[0])].lower()
+                if cls_name not in DEVICE_CLASSES:
+                    continue
+                bx = box.xyxy[0].cpu().numpy()
+                ix1 = max(bx[0], fx)
+                iy1 = max(bx[1], fy)
+                ix2 = min(bx[2], fx + fw)
+                iy2 = min(bx[3], fy + fh)
+                inter_area = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+                face_area = fw * fh + 1e-6
+                iou_face = inter_area / face_area
+                obj_w, obj_h = float(box.xywh[0][2]), float(box.xywh[0][3])
+                area_pct = (obj_w * obj_h) / (w * h + 1e-6)
+                if iou_face > 0.48:
+                    hard_overlap = True
+                part = min(1.0, iou_face * 2.1 + min(0.35, area_pct * 2.8))
+                max_risk = max(max_risk, part)
+    except Exception as e:
+        print(f"YOLO device risk error: {e}")
+    return float(min(1.0, max_risk)), hard_overlap
 
 
 def process_frame(session: LivenessSession, frame_bytes: bytes, identity_callback=None) -> Dict[str, Any]:
@@ -129,7 +179,138 @@ def process_frame(session: LivenessSession, frame_bytes: bytes, identity_callbac
     if len(session.landmark_history) > 30:
         session.landmark_history = session.landmark_history[-30:]
 
-    # Face too small
+    session.landmark_centroid_history.append(centroid_of_landmarks(pts_68))
+    if len(session.landmark_centroid_history) > 40:
+        session.landmark_centroid_history = session.landmark_centroid_history[-40:]
+
+    curr_gray_small = downsample_gray(img)
+
+    roi = get_face_roi(img, pts_68)
+    face_bbox = (
+        int(min([p["x"] for p in pts_68])),
+        int(min([p["y"] for p in pts_68])),
+        int(face_width),
+        int(max([p["y"] for p in pts_68]) - min([p["y"] for p in pts_68])),
+    )
+    if roi is not None:
+        luminance = float(np.mean(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)))
+        session.roi_luminance_history.append(luminance)
+        if len(session.roi_luminance_history) > 60:
+            session.roi_luminance_history.pop(0)
+
+    # ── WEIGHTED SPOOF + YOLO DEVICE (multi-signal; EMA + temporal gate) ──
+    critical_steps = ["calibration", "depth", "light_challenge", "micro", "gesture"]
+    if session.step in critical_steps or session.frame_count % 5 == 0:
+        extra_signals: Dict[str, float] = {
+            "depth_parallax": parallax_replay_risk(session.landmark_history),
+            "biological": biological_motion_replay_risk(session.landmark_history),
+            "challenge": challenge_consistency_replay_risk(session),
+            "device_replay": 0.0,
+        }
+        yolo = _get_yolo()
+        device_hard = False
+        if yolo is not None:
+            dr, device_hard = _yolo_device_replay_risk(img, face_bbox, w, h, yolo)
+            extra_signals["device_replay"] = dr
+            if device_hard:
+                return {
+                    "status": "processing",
+                    "detail": "Security Alert: device obscuring face — remove phone or tablet from view",
+                    "step": session.step,
+                    "landmarks": landmarks_to_serializable(pts_68),
+                    "mesh": landmarks_to_serializable(pts_478),
+                    "progress": session.progress_pct,
+                    "is_suspicious": True,
+                    "spoof_debug": {"device_replay": round(dr, 3), "hard_overlap": True},
+                }
+
+        spoof_report = analyze_passive_spoof_single_frame(
+            img,
+            pts_68,
+            strict=False,
+            roi_luminance_history=session.roi_luminance_history,
+            last_gray_small=session.last_gray_small,
+            curr_gray_small=curr_gray_small,
+            landmark_centroid_history=session.landmark_centroid_history,
+            extra_signals=extra_signals,
+        )
+        current_fused = float(spoof_report["total_spoof_score"])
+        th_all = load_thresholds()
+        alpha = float(th_all.get("ema_alpha", 0.22))
+        session.replay_risk_ema = alpha * current_fused + (1.0 - alpha) * float(session.replay_risk_ema)
+        session.fraud_ema_history.append(round(session.replay_risk_ema, 2))
+        if len(session.fraud_ema_history) > 30:
+            session.fraud_ema_history = session.fraud_ema_history[-30:]
+
+        # ── Track per-signal rolling history for debugging ──
+        signal_conf = spoof_report.get("confidence_per_signal", {})
+        for sig_key in session.per_signal_history:
+            v = float(signal_conf.get(sig_key, extra_signals.get(sig_key, 0.0)))
+            session.per_signal_history[sig_key].append(round(v, 3))
+            if len(session.per_signal_history[sig_key]) > 20:
+                session.per_signal_history[sig_key] = session.per_signal_history[sig_key][-20:]
+
+        should_flag, smoothed = streaming_temporal_decision(session.spoof_score_history, session.replay_risk_ema)
+        session.spoof_score_history.append(session.replay_risk_ema)
+        if len(session.spoof_score_history) > 20:
+            session.spoof_score_history = session.spoof_score_history[-20:]
+
+        # ── COOLDOWN RECOVERY: prevent false spikes from cascading ──
+        cooldown_threshold = float(th_all.get("cooldown_decay_threshold", 40.0))
+        temporal_hits_required = int(th_all.get("temporal_hits_required", 4))
+
+        if should_flag:
+            session.spoof_temporal_hits += 1
+            session.fraud_cooldown_frames = 0  # Reset cooldown
+        else:
+            # If current score is well below threshold, actively decay accumulated hits
+            if session.replay_risk_ema < cooldown_threshold:
+                session.fraud_cooldown_frames += 1
+                # Every 2 clean frames, reduce temporal hits by 1
+                if session.fraud_cooldown_frames >= 2 and session.spoof_temporal_hits > 0:
+                    session.spoof_temporal_hits = max(0, session.spoof_temporal_hits - 1)
+                    session.fraud_cooldown_frames = 0
+            else:
+                session.fraud_cooldown_frames = 0
+
+        # ── TEMPORAL REJECTION: only if sustained across MANY frames ──
+        if session.spoof_temporal_hits >= temporal_hits_required:
+            session.spoof_temporal_hits = 0  # Reset after rejection
+            rejection_reason = f"Sustained replay risk ({temporal_hits_required}+ frames, EMA={session.replay_risk_ema:.1f})"
+            session.fraud_rejection_reasons.append(rejection_reason)
+
+            # Compute per-signal rolling averages for debug
+            per_signal_avgs = {}
+            for sig_key, sig_hist in session.per_signal_history.items():
+                if sig_hist:
+                    per_signal_avgs[sig_key] = round(sum(sig_hist[-8:]) / len(sig_hist[-8:]), 3)
+
+            return {
+                "status": "processing",
+                "detail": "Security Alert: sustained presentation-attack risk (multi-signal + temporal)",
+                "step": session.step,
+                "landmarks": landmarks_to_serializable(pts_68),
+                "mesh": landmarks_to_serializable(pts_478),
+                "progress": session.progress_pct,
+                "is_suspicious": True,
+                "spoof_debug": {
+                    "final_replay_risk": round(session.replay_risk_ema, 2),
+                    "frame_fused_score": round(current_fused, 2),
+                    "smoothed_window": round(smoothed, 2),
+                    "temporal_hits_required": temporal_hits_required,
+                    "triggered_rules": spoof_report.get("triggered_rules", []),
+                    "confidence_per_signal": spoof_report.get("confidence_per_signal", {}),
+                    "extra_signals_used": spoof_report.get("extra_signals_used", {}),
+                    "correlation_gate_notes": spoof_report.get("correlation_gate_notes", []),
+                    "fraud_ema_history": list(session.fraud_ema_history[-16:]),
+                    "per_signal_rolling_averages": per_signal_avgs,
+                    "rejection_reason": rejection_reason,
+                    "fraud_rejection_count": len(session.fraud_rejection_reasons),
+                },
+            }
+
+    session.last_gray_small = curr_gray_small
+
     if face_width < w * 0.08:
         return {
             "status": "processing",
@@ -150,100 +331,6 @@ def process_frame(session: LivenessSession, frame_bytes: bytes, identity_callbac
             "mesh": landmarks_to_serializable(pts_478),
             "progress": session.progress_pct,
         }
-
-    # ── PASSIVE LIVENESS (Texture & Digital Glow Analysis) ──
-    # Run every frame during critical early steps, otherwise every 3 frames
-    critical_steps = ["calibration", "depth", "light_challenge", "micro"]
-    if session.step in critical_steps or session.frame_count % 5 == 0:
-        is_live_texture, texture_score, texture_reason = compute_passive_liveness(img, pts_68)
-        if not is_live_texture:
-            session.digital_screen_fail_count += 1
-            # 🔥 Require 3 consecutive failures to avoid light-flare false positives
-            if session.digital_screen_fail_count >= 3:
-                return {
-                    "status": "processing", 
-                    "detail": f"Security Alert: Digital screen glow detected",
-                    "step": session.step,
-                    "landmarks": landmarks_to_serializable(pts_68),
-                    "mesh": landmarks_to_serializable(pts_478),
-                    "progress": session.progress_pct,
-                    "is_suspicious": True
-                }
-            else:
-                # Still processing, waiting for consistency consensus
-                return {
-                    "status": "processing",
-                    "detail": "Analyzing environment security...",
-                    "step": session.step,
-                    "landmarks": landmarks_to_serializable(pts_68),
-                    "mesh": landmarks_to_serializable(pts_478),
-                    "progress": session.progress_pct,
-                }
-        else:
-            # Reset counter on valid live frame
-            session.digital_screen_fail_count = 0
-
-    # ── TEMPORAL HISTORY UPDATE ──
-    roi = get_face_roi(img, pts_68)
-    face_bbox = (int(min([p["x"] for p in pts_68])), int(min([p["y"] for p in pts_68])), 
-                 int(face_width), int(max([p["y"] for p in pts_68]) - min([p["y"] for p in pts_68])))
-    
-    if roi is not None:
-        luminance = float(np.mean(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)))
-        session.roi_luminance_history.append(luminance)
-        if len(session.roi_luminance_history) > 60:
-            session.roi_luminance_history.pop(0)
-
-    # ── YOLO OBJECT DETECTION (Fraud & Background check) ──
-    # Run every frame during critical steps for instant fail, otherwise every 2 frames
-    if session.step in critical_steps or session.frame_count % 5 == 0:
-        yolo = _get_yolo()
-        if yolo is not None:
-            try:
-                results = yolo(img, verbose=False, conf=0.55)
-                for r in results:
-                    for box in r.boxes:
-                        cls_name = r.names[int(box.cls[0])].lower()
-                        if cls_name in DEVICE_CLASSES:
-                            # 🚨 HARD FAIL-FAST ON OVERLAP
-                            bx = box.xyxy[0].cpu().numpy() # [x1, y1, x2, y2]
-                            fx, fy, fw, fh = face_bbox
-                            
-                            # Intersection over Union (coarse overlap check)
-                            ix1 = max(bx[0], fx)
-                            iy1 = max(bx[1], fy)
-                            ix2 = min(bx[2], fx + fw)
-                            iy2 = min(bx[3], fy + fh)
-                            inter_area = max(0, ix2 - ix1) * max(0, iy2 - iy1)
-                            face_area = fw * fh
-                            
-                            if (inter_area / face_area) > 0.15:
-                                return {
-                                    "status": "processing",
-                                    "detail": f"Security Alert: {DEVICE_CLASSES[cls_name]} overlap detected.",
-                                    "step": session.step,
-                                    "is_suspicious": True
-                                }
-
-                            # Size based check as backup
-                            obj_w, obj_h = box.xywh[0][2], box.xywh[0][3]
-                            area_pct = (obj_w * obj_h) / (w * h)
-                            if area_pct < 0.015: continue
-
-                            display_name = DEVICE_CLASSES.get(cls_name, cls_name.replace("_", " ").title())
-                            session.device_detected = True
-                            session.device_class = display_name
-                            return {
-                                "status": "processing", 
-                                "detail": f"Security Alert: {display_name} detected.",
-                                "step": session.step,
-                                "mesh": landmarks_to_serializable(pts_478),
-                                "is_suspicious": True
-                            }
-            except Exception as e:
-                print(f"YOLO error: {e}")
-                pass
-
 
     # ── CALIBRATION PHASE ──
     if session.step == "calibration":

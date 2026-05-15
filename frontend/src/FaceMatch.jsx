@@ -144,6 +144,8 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
   const [completedSteps, setCompletedSteps] = useState([]);
   const [toasts, setToasts] = useState([]);
   const [penaltyDetails, setPenaltyDetails] = useState([]);
+  /** When backend flags final selfie as non-live (screen/print), show security failure UI even if cosine match is high. */
+  const [captureLiveFailure, setCaptureLiveFailure] = useState(null);
 
   const addToast = useCallback((msg, type = "success") => {
     const id = Date.now();
@@ -491,6 +493,7 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
     setPreview(null);
     setResults([]);
     setPenaltyDetails([]);
+    setCaptureLiveFailure(null);
     setLivenessLive(false);
     setCanMatch(false);
     setGeoData(null);
@@ -638,6 +641,7 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
     setError(null);
     setResults([]);
     setPenaltyDetails([]);
+    setCaptureLiveFailure(null);
     setProgress(0);
     setGeoError(null);
 
@@ -688,11 +692,20 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
       if (data.error) {
         console.error("❌ Match error from backend:", data.error);
         setError(data.error);
+        setCaptureLiveFailure(null);
         setProgress(0);
       } else {
         console.log("✅ Match successful", data.matches?.length, "results");
         setResults(data.matches || []);
         setPenaltyDetails(data.security_penalty_breakdown || []);
+        if (data.capture_live_ok === false) {
+          setCaptureLiveFailure({
+            reason: data.capture_live_reason || "Final capture did not pass live-face checks (screen, photo, or replay suspected).",
+            score: typeof data.capture_live_score === "number" ? data.capture_live_score : null,
+          });
+        } else {
+          setCaptureLiveFailure(null);
+        }
         if (data.processed_image) setProcessedPreview(data.processed_image);
         if (data.captured_image) setCapturedImage(data.captured_image);
         setProgress(100);
@@ -1011,7 +1024,7 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
         {error && <div className="fm-error"><AlertTriangle size={16} style={{ marginRight: 8 }} /> {error}</div>}
 
         {results.length > 0 && !loading ? (
-          (results[0].confidence * 100).toFixed(0) >= 70 ? (
+          !captureLiveFailure && (results[0].confidence * 100).toFixed(0) >= 80 ? (
             <div>
               <div className="fm-verification-summary-bar">
                 <div className="fm-verified-badge">
@@ -1112,8 +1125,19 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
             <>
               <div className="fm-error" style={{ marginTop: 20 }}>
                 <AlertTriangle size={16} style={{ marginRight: 8 }} />
-                Security Check Failed: Match confidence too low ({(results[0].confidence * 100).toFixed(0)}%).
-                Please ensure you are the registered agent and not using a digital screen.
+                {captureLiveFailure ? (
+                  <>
+                    Security Check Failed: Final capture failed live-face verification
+                    {captureLiveFailure.score != null ? ` (PAD score ${captureLiveFailure.score})` : ""}.{" "}
+                    {captureLiveFailure.reason}
+                    {" "}Do not point the camera at a screen or printed photo; use your face directly, well lit.
+                  </>
+                ) : (
+                  <>
+                    Security Check Failed: Match confidence too low ({(results[0].confidence * 100).toFixed(0)}%).
+                    Please ensure you are the registered agent and not using a digital screen.
+                  </>
+                )}
               </div>
 
               {penaltyDetails.length > 0 && (
