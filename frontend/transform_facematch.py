@@ -33,7 +33,7 @@ const CHALLENGE_TEXT = {
   # surprised: "\ud83d\ude32 Look SURPRISED",
   mouth_open: "\ud83d\ude2e OPEN your mouth wide",
   # wide_eyes: "\ud83d\udc40 OPEN your eyes wide",
-  blink_both: "\ud83d\ude09 BLINK both eyes quickly",
+  # blink_both: "\ud83d\ude09 BLINK both eyes quickly",
   # raise_eyebrows: "\ud83e\udd28 Raise your EYEBROWS up",
   # pucker_lips: "\ud83d\ude17 PUCKER your lips forward",
   # frown: "\u2639\ufe0f FROWN (sad face)",
@@ -50,7 +50,7 @@ const CHALLENGE_TEXT = {
   # eye_left_right: "\ud83d\udc40 Move eyes LEFT then RIGHT",
   # smile_then_blink: "\ud83d\ude0a SMILE then BLINK",
   # blink_then_turn_left: "\ud83d\ude09 BLINK then turn LEFT",
-  raise_eyebrows_hold: "\ud83e\udd28 Raise both eyebrows and HOLD 1.5s",
+  # raise_eyebrows_hold: "\ud83e\udd28 Raise both eyebrows and HOLD 1.5s",
 };
 
 function getOrCreateDeviceId() {

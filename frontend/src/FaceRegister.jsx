@@ -43,24 +43,24 @@ const CHALLENGE_UI = {
   // surprised: { label: "Look SURPRISED", icon: Smile },
   mouth_open: { label: "OPEN your mouth wide", icon: Smile },
   // wide_eyes: { label: "OPEN eyes wide", icon: Eye },
-  blink_both: { label: "BLINK both eyes", icon: Eye },
+  // blink_both: { label: "BLINK both eyes", icon: Eye },
   // raise_eyebrows: { label: "Raise your EYEBROWS", icon: Activity },
   // pucker_lips: { label: "PUCKER your lips", icon: Smile },
   // frown: { label: "FROWN (sad face)", icon: Smile },
-  move_closer: { label: "Move CLOSER", icon: Maximize },
-  move_farther: { label: "Move FARTHER", icon: Maximize },
+  move_closer: { label: "Move Closer", icon: Maximize },
+  move_farther: { label: "Move Away", icon: Maximize },
   shake_head: { label: "Shake head NO", icon: Activity },
   // blink_twice_fast: { label: "BLINK twice fast", icon: Eye },
   look_left_hold: { label: "Look LEFT & HOLD", icon: ArrowLeft },
   look_right_hold: { label: "Look RIGHT & HOLD", icon: ArrowRight },
   look_up_hold: { label: "Look UP & HOLD", icon: ArrowUp },
   look_down_hold: { label: "Look DOWN & HOLD", icon: ArrowDown },
-  head_forward: { label: "Move head FORWARD", icon: ArrowUp },
-  head_backward: { label: "Move head BACKWARD", icon: ArrowDown },
+  // head_forward: { label: "Move head FORWARD", icon: ArrowUp },
+  // head_backward: { label: "Move head BACKWARD", icon: ArrowDown },
   // eye_left_right: { label: "Move eyes L to R", icon: Eye },
   // smile_then_blink: { label: "SMILE then BLINK", icon: Smile },
   // blink_then_turn_left: { label: "BLINK then turn LEFT", icon: Eye },
-  raise_eyebrows_hold: { label: "Raise brows & HOLD", icon: Activity },
+  // raise_eyebrows_hold: { label: "Raise brows & HOLD", icon: Activity },
 };
 
 const FACE_CONNECTIONS = [
@@ -79,8 +79,8 @@ let sessionDeviceId = null;
 function getOrCreateDeviceId() {
   if (!sessionDeviceId) {
     try {
-      const uuid = (typeof crypto !== 'undefined' && crypto.randomUUID) 
-        ? crypto.randomUUID().slice(0, 8) 
+      const uuid = (typeof crypto !== 'undefined' && crypto.randomUUID)
+        ? crypto.randomUUID().slice(0, 8)
         : Math.random().toString(36).substring(2, 10);
       sessionDeviceId = `session_${uuid}`;
     } catch (e) {

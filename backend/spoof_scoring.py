@@ -22,6 +22,10 @@ from face_detection import (
     check_screen_edges,
     compute_color_diversity,
     get_face_roi,
+    compute_rtc_compression_score,
+    compute_sensor_authenticity,
+    analyze_eye_reflections,
+    detect_display_refresh_rate,
 )
 
 
@@ -58,6 +62,11 @@ def load_spoof_weights() -> Dict[str, float]:
         "bg_uniform_motion": _f("SPOOF_WEIGHT_BG_MOTION", 18.0),
         "perspective": _f("SPOOF_WEIGHT_PERSPECTIVE", 8.0),
         "rect_glare": _f("SPOOF_WEIGHT_RECT_GLARE", 10.0),
+        "video_call_replay": _f("SPOOF_WEIGHT_VIDEO_CALL", 25.0),
+        "eye_screen_reflection": _f("SPOOF_WEIGHT_EYE_REFLECTION", 20.0),
+        "temporal_stream_integrity": _f("SPOOF_WEIGHT_TEMPORAL_STREAM", 20.0),
+        "sensor_authenticity": _f("SPOOF_WEIGHT_SENSOR_AUTH", 15.0),
+        "environment_authenticity": _f("SPOOF_WEIGHT_ENV_AUTH", 15.0),
     }
 
 
@@ -358,17 +367,26 @@ def _gather_raw_signals(
         # Suppress peak saturation for natural skin regardless of peak value
         peak *= 0.25
         glare_for_score *= 0.5
+        
+    rtc_comp = compute_rtc_compression_score(img_bgr, face_bbox)
+    sensor_auth = compute_sensor_authenticity(img_bgr)
+    eye_refl = analyze_eye_reflections(img_bgr, pts_68) if pts_68 else 0.0
+    refresh_rate = detect_display_refresh_rate(img_bgr)
 
     return {
         "moire": float(min(1.0, moire_combined + emissive_boost * 0.3)),
         "flat_plane": float(min(1.0, flat_p + (0.18 if is_emissive else 0.0))),
         "screen_border": border,
-        "flicker": flicker,
+        "flicker": float(min(1.0, flicker + refresh_rate * 0.5)),
         "reflection_raw": float(min(1.0, glare_for_score * 2.5 + peak * 1.2)),  # Reduced multipliers
         "texture_degraded": float(min(1.0, texture + (0.15 if color_div < 0.025 else 0.0))),
         "rect_glare": float(min(1.0, rect_g + 0.25 * peak)),  # Reduced from 0.35
         "bg_uniform_motion": bg_mot,
         "perspective": persp,
+        "video_call_replay": rtc_comp,
+        "sensor_authenticity": sensor_auth,
+        "eye_screen_reflection": eye_refl,
+        "display_refresh_probability": refresh_rate,
         "_refl_label": refl_label,
         "_refl_conf": refl_conf,
         "_scan": scan,
@@ -443,10 +461,14 @@ def aggregate_weighted_score(
     if raw["rect_glare"] > 0.55:
         extra_sb = weights.get("screen_border", 15.0) * 0.12 * raw["rect_glare"] * strict_mul
         total += extra_sb
-
+        
     # High-priority session / landmark signals (replay_risk 0..1)
-    for key in ("depth_parallax", "biological", "device_replay", "challenge"):
-        v = float(min(1.0, max(0.0, extra_signals.get(key, 0.0))))
+    for key in (
+        "depth_parallax", "biological", "device_replay", "challenge",
+        "video_call_replay", "eye_screen_reflection", "sensor_authenticity",
+        "temporal_stream_integrity", "environment_authenticity"
+    ):
+        v = float(min(1.0, max(0.0, raw.get(key, extra_signals.get(key, 0.0)))))
         per_signal_conf[key] = v
         w = weights.get(key, 0.0)
         total += w * v * strict_mul
@@ -466,6 +488,11 @@ def aggregate_weighted_score(
         "biological",
         "device_replay",
         "challenge",
+        "video_call_replay",
+        "eye_screen_reflection",
+        "sensor_authenticity",
+        "temporal_stream_integrity",
+        "environment_authenticity",
     ):
         if per_signal_conf.get(key, 0) >= 0.42:
             triggered.append(key)

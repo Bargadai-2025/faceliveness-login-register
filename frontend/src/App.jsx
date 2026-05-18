@@ -5,9 +5,9 @@ import LoginPage from "./loginpage";
 
 function App() {
   // Default user to bypass login
-  const [user, setUser] = useState({ 
-    email: "agent@bargad.ai", 
-    agentLabel: "Authorized Agent" 
+  const [user, setUser] = useState({
+    email: "agent@bargad.ai",
+    agentLabel: "Authorized Agent",
   });
   const [currentPath, setCurrentPath] = useState(window.location.pathname);
 
@@ -57,4 +57,3 @@ function App() {
 }
 
 export default App;
-

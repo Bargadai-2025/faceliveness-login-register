@@ -43,24 +43,24 @@ const CHALLENGE_UI = {
   // surprised: { label: "Look SURPRISED", icon: Smile },
   mouth_open: { label: "OPEN your mouth wide", icon: Smile },
   // wide_eyes: { label: "OPEN eyes wide", icon: Eye },
-  blink_both: { label: "BLINK both eyes", icon: Eye },
+  // blink_both: { label: "BLINK both eyes", icon: Eye },
   // raise_eyebrows: { label: "Raise your EYEBROWS", icon: Activity },
   // pucker_lips: { label: "PUCKER your lips", icon: Smile },
   // frown: { label: "FROWN (sad face)", icon: Smile },
   move_closer: { label: "Move CLOSER", icon: Maximize },
-  move_farther: { label: "Move FARTHER", icon: Maximize },
+  move_farther: { label: "Move Away", icon: Maximize },
   shake_head: { label: "Shake head NO", icon: Activity },
   // blink_twice_fast: { label: "BLINK twice fast", icon: Eye },
   look_left_hold: { label: "Look LEFT & HOLD", icon: ArrowLeft },
   look_right_hold: { label: "Look RIGHT & HOLD", icon: ArrowRight },
   look_up_hold: { label: "Look UP & HOLD", icon: ArrowUp },
   look_down_hold: { label: "Look DOWN & HOLD", icon: ArrowDown },
-  head_forward: { label: "Move head FORWARD", icon: ArrowUp },
-  head_backward: { label: "Move head BACKWARD", icon: ArrowDown },
+  // head_forward: { label: "Move head FORWARD", icon: ArrowUp },
+  // head_backward: { label: "Move head BACKWARD", icon: ArrowDown },
   // eye_left_right: { label: "Move eyes L to R", icon: Eye },
   // smile_then_blink: { label: "SMILE then BLINK", icon: Smile },
   // blink_then_turn_left: { label: "BLINK then turn LEFT", icon: Eye },
-  raise_eyebrows_hold: { label: "Raise brows & HOLD", icon: Activity },
+  // raise_eyebrows_hold: { label: "Raise brows & HOLD", icon: Activity },
 };
 
 // 68-pt landmark segment indices (MediaPipe → 68 mapping on server)
@@ -757,6 +757,10 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
     }
   };
 
+  const handleReload = () => {
+    window.location.reload();
+  }
+
   return (
     <div className="fm-page">
       {/* Toast Notification Pipeline */}
@@ -1165,7 +1169,7 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
               )}
               <div className="fm-penalty-retry">
                 <p>Verification failed due to high security risk or low similarity. Please try again in a well-lit environment.</p>
-                <button className="fm-btn retry-btn" onClick={startCamera}>
+                <button className="fm-btn retry-btn" onClick={handleReload}>
                   <Camera size={18} /> Retry Verification
                 </button>
               </div>

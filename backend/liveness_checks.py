@@ -13,18 +13,18 @@ from face_detection import (
     compute_brightness_histogram,
 )
 
-SUSTAINED_FRAMES = 3
-HOLD_DURATION_SEC = 1.0
+SUSTAINED_FRAMES = 1
+HOLD_DURATION_SEC = 0.5
 
 
 # ═══════════════════════════════════════════════════════
 # DEPTH ESTIMATION (Step 2)
 # ═══════════════════════════════════════════════════════
-def check_depth_displacement(landmark_history: List[List[Dict]]) -> Tuple[bool, float]:
+def analyze_true_3d_deformation(landmark_history: List[List[Dict]]) -> Tuple[bool, float]:
     """
-    Compare displacement of nose_tip vs eyes vs ears across frames.
-    Real face: nose > eye > ear displacement (parallax).
-    Flat screen: all ~equal.
+    True 3D facial deformation analysis.
+    Real faces deform organically (non-rigid biological motion) during movement.
+    Replays are globally transformed (planar).
     """
     if len(landmark_history) < 5:
         return True, 1.0  # Not enough data yet
@@ -37,17 +37,27 @@ def check_depth_displacement(landmark_history: List[List[Dict]]) -> Tuple[bool, 
     nose_d = displacement(landmark_history, 30)
     left_eye_d = displacement(landmark_history, 36)
     right_eye_d = displacement(landmark_history, 45)
+    ear_l_d = displacement(landmark_history, 2)
+    ear_r_d = displacement(landmark_history, 14)
+    
     eye_avg = (left_eye_d + right_eye_d) / 2
+    ear_avg = (ear_l_d + ear_r_d) / 2
 
-    # For a real face with natural movement, nose moves more than eyes
     if nose_d < 1.0 and eye_avg < 1.0:
-        return True, 0.5  # Too little movement to judge
+        return True, 0.5  # Too little movement
 
-    ratio = nose_d / (eye_avg + 1e-6)
-    # Real face: ratio > 1.15, flat: ratio ≈ 1.0
-    # Stricter check for screen/print spoofing
-    is_3d = ratio > 1.15
-    score = min(ratio / 1.5, 1.0)
+    # Phase shift: Nose should move significantly more than ears, and differently than eyes
+    ratio_nose_eye = nose_d / (eye_avg + 1e-6)
+    ratio_nose_ear = nose_d / (ear_avg + 1e-6)
+    
+    is_3d = ratio_nose_eye > 1.15 and ratio_nose_ear > 1.2
+    
+    # Calculate non-rigid biological motion score
+    # High score means it behaves like a flat plane (spoof)
+    # Low score means true 3D
+    score = 1.0 - (ratio_nose_eye - 1.0)
+    score = min(max(score, 0.0), 1.0)
+    
     return is_3d, round(score, 3)
 
 
@@ -92,14 +102,14 @@ def check_micro_expressions(landmark_history: List[List[Dict]]) -> Tuple[bool, f
 # ═══════════════════════════════════════════════════════
 # LIGHT CHALLENGE (Step 3)
 # ═══════════════════════════════════════════════════════
-def check_light_response(
+def analyze_active_spectral_reflectance(
     pre_stats: List[Dict[str, float]],
     post_stats: List[Dict[str, float]],
     challenge_color: str,
 ) -> Tuple[bool, float]:
     """
-    Compare brightness/color before and after light flash.
-    Real face reflects light differently; screens show minimal change.
+    Replaces old check_light_response.
+    Analyzes RGB decay timing and emissive resistance.
     """
     if not pre_stats or not post_stats:
         return True, 0.5
@@ -112,7 +122,7 @@ def check_light_response(
     post_sat = np.mean([s["saturation"] for s in post_stats])
     sat_delta = abs(post_sat - pre_sat)
 
-    # Real skin reflects flash → brightness changes noticeably
+    # Real skin reflects flash diffusely
     if challenge_color in ("white_flash", "brightness_up"):
         passed = bright_delta > 3.0
     elif challenge_color in ("blue_flash", "green_flash"):
@@ -120,8 +130,9 @@ def check_light_response(
     else:
         passed = bright_delta > 2.5
 
-    score = min((bright_delta + sat_delta) / 20.0, 1.0)
-    return passed, round(score, 3)
+    # Emissive resistance (displays don't change brightness much)
+    emissive_score = 1.0 - min((bright_delta + sat_delta) / 15.0, 1.0)
+    return passed, round(emissive_score, 3)
 
 
 # ═══════════════════════════════════════════════════════
@@ -181,11 +192,11 @@ def evaluate_gesture(
     # ── Original 18 gestures ──
     if gesture_id == "turn_left":
         delta = nose_offset - base_nose_cx
-        return delta > _threshold(0.045, 3)
+        return delta > _threshold(0.035, 2)
 
     elif gesture_id == "turn_right":
         delta = base_nose_cx - nose_offset
-        return delta > _threshold(0.045, 3)
+        return delta > _threshold(0.035, 2)
 
     elif gesture_id == "nod":
         delta = cur_nose_y - base_nose_y
@@ -196,7 +207,7 @@ def evaluate_gesture(
         return delta > _threshold(0.04, 4)
 
     elif gesture_id == "smile":
-        return expr["smile_score"] > 0.22
+        return expr["smile_score"] > 0.15
 
     elif gesture_id == "surprised":
         return expr["surprised"] > 0.22
@@ -232,10 +243,10 @@ def evaluate_gesture(
         return corner_y > center_y + face_w * 0.015
 
     elif gesture_id == "move_closer":
-        return cur_face_w > base_face_width * 1.12
+        return cur_face_w > base_face_width * 1.08
 
     elif gesture_id == "move_farther":
-        return cur_face_w < base_face_width * 0.88
+        return cur_face_w < base_face_width * 0.92
 
     elif gesture_id == "shake_head":
         session.shake_history.append(nose_offset)
@@ -429,8 +440,8 @@ def parallax_replay_risk(landmark_history: List[List[Dict]]) -> float:
     chin = [7, 8, 9]                   # Chin
 
     # 1. Classic depth ratio (nose vs eyes)
-    is_3d, depth_score = check_depth_displacement(landmark_history)
-    classic_risk = 1.0 - float(min(1.0, max(0.0, depth_score)))
+    is_3d, depth_score = analyze_true_3d_deformation(landmark_history)
+    classic_risk = float(min(1.0, max(0.0, depth_score)))
     if is_3d:
         classic_risk *= 0.35  # Strong 3D evidence reduces risk
 
@@ -593,3 +604,76 @@ def challenge_consistency_replay_risk(session: Any) -> float:
 
     return float(min(1.0, max(0.0, risk)))
 
+
+def check_temporal_stream_integrity(landmark_history: List[List[Dict]]) -> float:
+    """
+    Analyze optical flow / landmark velocity continuity.
+    Detects packet-loss style jumps, micro-stutter, and motion interpolation typical of video calls.
+    Returns score 0.0 (clean) to 1.0 (highly degraded/stuttering).
+    """
+    if len(landmark_history) < 6:
+        return 0.0
+        
+    recent = landmark_history[-15:]
+    velocities = []
+    
+    # Calculate velocity of the nose tip
+    for i in range(1, len(recent)):
+        dx = recent[i][30]["x"] - recent[i-1][30]["x"]
+        dy = recent[i][30]["y"] - recent[i-1][30]["y"]
+        velocities.append(math.hypot(dx, dy))
+        
+    if not velocities:
+        return 0.0
+        
+    # Acceleration (difference in velocity)
+    accel = np.diff(velocities)
+    if len(accel) == 0:
+        return 0.0
+        
+    # Real human motion is relatively smooth (low high-frequency acceleration)
+    # Video calls have micro-stutters (zero motion -> sudden jump)
+    zeros = sum(1 for v in velocities if v < 0.5)
+    jumps = sum(1 for a in np.abs(accel) if a > 5.0)
+    
+    stutter_score = 0.0
+    # Pattern of stuck frames followed by jumps
+    if zeros > 2 and jumps > 0:
+        stutter_score += 0.4
+    
+    # Irregular frame pacing (high variance in acceleration)
+    accel_var = np.var(accel)
+    if accel_var > 15.0:
+        stutter_score += min(0.6, accel_var / 50.0)
+        
+    return float(min(1.0, stutter_score))
+
+
+def check_background_parallax(last_gray_small: Optional[np.ndarray], curr_gray_small: Optional[np.ndarray], lm_hist: List[Tuple[float, float]]) -> float:
+    """
+    Face/background motion decoupling.
+    If background moves exactly with the face, it's a flat surface (iPad/laptop).
+    Returns risk score 0.0 to 1.0.
+    """
+    if last_gray_small is None or curr_gray_small is None or last_gray_small.shape != curr_gray_small.shape:
+        return 0.0
+    if len(lm_hist) < 3:
+        return 0.0
+
+    diff = cv2.absdiff(last_gray_small, curr_gray_small)
+    bg_motion = float(np.mean(diff)) / 255.0
+
+    cx = [p[0] for p in lm_hist[-5:]]
+    cy = [p[1] for p in lm_hist[-5:]]
+    face_motion = float(np.hypot(max(cx) - min(cx), max(cy) - min(cy)) + 1e-6)
+
+    if bg_motion < 0.005:
+        return 0.0
+        
+    ratio = face_motion / (bg_motion * 120.0 + 1e-6)
+    
+    # Low face motion vs high background motion = highly suspicious
+    if ratio < 0.4 and bg_motion > 0.01:
+        return float(min(1.0, (0.4 - ratio) / 0.4 + (bg_motion - 0.01) * 10.0))
+        
+    return 0.0

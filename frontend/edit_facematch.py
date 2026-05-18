@@ -26,7 +26,7 @@ old_gestures_block = """      const session_id = payload.session_id;
       if (!session_id || !Array.isArray(gestures) || gestures.length === 0) {"""
 new_gestures_block = """      const session_id = payload.session_id || crypto.randomUUID();
       // RANDOMIZE 4 GESTURES as per requirement
-      const allowed = ["blink_both", "turn_left", "turn_right", "move_closer", "smile"];
+      const allowed = ["turn_left", "turn_right", "move_closer", "smile"];
       const shuffled = allowed.sort(() => 0.5 - Math.random());
       const gestures = shuffled.slice(0, 4);
       if (!session_id || gestures.length !== 4) {"""

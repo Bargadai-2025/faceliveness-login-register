@@ -12,10 +12,12 @@ from typing import Dict, List, Optional, Any, Tuple
 # ── Full gesture pool (25 gestures) ──
 ALL_GESTURE_IDS = [
     "turn_left", "turn_right", "nod", "look_up", "smile",
-    "mouth_open", "blink_both", 
+    "mouth_open", 
+    # "blink_both", 
      "move_closer", "move_farther", "shake_head", "look_left_hold", "look_right_hold", "look_up_hold",
-    "look_down_hold", "head_forward", "head_backward",
-    "raise_eyebrows_hold",
+    "look_down_hold",
+    #  "head_forward", "head_backward",
+    # "raise_eyebrows_hold",
 ]
 
 LIGHT_CHALLENGES = ["white_flash", "blue_flash", "green_flash", "brightness_up", "brightness_down"]

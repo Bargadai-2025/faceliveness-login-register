@@ -17,11 +17,13 @@ from face_detection import (
     get_face_roi,
 )
 from liveness_checks import (
-    check_depth_displacement, check_micro_expressions,
-    check_light_response, evaluate_gesture, SUSTAINED_FRAMES,
+    analyze_true_3d_deformation, check_micro_expressions,
+    analyze_active_spectral_reflectance, evaluate_gesture, SUSTAINED_FRAMES,
     parallax_replay_risk,
     biological_motion_replay_risk,
     challenge_consistency_replay_risk,
+    check_temporal_stream_integrity,
+    check_background_parallax,
 )
 from spoof_scoring import (
     analyze_passive_spoof_single_frame,
@@ -205,6 +207,8 @@ def process_frame(session: LivenessSession, frame_bytes: bytes, identity_callbac
             "depth_parallax": parallax_replay_risk(session.landmark_history),
             "biological": biological_motion_replay_risk(session.landmark_history),
             "challenge": challenge_consistency_replay_risk(session),
+            "temporal_stream_integrity": check_temporal_stream_integrity(session.landmark_history),
+            "environment_authenticity": check_background_parallax(session.last_gray_small, curr_gray_small, session.landmark_centroid_history),
             "device_replay": 0.0,
         }
         yolo = _get_yolo()
@@ -393,7 +397,7 @@ def process_frame(session: LivenessSession, frame_bytes: bytes, identity_callbac
 
     # ── DEPTH ESTIMATION PHASE ──
     if session.step == "depth":
-        is_3d, depth_score = check_depth_displacement(session.landmark_history)
+        is_3d, depth_score = analyze_true_3d_deformation(session.landmark_history)
         session.depth_scores.append(depth_score)
 
         if len(session.depth_scores) >= 4:
@@ -449,7 +453,7 @@ def process_frame(session: LivenessSession, frame_bytes: bytes, identity_callbac
         else:
             session.light_post_frames.append(stats)
             if len(session.light_post_frames) >= 3:
-                passed, score = check_light_response(
+                passed, score = analyze_active_spectral_reflectance(
                     session.light_pre_frames, session.light_post_frames,
                     session.light_challenge_color
                 )

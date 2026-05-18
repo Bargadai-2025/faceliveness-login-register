@@ -462,3 +462,103 @@ def check_screen_edges(img: np.ndarray, face_bbox: Tuple[int, int, int, int]) ->
                 if x < (fx + fw/2) < (x + bw) and y < (fy + fh/2) < (y + bh):
                     return True
     return False
+
+def compute_rtc_compression_score(img_bgr: np.ndarray, face_bbox: Tuple[int, int, int, int]) -> float:
+    """Detect block ringing, YUV artifacts, and over-smoothed skin typical of video calls."""
+    if img_bgr is None: return 0.0
+    x, y, w, h_box = face_bbox
+    img_h, img_w = img_bgr.shape[:2]
+    # Extract forehead/cheek patch
+    px, py = max(0, x + int(w*0.2)), max(0, y + int(h_box*0.1))
+    pw, ph = min(img_w - px, int(w*0.6)), min(img_h - py, int(h_box*0.3))
+    if pw < 16 or ph < 16: return 0.0
+    
+    patch = img_bgr[py:py+ph, px:px+pw]
+    gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
+    
+    # DCT block boundary analysis (8x8 blocks)
+    h, w_p = gray.shape
+    if h < 8 or w_p < 8: return 0.0
+    
+    # Simple blockiness metric: horizontal/vertical gradients at 8-pixel boundaries
+    diff_v = np.abs(gray[:, 7:-1:8].astype(int) - gray[:, 8::8].astype(int))
+    diff_h = np.abs(gray[7:-1:8, :].astype(int) - gray[8::8, :].astype(int))
+    
+    # Mean boundary difference
+    boundary_diff = (np.mean(diff_v) + np.mean(diff_h)) / 2.0
+    
+    # Internal difference (non-boundaries)
+    int_diff_v = np.abs(gray[:, :-1].astype(int) - gray[:, 1:].astype(int))
+    int_diff_h = np.abs(gray[:-1, :].astype(int) - gray[1:, :].astype(int))
+    int_diff = (np.mean(int_diff_v) + np.mean(int_diff_h)) / 2.0
+    
+    # Blockiness ratio (high if boundaries have artificially high gradients vs internal)
+    if int_diff < 1.0: int_diff = 1.0
+    blockiness = boundary_diff / int_diff
+    
+    return float(min(1.0, max(0.0, (blockiness - 1.2) / 2.0)))
+
+def compute_sensor_authenticity(img_bgr: np.ndarray) -> float:
+    """Detect double sharpening halos and color space degradation (Camera filming a screen)."""
+    if img_bgr is None: return 0.0
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    # Edge gradient profile
+    laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+    variance = np.var(laplacian)
+    
+    # Oversharpening often creates very high extreme values in Laplacian compared to variance
+    max_val = np.max(np.abs(laplacian))
+    if variance < 1.0: return 0.0
+    
+    ratio = max_val / np.sqrt(variance)
+    # High ratio means isolated extreme spikes (halos)
+    return float(min(1.0, max(0.0, (ratio - 8.0) / 10.0)))
+
+def analyze_eye_reflections(img_bgr: np.ndarray, pts_68: List[Dict]) -> float:
+    """High-res pupil crop analysis for rectangular catchlights and emissive RGB glow."""
+    if img_bgr is None or not pts_68 or len(pts_68) < 48: return 0.0
+    
+    # Left eye center (points 36-41)
+    le_xs = [p["x"] for p in pts_68[36:42]]
+    le_ys = [p["y"] for p in pts_68[36:42]]
+    lx, ly = int(np.mean(le_xs)), int(np.mean(le_ys))
+    
+    # Right eye center (points 42-47)
+    re_xs = [p["x"] for p in pts_68[42:48]]
+    re_ys = [p["y"] for p in pts_68[42:48]]
+    rx, ry = int(np.mean(re_xs)), int(np.mean(re_ys))
+    
+    eye_dist = int(math.hypot(rx - lx, ry - ly))
+    patch_size = max(10, eye_dist // 4)
+    h, w = img_bgr.shape[:2]
+    
+    score = 0.0
+    for cx, cy in [(lx, ly), (rx, ry)]:
+        x1, y1 = max(0, cx - patch_size), max(0, cy - patch_size)
+        x2, y2 = min(w, cx + patch_size), min(h, cy + patch_size)
+        patch = img_bgr[y1:y2, x1:x2]
+        if patch.shape[0] < 5 or patch.shape[1] < 5: continue
+        
+        v_channel = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)[:, :, 2]
+        _, binary = cv2.threshold(v_channel, 230, 255, cv2.THRESH_BINARY)
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        for cnt in contours:
+            if cv2.contourArea(cnt) < 4: continue
+            bx, by, bw, bh = cv2.boundingRect(cnt)
+            aspect = bw / float(bh + 1e-6)
+            # Rectangular catchlights (phones/monitors) vs round (natural)
+            if aspect > 1.8 or aspect < 0.5:
+                score = max(score, 0.8)
+            # Extent (rectangularity)
+            rect_area = bw * bh
+            extent = cv2.contourArea(cnt) / float(rect_area + 1e-6)
+            if extent > 0.8: # Very rectangular
+                score = max(score, 0.9)
+    return float(score)
+
+def detect_display_refresh_rate(img_bgr: np.ndarray) -> float:
+    """Enhancement of scanlines to detect rolling shutter banding/PWM dimming."""
+    # Maps to the established scanline analysis but logically represents display refresh rate
+    return detect_scanline_artifacts(img_bgr)
+
