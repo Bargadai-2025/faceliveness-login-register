@@ -6,9 +6,9 @@ import numpy as np
 import cloudinary
 import cloudinary.uploader
 from tqdm import tqdm
-from facenet_pytorch import MTCNN, InceptionResnetV1
 from dotenv import load_dotenv
 from database import execute_sync, insert_face_sync
+from embedding_pipeline import create_face_models, extract_face_embedding
 
 load_dotenv()
 
@@ -67,8 +67,7 @@ if confirm.lower() != "y":
 # Model setup
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"🖥️ Using: {DEVICE}\n")
-mtcnn = MTCNN(image_size=160, margin=20)
-model = InceptionResnetV1(pretrained='vggface2').eval().to(DEVICE)
+mtcnn, model = create_face_models(DEVICE)
 
 total = 0
 
@@ -103,20 +102,11 @@ with torch.no_grad():
                     if img is None:
                         continue
 
-                    h, w = img.shape[:2]
-                    if max(h, w) > 800:
-                        scale = 800 / max(h, w)
-                        img = cv2.resize(img, (int(w * scale), int(h * scale)))
-
-                    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                    face = mtcnn(img_rgb)
-                    if face is None:
+                    out = extract_face_embedding(img, mtcnn, model, DEVICE, mp_fallback=False)
+                    if not out["ok"]:
                         print(f"  ❌ No face: {img_file}")
                         continue
-
-                    face = face.unsqueeze(0).to(DEVICE)
-                    emb = model(face).cpu().numpy()[0].astype("float32")
-                    emb = emb / np.linalg.norm(emb)
+                    emb = out["embedding"]
 
                     upload = cloudinary.uploader.upload(
                         img_path,
@@ -186,20 +176,11 @@ with torch.no_grad():
                     if img is None:
                         continue
 
-                    h, w = img.shape[:2]
-                    if max(h, w) > 800:
-                        scale = 800 / max(h, w)
-                        img = cv2.resize(img, (int(w * scale), int(h * scale)))
-
-                    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                    face = mtcnn(img_rgb)
-                    if face is None:
+                    out = extract_face_embedding(img, mtcnn, model, DEVICE, mp_fallback=False)
+                    if not out["ok"]:
                         print(f"  ❌ No face: {img_file}")
                         continue
-
-                    face = face.unsqueeze(0).to(DEVICE)
-                    emb = model(face).cpu().numpy()[0].astype("float32")
-                    emb = emb / np.linalg.norm(emb)
+                    emb = out["embedding"]
 
                     upload = cloudinary.uploader.upload(
                         img_path,

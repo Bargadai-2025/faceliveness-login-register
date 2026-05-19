@@ -29,7 +29,6 @@ import uuid
 import secrets
 from fastapi import FastAPI, File, UploadFile, Form, Body, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from facenet_pytorch import MTCNN, InceptionResnetV1
 import uvicorn
 from datetime import datetime, timedelta
 from typing import Optional, List, Tuple, Any, Dict
@@ -39,6 +38,13 @@ import cloudinary.uploader
 from liveness_session import session_manager, ALL_GESTURE_IDS, LIGHT_CHALLENGES
 from frame_processor import process_frame
 from face_detection import remove_background
+from embedding_pipeline import (
+    FACE_DETECT_MAX_SIDE,
+    create_face_models,
+    extract_face_embedding,
+    load_match_thresholds,
+)
+from post_selfie_security import load_post_selfie_config, run_post_selfie_security
 from spoof_scoring import analyze_passive_spoof_single_frame
 from liveness_checks import check_reaction_timing
 from database import (
@@ -84,8 +90,8 @@ SESSION_TTL_MINUTES = 15
 SESSION_ISSUE_MAX_ATTEMPTS = 50
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-mtcnn = MTCNN(image_size=160, margin=20, device=DEVICE)
-model = InceptionResnetV1(pretrained='vggface2').eval().to(DEVICE)
+mtcnn, model = create_face_models(DEVICE)
+MATCH_THRESHOLDS = load_match_thresholds()
 
 # Cloudinary Setup
 cloudinary.config(
@@ -94,12 +100,14 @@ cloudinary.config(
     api_secret=os.getenv("CLOUDINARY_API_SECRET")
 )
 
-MIN_CONFIDENCE_BARGAD = 0.65
-MIN_CONFIDENCE_LFW = 0.55
+MIN_CONFIDENCE_BARGAD = MATCH_THRESHOLDS["bargad"]
+MIN_CONFIDENCE_LFW = MATCH_THRESHOLDS["lfw"]
+MATCH_MIN_TOP2_MARGIN = MATCH_THRESHOLDS["top2_margin"]
 TOP_K = 50
 
-# Set FAST_MATCH=1 in .env for local/dev: skips YOLO + MediaPipe background removal on POST /match (much faster).
+# Local/dev only: skips remove_background on POST /match (YOLO + spoof always run).
 FAST_MATCH = os.getenv("FAST_MATCH", "").strip().lower() in ("1", "true", "yes")
+
 
 # ════════════════════════════════════════════════════════════
 # IDENTITY VERIFICATION CALLBACK
@@ -139,11 +147,60 @@ def verify_identity_callback(img_bgr, target_embedding):
 
 @app.on_event("startup")
 async def _startup():
+    from database import count_faces, get_database_dsn
+
     await init_db_pool()
     try:
         await ensure_indexes()
     except Exception as e:
         print(f"PostgreSQL index warning: {e}")
+
+    dsn = get_database_dsn()
+    host_hint = "configured"
+    if "@" in dsn:
+        host_hint = dsn.split("@", 1)[-1].split("/")[0].split("?")[0]
+    try:
+        counts = await count_faces()
+        face_rows = counts.get("with_512", 0)
+    except Exception:
+        face_rows = "unavailable"
+    pad = load_post_selfie_config()
+    print(
+        f"🧬 Match config: device={DEVICE}, detect_max_side={FACE_DETECT_MAX_SIDE}, "
+        f"FAST_MATCH={FAST_MATCH}, bargad>={MIN_CONFIDENCE_BARGAD}, lfw>={MIN_CONFIDENCE_LFW}, "
+        f"top2_margin>={MATCH_MIN_TOP2_MARGIN}, yolo_conf={pad['yolo_conf']}, "
+        f"hard_reject_spoof={pad['hard_reject_spoof']}, db_host={host_hint}, faces_512={face_rows}, "
+        f"torch={torch.__version__}"
+    )
+
+
+@app.get("/health/match-config")
+async def health_match_config():
+    """Runtime face-match settings (compare production vs local)."""
+    from database import count_faces, get_database_dsn
+
+    dsn = get_database_dsn()
+    host_hint = "local"
+    if "@" in dsn:
+        host_hint = dsn.split("@", 1)[-1].split("/")[0].split("?")[0]
+    try:
+        counts = await count_faces()
+    except Exception as e:
+        counts = {"error": str(e)}
+    return {
+        "device": DEVICE,
+        "torch_version": torch.__version__,
+        "model": "InceptionResnetV1_vggface2",
+        "embedding_dim": 512,
+        "face_detect_max_side": FACE_DETECT_MAX_SIDE,
+        "fast_match": FAST_MATCH,
+        "min_confidence_bargad": MIN_CONFIDENCE_BARGAD,
+        "min_confidence_lfw": MIN_CONFIDENCE_LFW,
+        "min_top2_margin": MATCH_MIN_TOP2_MARGIN,
+        "db_host": host_hint,
+        "face_counts": counts,
+        "post_selfie_security": load_post_selfie_config(),
+    }
 
 
 @app.on_event("shutdown")
@@ -430,171 +487,45 @@ async def match_face(
         if img_raw is None:
             return {"error": "Could not read image."}
 
-        # 3. DETECT FACE ON ORIGINAL IMAGE
-        # Resize for faster/more reliable detection if huge
-        h, w = img_raw.shape[:2]
-        img_detect = img_raw.copy()
-        if max(h, w) > 1024:
-            scale = 1024 / max(h, w)
-            img_detect = cv2.resize(img_raw, (int(w * scale), int(h * scale)))
-        
-        img_detect_rgb = cv2.cvtColor(img_detect, cv2.COLOR_BGR2RGB)
-        
-        face = None
-        face_landmarks_mp = None
+        # 3. DETECT FACE (canonical pipeline — same max_side as build_db indexing)
         try:
-            # Primary detection
-            face = mtcnn(img_detect_rgb)
-            
-            # Use MediaPipe for landmarks (needed for ROI-based liveness)
-            from face_detection import detect_faces
-            mp_faces = detect_faces(img_detect) # detect_faces expects BGR
-            if mp_faces:
-                orig_h, orig_w = img_raw.shape[:2]
-                det_h, det_w = img_detect.shape[:2]
-                scale_x = orig_w / det_w
-                scale_y = orig_h / det_h
-                
-                face_landmarks_mp = []
-                for p in mp_faces[0]["pts_68"]:
-                    face_landmarks_mp.append({
-                        "x": p["x"] * scale_x,
-                        "y": p["y"] * scale_y
-                    })
-                
-            if face is None:
-                # Fallback: MediaPipe detection
-                print("⚠️ MTCNN failed on original, trying MediaPipe fallback...")
-                if mp_faces:
-                    print("✅ MediaPipe found a face. Attempting guided MTCNN...")
-                    pts = mp_faces[0]["pts_68"]
-                    xs = [p["x"] for p in pts]
-                    ys = [p["y"] for p in pts]
-                    x1, y1, x2, y2 = min(xs), min(ys), max(xs), max(ys)
-                    # Expand bbox
-                    w_b, h_b = x2 - x1, y2 - y1
-                    x1 = max(0, int(x1 - w_b * 0.3))
-                    y1 = max(0, int(y1 - h_b * 0.3))
-                    x2 = min(img_detect.shape[1], int(x2 + w_b * 0.3))
-                    y2 = min(img_detect.shape[0], int(y2 + h_b * 0.3))
-                    
-                    crop_bgr = img_detect[y1:y2, x1:x2]
-                    crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
-                    face = mtcnn(crop_rgb)
-
+            face_out = extract_face_embedding(img_raw, mtcnn, model, DEVICE)
         except Exception as e:
             print(f"Face detection crash: {e}")
             return {"error": f"Face detection engine error: {str(e)}"}
 
-        if face is None:
-            return {"error": "No face detected in the uploaded image. Please ensure your face is clearly visible, well-lit, and facing the camera directly."}
-
-        # 4. HARD ANTI-SCREEN DETECTION (YOLO + face-device overlap + single-frame spoof)
-        # SECURITY: These scans ALWAYS run regardless of FAST_MATCH.
-        # FAST_MATCH only skips cosmetic operations (background removal), NEVER security scans.
-        device_replay_score = 0.0
-        from frame_processor import _get_yolo, _yolo_device_replay_risk, DEVICE_CLASSES
-        yolo = _get_yolo()
-        if yolo:
-            try:
-                # Calculate face bounding box from MediaPipe landmarks
-                face_bbox_match = (0, 0, img_raw.shape[1], img_raw.shape[0])  # fallback
-                if face_landmarks_mp:
-                    lm_xs = [p["x"] for p in face_landmarks_mp]
-                    lm_ys = [p["y"] for p in face_landmarks_mp]
-                    face_bbox_match = (
-                        int(min(lm_xs)), int(min(lm_ys)),
-                        int(max(lm_xs) - min(lm_xs)),
-                        int(max(lm_ys) - min(lm_ys)),
-                    )
-
-                h_raw, w_raw = img_raw.shape[:2]
-                # Use same face-device overlap analysis as the liveness flow
-                dr, device_hard = _yolo_device_replay_risk(img_raw, face_bbox_match, w_raw, h_raw, yolo)
-                device_replay_score = dr
-                print(f"🔒 YOLO device scan: risk={dr:.3f}, hard_overlap={device_hard}")
-
-                if device_hard:
-                    # HARD REJECT: device directly overlapping face
-                    print(f"🚨 HARD REJECT: Device overlapping face in selfie (IoU overlap, dr={dr:.3f})")
-                    return {
-                        "error": "Security Alert: Electronic device (phone/tablet/screen) detected overlapping your face. Please take a direct selfie without any screens in front of you.",
-                        "security_penalty_breakdown": [{
-                            "type": "Electronic Device Blocking Face",
-                            "penalty": 1.0,
-                            "count": 1,
-                            "detail": f"YOLO detected device with high face overlap (risk={dr:.2f})"
-                        }],
-                    }
-
-                if dr > 0.25:
-                    # Device visible near face but not fully overlapping
-                    print(f"⚠️ Device near face in selfie: risk={dr:.3f}")
-                    errcount += 40
-                    penalties_breakdown.append({
-                        "type": "Electronic Device Near Face",
-                        "penalty": 0.40,
-                        "count": 1,
-                        "detail": f"Device detected near face area (risk={dr:.2f})"
-                    })
-
-                # Also do the general YOLO scan for any devices in the full frame
-                yolo_results = yolo(img_raw, verbose=False, conf=0.30)
-                for r in yolo_results:
-                    for box in r.boxes:
-                        cls_name = r.names[int(box.cls[0])].lower()
-                        if cls_name in DEVICE_CLASSES:
-                            display_name = DEVICE_CLASSES[cls_name]
-                            print(f"🚨 YOLO Detect: {display_name} found in selfie frame!")
-                            if dr < 0.25:  # Only add if not already penalized above
-                                errcount += 30
-                                penalties_breakdown.append({
-                                    "type": "Electronic Device Detected",
-                                    "penalty": 0.30,
-                                    "count": 1,
-                                    "detail": f"YOLO detected: {display_name}"
-                                })
-            except Exception as e:
-                print(f"YOLO selfie check error: {e}")
-
-        # Run spoof analysis in SINGLE-FRAME MODE — ALWAYS runs (security critical)
-        # This lets imaging signals (moiré, texture, scanlines) detect screen replay
-        extra_signals_match = {"device_replay": device_replay_score} if device_replay_score > 0.01 else None
-        spoof_detail = analyze_passive_spoof_single_frame(
-            img_raw,
-            face_landmarks_mp,
-            strict=True,
-            roi_luminance_history=None,
-            last_gray_small=None,
-            curr_gray_small=None,
-            landmark_centroid_history=None,
-            extra_signals=extra_signals_match,
-            single_frame_mode=True,  # KEY: relaxed gate for selfie capture
-        )
-        live_ok = bool(spoof_detail["is_live"])
-        triggered_rules = spoof_detail.get("triggered_rules", [])
-        
-        # USER REQUEST: Explicitly block if ambient/reflected light from a screen is captured
-        if "reflection" in triggered_rules or "rectangular_glare" in triggered_rules or spoof_detail.get("confidence_per_signal", {}).get("reflection_raw", 0.0) > 0.45:
-            print("🚨 HARD REJECT: Ambient light / screen reflection detected.")
+        if not face_out["ok"]:
             return {
-                "error": "Ambient light / screen reflection detected. Please avoid capturing photos of screens or devices."
+                "error": "No face detected in the uploaded image. Please ensure your face is clearly visible, well-lit, and facing the camera directly."
             }
 
-        live_score = max(0.0, min(1.0, 1.0 - spoof_detail["total_spoof_score"] / 100.0))
-        live_reason = "OK" if live_ok else (
-            "Weighted spoof: " + ", ".join(triggered_rules)[:220]
+        emb = face_out["embedding"]
+        face_landmarks_mp = face_out["face_landmarks_mp"]
+
+        # 4. POST-SELFIE SECURITY (YOLO devices, ambient light, PAD spoof) — always runs
+        sec = run_post_selfie_security(
+            img_raw,
+            face_landmarks_mp,
+            errcount=errcount,
+            penalties_breakdown=penalties_breakdown,
         )
-        print(f"🔒 Spoof analysis: score={spoof_detail['total_spoof_score']:.1f}/{spoof_detail.get('reject_threshold', 68)}, live={live_ok}, rules={triggered_rules}")
-        if not live_ok:
-            print(f"🚨 Single-frame spoof FAILED: score={spoof_detail['total_spoof_score']}/{spoof_detail.get('reject_threshold', 68)}")
-            errcount += 35
-            penalties_breakdown.append({
-                "type": "Digital Media / Screen Detected",
-                "penalty": 0.35,
-                "count": 1,
-                "detail": f"Spoof score {spoof_detail['total_spoof_score']:.0f}/{spoof_detail.get('reject_threshold', 68):.0f} — " + live_reason[:400],
-            })
+        if sec.get("error"):
+            out = {"error": sec["error"]}
+            if sec.get("security_penalty_breakdown"):
+                out["security_penalty_breakdown"] = sec["security_penalty_breakdown"]
+            if sec.get("spoof_detail"):
+                sd = sec["spoof_detail"]
+                out["capture_live_ok"] = False
+                out["spoof_score"] = sd.get("total_spoof_score")
+                out["triggered_rules"] = sd.get("triggered_rules", [])
+            return out
+
+        errcount = sec["errcount"]
+        penalties_breakdown = sec["penalties_breakdown"]
+        spoof_detail = sec["spoof_detail"]
+        live_ok = sec["live_ok"]
+        live_reason = sec["live_reason"]
+        live_score = max(0.0, min(1.0, 1.0 - spoof_detail["total_spoof_score"] / 100.0))
 
         # 5. PREPARE PROCESSED IMAGE FOR UI (with background removal; FAST_MATCH uses a small RGB resize only)
         if FAST_MATCH:
@@ -612,14 +543,6 @@ async def match_face(
             if max(img_processed.shape[:2]) > 800:
                 scale = 800 / max(img_processed.shape[:2])
                 img_processed = cv2.resize(img_processed, (int(img_processed.shape[1] * scale), int(img_processed.shape[0] * scale)))
-
-        # 5. GENERATE EMBEDDING
-        face = face.unsqueeze(0).to(DEVICE)
-        with torch.no_grad():
-            emb = model(face).cpu().numpy()[0].astype("float32")
-        emb = emb / (np.linalg.norm(emb) + 1e-6)
-        if np.isnan(emb).any():
-            return {"error": "Face analysis yielded invalid results. Please check lighting and try again."}
 
         all_docs = await list_faces_for_matching()
         print(f"📦 Loaded {len(all_docs)} faces from PostgreSQL")
@@ -655,6 +578,20 @@ async def match_face(
         print("\n🔍 Top 5 raw matches:")
         for r in raw_results[:5]:
             print(f"  {r['label']} ({r['source']}) → {r['score']:.3f} [Type: {r.get('doc_type')}]")
+
+        match_diagnostics = {
+            "detect_max_side": FACE_DETECT_MAX_SIDE,
+            "fast_match": FAST_MATCH,
+            "top_raw_label": raw_results[0]["label"] if raw_results else None,
+            "top_raw_score": raw_results[0]["score"] if raw_results else None,
+            "second_raw_label": raw_results[1]["label"] if len(raw_results) > 1 else None,
+            "second_raw_score": raw_results[1]["score"] if len(raw_results) > 1 else None,
+            "top2_margin": (
+                round(float(raw_results[0]["score"]) - float(raw_results[1]["score"]), 4)
+                if len(raw_results) > 1
+                else None
+            ),
+        }
 
         print(f"\n🔍 Matching against {len(raw_results)} candidates...")
         seen = {}
@@ -698,6 +635,23 @@ async def match_face(
 
         results = list(seen.values())
         results.sort(key=lambda x: x["confidence"], reverse=True)
+
+        # Ambiguous top-2: reject when best and runner-up identities are too close in score
+        if len(raw_results) >= 2:
+            top_raw = raw_results[0]
+            second_raw = raw_results[1]
+            top_key = " ".join(str(top_raw["label"]).split()).lower()
+            second_key = " ".join(str(second_raw["label"]).split()).lower()
+            margin = match_diagnostics["top2_margin"]
+            if top_key != second_key and margin is not None and margin < MATCH_MIN_TOP2_MARGIN:
+                print(
+                    f"⚠️ Ambiguous match: {top_raw['label']}={top_raw['score']:.3f} vs "
+                    f"{second_raw['label']}={second_raw['score']:.3f} (margin {margin:.3f} < {MATCH_MIN_TOP2_MARGIN})"
+                )
+                return {
+                    "error": "Match ambiguous — multiple identities scored too closely. Please retake the selfie with even lighting and face centered.",
+                    "match_diagnostics": match_diagnostics,
+                }
 
         # Apply security penalty from errcount (each point reduces confidence by 1%)
         if errcount > 0 or True: # Always show breakdown if results exist
@@ -745,7 +699,10 @@ async def match_face(
             print(f"📍 Geo logged: {geo_lat}, {geo_long}")
 
         if not results:
-            return {"error": "No confident match found in the dataset."}
+            return {
+                "error": "No confident match found in the dataset.",
+                "match_diagnostics": match_diagnostics,
+            }
 
         # Identity Verification Check (Disabled as per user request to allow anyone to match)
         # if expected_label and results:
@@ -794,6 +751,7 @@ async def match_face(
             "final_replay_risk": spoof_detail["total_spoof_score"],
             "correlation_gate_notes": spoof_detail.get("correlation_gate_notes", []),
             "extra_signals_used": spoof_detail.get("extra_signals_used", {}),
+            "match_diagnostics": match_diagnostics,
         }
 
     except Exception as e:

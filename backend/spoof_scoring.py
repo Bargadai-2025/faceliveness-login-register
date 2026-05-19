@@ -512,6 +512,7 @@ def _apply_correlation_gate(
     reject_threshold: float,
     min_strong: int = 3,
     single_frame_mode: bool = False,
+    refl_label: str = "unknown",
 ) -> Tuple[float, List[str]]:
     """
     STRENGTHENED correlation gate: one suspicious signal should NEVER reject.
@@ -557,7 +558,11 @@ def _apply_correlation_gate(
         # Still suppress if ONLY glare/reflection/flicker triggered (those are unreliable alone)
         glare_only_triggers = {"reflection", "rectangular_glare", "flicker"}
         only_glare = bool(triggered) and all(t in glare_only_triggers for t in triggered)
-        if only_glare and adj >= reject_threshold - 8.0:
+        screen_refl_labels = {"phone_screen_reflection", "monitor_glare", "rectangular_source"}
+        if refl_label in screen_refl_labels:
+            adj += 18.0
+            reasons.append(f"single_frame_screen_reflection_boost ({refl_label})")
+        elif only_glare and adj >= reject_threshold - 8.0:
             adj = min(adj, reject_threshold - 6.0)
             reasons.append("single_frame_glare_only_suppressed")
 
@@ -658,7 +663,7 @@ def analyze_passive_spoof_single_frame(
     # but screen evidence fusion boost compensates for the lower individual weights.
     # Real selfie = 5-15 score, Phone screen = 50+ with fusion boost.
     if single_frame_mode:
-        reject_threshold = _f("SPOOF_SINGLE_FRAME_THRESHOLD", 50.0)
+        reject_threshold = _f("SPOOF_SINGLE_FRAME_THRESHOLD", 45.0)
     else:
         reject_threshold = th["match_total"] if strict else th["reject_total"]
 
@@ -667,6 +672,7 @@ def analyze_passive_spoof_single_frame(
         total, per_signal, extra_signals, triggered, reject_threshold,
         min_strong=min_strong,
         single_frame_mode=single_frame_mode,
+        refl_label=refl_label,
     )
 
     per_signal_clean = {k: round(float(v), 4) for k, v in per_signal.items() if not str(k).startswith("_")}
