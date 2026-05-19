@@ -1001,7 +1001,7 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
           <div className="fm-header">
             <div className="fm-logo">⬡</div>
             <div>
-              <h1>Face Match</h1>
+              <h1>Face Match and Liveness</h1>   
               <p>
                 Complete liveness flow, then capture or upload to find matches.
               </p>
@@ -1095,6 +1095,8 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
                 </button>
                 <button
                   className="fm-camera-btn"
+                  // className="fm-btn"
+                  // style={{backgroundColor: "#000", border: "1px solid var(--border)", color: "#fff", fontSize: "14px", fontWeight: "600", borderRadius: "16px", cursor: "pointer", transition: "var(--transition)"}}
                   onClick={showCamera ? stopCamera : startCamera}
                 >
                   {showCamera ? "✕ Cancel" : "Take Selfie Instead"}
