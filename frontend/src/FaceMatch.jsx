@@ -13,16 +13,30 @@ import { MapContainer, TileLayer, Marker } from "react-leaflet";
 import "leaflet/dist/leaflet.css";
 import L from "leaflet";
 import {
-  Target, Layers, Sun, Activity,
-  ArrowLeft, ArrowRight, ArrowUp, ArrowDown,
-  Smile, Eye, Maximize, UserCheck, AlertOctagon, Info,
-  Camera, MapPin, AlertTriangle,
-  Search
+  Target,
+  Layers,
+  Sun,
+  Activity,
+  ArrowLeft,
+  ArrowRight,
+  ArrowUp,
+  ArrowDown,
+  Smile,
+  Eye,
+  Maximize,
+  UserCheck,
+  AlertOctagon,
+  Info,
+  Camera,
+  MapPin,
+  AlertTriangle,
+  Search,
 } from "lucide-react";
 
 delete L.Icon.Default.prototype._getIconUrl;
 L.Icon.Default.mergeOptions({
-  iconRetinaUrl: "https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon-2x.png",
+  iconRetinaUrl:
+    "https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon-2x.png",
   iconUrl: "https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon.png",
   shadowUrl: "https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png",
 });
@@ -65,24 +79,80 @@ const CHALLENGE_UI = {
 
 // 68-pt landmark segment indices (MediaPipe → 68 mapping on server)
 const FACE_CONNECTIONS = [
-  [0, 1], [1, 2], [2, 3], [3, 4], [4, 5], [5, 6], [6, 7], [7, 8], [8, 9], [9, 10], [10, 11], [11, 12], [12, 13], [13, 14], [14, 15], [15, 16],
-  [17, 18], [18, 19], [19, 20], [20, 21],
-  [22, 23], [23, 24], [24, 25], [25, 26],
-  [27, 28], [28, 29], [29, 30],
-  [31, 32], [32, 33], [33, 34], [34, 35], [31, 35],
-  [36, 37], [37, 38], [38, 39], [39, 40], [40, 41], [41, 36],
-  [42, 43], [43, 44], [44, 45], [45, 46], [46, 47], [47, 42],
-  [48, 49], [49, 50], [50, 51], [51, 52], [52, 53], [53, 54], [54, 55], [55, 56], [56, 57], [57, 58], [58, 59], [59, 48],
-  [60, 61], [61, 62], [62, 63], [63, 64], [64, 65], [65, 66], [66, 67], [67, 60],
+  [0, 1],
+  [1, 2],
+  [2, 3],
+  [3, 4],
+  [4, 5],
+  [5, 6],
+  [6, 7],
+  [7, 8],
+  [8, 9],
+  [9, 10],
+  [10, 11],
+  [11, 12],
+  [12, 13],
+  [13, 14],
+  [14, 15],
+  [15, 16],
+  [17, 18],
+  [18, 19],
+  [19, 20],
+  [20, 21],
+  [22, 23],
+  [23, 24],
+  [24, 25],
+  [25, 26],
+  [27, 28],
+  [28, 29],
+  [29, 30],
+  [31, 32],
+  [32, 33],
+  [33, 34],
+  [34, 35],
+  [31, 35],
+  [36, 37],
+  [37, 38],
+  [38, 39],
+  [39, 40],
+  [40, 41],
+  [41, 36],
+  [42, 43],
+  [43, 44],
+  [44, 45],
+  [45, 46],
+  [46, 47],
+  [47, 42],
+  [48, 49],
+  [49, 50],
+  [50, 51],
+  [51, 52],
+  [52, 53],
+  [53, 54],
+  [54, 55],
+  [55, 56],
+  [56, 57],
+  [57, 58],
+  [58, 59],
+  [59, 48],
+  [60, 61],
+  [61, 62],
+  [62, 63],
+  [63, 64],
+  [64, 65],
+  [65, 66],
+  [66, 67],
+  [67, 60],
 ];
 
 let sessionDeviceId = null;
 function getOrCreateDeviceId() {
   if (!sessionDeviceId) {
     try {
-      const uuid = (typeof crypto !== 'undefined' && crypto.randomUUID)
-        ? crypto.randomUUID().slice(0, 8)
-        : Math.random().toString(36).substring(2, 10);
+      const uuid =
+        typeof crypto !== "undefined" && crypto.randomUUID
+          ? crypto.randomUUID().slice(0, 8)
+          : Math.random().toString(36).substring(2, 10);
       sessionDeviceId = `session_${uuid}`;
     } catch (e) {
       sessionDeviceId = `session_${Date.now()}`;
@@ -149,9 +219,9 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
 
   const addToast = useCallback((msg, type = "success") => {
     const id = Date.now();
-    setToasts(prev => [...prev, { id, msg, type }]);
+    setToasts((prev) => [...prev, { id, msg, type }]);
     setTimeout(() => {
-      setToasts(prev => prev.filter(t => t.id !== id));
+      setToasts((prev) => prev.filter((t) => t.id !== id));
     }, 3500);
   }, []);
 
@@ -171,7 +241,10 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
   // Click outside profile menu
   useEffect(() => {
     function handleClickOutside(event) {
-      if (profileMenuRef.current && !profileMenuRef.current.contains(event.target)) {
+      if (
+        profileMenuRef.current &&
+        !profileMenuRef.current.contains(event.target)
+      ) {
         setProfileMenuOpen(false);
       }
     }
@@ -184,7 +257,10 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
     let timer;
     if (showCamera && !livenessLive) {
       timer = setTimeout(() => {
-        addToast("Verification taking longer than usual. Please ensure you are a registered user.", "warning");
+        addToast(
+          "Verification taking longer than usual. Please ensure you are a registered user.",
+          "warning",
+        );
       }, 20000);
     }
     return () => clearTimeout(timer);
@@ -195,13 +271,14 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
     return new Promise((resolve) => {
       if (!navigator.geolocation) return resolve(null);
       navigator.geolocation.getCurrentPosition(
-        (pos) => resolve({
-          lat: pos.coords.latitude.toFixed(7),
-          long: pos.coords.longitude.toFixed(7),
-          timestamp: new Date().toISOString(),
-        }),
+        (pos) =>
+          resolve({
+            lat: pos.coords.latitude.toFixed(7),
+            long: pos.coords.longitude.toFixed(7),
+            timestamp: new Date().toISOString(),
+          }),
         () => resolve(null),
-        { enableHighAccuracy: true, maximumAge: 0, timeout: 12000 }
+        { enableHighAccuracy: true, maximumAge: 0, timeout: 12000 },
       );
     });
   }, []);
@@ -209,18 +286,28 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
   const reverseGeocode = useCallback(async (lat, long) => {
     try {
       const res = await fetch(
-        `https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=${lat}&longitude=${long}&localityLanguage=en`
+        `https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=${lat}&longitude=${long}&localityLanguage=en`,
       );
       const data = await res.json();
-      const parts = [data.locality, data.principalSubdivision, data.countryName].filter(Boolean);
+      const parts = [
+        data.locality,
+        data.principalSubdivision,
+        data.countryName,
+      ].filter(Boolean);
       return {
         city: data.locality || data.city || "",
         state: data.principalSubdivision || "",
         country: data.countryName || "",
-        full: data.localityInfo?.administrative?.map((a) => a.name).filter(Boolean).join(", ") || parts.join(", "),
+        full:
+          data.localityInfo?.administrative
+            ?.map((a) => a.name)
+            .filter(Boolean)
+            .join(", ") || parts.join(", "),
         short: parts.join(", "),
       };
-    } catch { return null; }
+    } catch {
+      return null;
+    }
   }, []);
 
   // Face mesh overlay — rAF (no React state per frame) + lighter drawing
@@ -300,18 +387,22 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
 
     const handlePlay = () => {
       if (frameIntervalRef.current) clearInterval(frameIntervalRef.current);
-      frameIntervalRef.current = setInterval(streamFrameToBackend, FRAME_INTERVAL_MS);
+      frameIntervalRef.current = setInterval(
+        streamFrameToBackend,
+        FRAME_INTERVAL_MS,
+      );
     };
 
     video.onloadedmetadata = () => {
-      video.play()
+      video
+        .play()
         .then(() => {
           console.log("Video playing successfully");
           handlePlay();
         })
-        .catch(e => {
+        .catch((e) => {
           console.error("Video play failed:", e);
-          // Fallback: try playing again on user interaction if needed, 
+          // Fallback: try playing again on user interaction if needed,
           // but 'muted' should handle most cases.
         });
     };
@@ -326,7 +417,10 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
     if (!data) return;
     // if (data.landmarks) setBackendLandmarks(data.landmarks);
     if (Array.isArray(data.landmarks) && data.landmarks.length >= 68) {
-      overlayLandmarksRef.current = data.landmarks.map((p) => ({ x: p.x, y: p.y }));
+      overlayLandmarksRef.current = data.landmarks.map((p) => ({
+        x: p.x,
+        y: p.y,
+      }));
     } else if (data.mesh === null) {
       overlayLandmarksRef.current = null;
     }
@@ -358,14 +452,8 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
     //   }
     // }
     if (data.step && data.step !== livenessStep) {
-
       // Skip unwanted phases visually
-      const hiddenSteps = [
-        "calibration",
-        "depth",
-        "light_challenge",
-        "micro"
-      ];
+      const hiddenSteps = ["calibration", "depth", "light_challenge", "micro"];
 
       // Auto jump frontend directly to gesture
       if (hiddenSteps.includes(data.step)) {
@@ -381,10 +469,10 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
         setToastVisible(true);
 
         if (prevStep !== "idle" && prevStep !== "camera") {
-          setCompletedSteps(prev => [...new Set([...prev, prevStep])]);
+          setCompletedSteps((prev) => [...new Set([...prev, prevStep])]);
 
           const STEP_MAP = {
-            gesture: "Liveness Verified"
+            gesture: "Liveness Verified",
           };
 
           if (STEP_MAP[prevStep]) addToast(STEP_MAP[prevStep]);
@@ -410,7 +498,13 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
     if (data.status === "verified" || data.step === "complete") {
       if (!livenessCompletedRef.current) {
         livenessCompletedRef.current = true;
-        setCompletedSteps(["calibration", "depth", "light_challenge", "micro", "gesture"]);
+        setCompletedSteps([
+          "calibration",
+          "depth",
+          "light_challenge",
+          "micro",
+          "gesture",
+        ]);
         addToast("Security Check Passed");
         await completeSession();
       }
@@ -418,7 +512,7 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
 
     if (data.status === "rejected" || data.status === "failed") {
       if (data.status === "rejected") {
-        setErrcount(prev => prev + 10);
+        setErrcount((prev) => prev + 10);
         addToast("Security Alert: Electronic device detected.", "error");
         // Silently log rejection without stopping camera or showing modal
         console.warn("Security rejection caught:", data.detail);
@@ -431,17 +525,25 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
       // Increment errcount for suspicious activity (e.g. digital screen, identity mismatch)
       if (data.is_suspicious) {
         // Increment by 10 per event/frame as requested
-        setErrcount(prev => prev + 10);
+        setErrcount((prev) => prev + 10);
 
         // Show small popup at top
         const now = Date.now();
         if (now - lastToastTimeRef.current > 2500) {
-          addToast("Security Warning: Potential device or non-live media detected.", "warning");
+          addToast(
+            "Security Warning: Potential device or non-live media detected.",
+            "warning",
+          );
           lastToastTimeRef.current = now;
         }
       }
 
-      if (d.includes("blocked") || d.includes("too close") || d.includes("too far") || d.includes("No face")) {
+      if (
+        d.includes("blocked") ||
+        d.includes("too close") ||
+        d.includes("too far") ||
+        d.includes("No face")
+      ) {
         setError(d);
       } else {
         setError(null);
@@ -450,7 +552,13 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
   }
 
   async function streamFrameToBackend() {
-    if (streamingRef.current || !videoRef.current || videoRef.current.readyState < 2 || !livenessSessionIdRef.current) return;
+    if (
+      streamingRef.current ||
+      !videoRef.current ||
+      videoRef.current.readyState < 2 ||
+      !livenessSessionIdRef.current
+    )
+      return;
     streamingRef.current = true;
     try {
       const video = videoRef.current;
@@ -458,32 +566,55 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
       c.width = PROCESS_W;
       c.height = PROCESS_H;
       const ctx2 = c.getContext("2d");
-      if (!ctx2) { streamingRef.current = false; return; }
+      if (!ctx2) {
+        streamingRef.current = false;
+        return;
+      }
       const vw = video.videoWidth;
       const vh = video.videoHeight;
-      const { sx, sy, sw, sh } = getCoverSourceRect(vw, vh, PROCESS_W, PROCESS_H);
+      const { sx, sy, sw, sh } = getCoverSourceRect(
+        vw,
+        vh,
+        PROCESS_W,
+        PROCESS_H,
+      );
       ctx2.drawImage(video, sx, sy, sw, sh, 0, 0, PROCESS_W, PROCESS_H);
       const blob = await new Promise((r) => c.toBlob(r, "image/jpeg", 0.9));
-      if (!blob) { streamingRef.current = false; return; }
+      if (!blob) {
+        streamingRef.current = false;
+        return;
+      }
       const fd = new FormData();
       fd.append("session_id", livenessSessionIdRef.current);
       fd.append("frame", blob, "frame.jpg");
-      const res = await fetch(`${API_URL}/liveness/frame`, { method: "POST", body: fd });
+      const res = await fetch(`${API_URL}/liveness/frame`, {
+        method: "POST",
+        body: fd,
+      });
       const data = await res.json();
       await handleBackendResponse(data);
-    } catch (e) { console.warn("Stream error:", e); }
+    } catch (e) {
+      console.warn("Stream error:", e);
+    }
     streamingRef.current = false;
   }
 
   async function completeSession() {
     try {
       const res = await fetch(`${API_URL}/liveness/session/complete`, {
-        method: "POST", headers: { "Content-Type": "application/json" },
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ session_id: livenessSessionIdRef.current }),
       });
       const data = await res.json();
-      if (res.ok && data.ok) { setCanMatch(true); setLivenessLive(true); setLivenessStep("capture"); }
-    } catch { setError("Verification failed"); }
+      if (res.ok && data.ok) {
+        setCanMatch(true);
+        setLivenessLive(true);
+        setLivenessStep("capture");
+      }
+    } catch {
+      setError("Verification failed");
+    }
   }
 
   async function startCamera() {
@@ -506,10 +637,11 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
       let sessData;
       try {
         const sessRes = await fetch(`${API_URL}/liveness/session/start`, {
-          method: "POST", headers: { "Content-Type": "application/json" },
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             device_id: getOrCreateDeviceId(),
-            agent_label: userAgentLabel
+            agent_label: userAgentLabel,
           }),
         });
         if (!sessRes.ok) {
@@ -529,8 +661,8 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
           video: {
             facingMode: { ideal: "user" },
             width: { ideal: 640 },
-            height: { ideal: 480 }
-          }
+            height: { ideal: 480 },
+          },
         };
         mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
       } catch (e) {
@@ -545,12 +677,15 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
       setShowCamera(true);
       setLivenessStep("camera");
       setChallengeMsg("Waiting for gesture...");
-    } catch (e) { setError(`Unexpected error: ${e.message}`); }
-    finally { setLivenessSessionLoading(false); }
+    } catch (e) {
+      setError(`Unexpected error: ${e.message}`);
+    } finally {
+      setLivenessSessionLoading(false);
+    }
   }
 
   function stopCamera() {
-    if (stream) stream.getTracks().forEach(t => t.stop());
+    if (stream) stream.getTracks().forEach((t) => t.stop());
     if (frameIntervalRef.current) {
       clearInterval(frameIntervalRef.current);
       frameIntervalRef.current = null;
@@ -586,26 +721,29 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
     canvas.height = video.videoHeight;
     canvas.getContext("2d").drawImage(video, 0, 0);
 
-    canvas.toBlob((blob) => {
-      if (!blob) {
-        console.error("Failed to create blob from canvas");
-        setError("Capture failed: Could not process image.");
-        return;
-      }
-      console.log("✅ Blob created, triggering match...");
-      const f = new File([blob], "selfie.jpg", { type: "image/jpeg" });
-      const currentSessionId = livenessSessionIdRef.current;
+    canvas.toBlob(
+      (blob) => {
+        if (!blob) {
+          console.error("Failed to create blob from canvas");
+          setError("Capture failed: Could not process image.");
+          return;
+        }
+        console.log("✅ Blob created, triggering match...");
+        const f = new File([blob], "selfie.jpg", { type: "image/jpeg" });
+        const currentSessionId = livenessSessionIdRef.current;
 
-      setFile(f);
-      setPreview(URL.createObjectURL(f));
+        setFile(f);
+        setPreview(URL.createObjectURL(f));
 
-      // 2. Stop camera and streaming immediately
-      stopCamera();
+        // 2. Stop camera and streaming immediately
+        stopCamera();
 
-      // 3. Trigger match with the saved session ID
-      handleMatch(f, currentSessionId);
-    }, "image/jpeg", 0.95);
-
+        // 3. Trigger match with the saved session ID
+        handleMatch(f, currentSessionId);
+      },
+      "image/jpeg",
+      0.95,
+    );
   };
 
   const handleMatch = async (fileOverride = null, sessionIdOverride = null) => {
@@ -615,10 +753,10 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
     console.log("🔍 Starting Match process", {
       hasFile: !!fileToUse,
       hasSession: !!sessionIdToUse,
-      canMatch
+      canMatch,
     });
 
-    // If we are overriding with a direct file from capture, we bypass the state-based canMatch 
+    // If we are overriding with a direct file from capture, we bypass the state-based canMatch
     // because liveness is already verified to reach the capture button.
     const isDirectCapture = !!fileOverride;
 
@@ -630,10 +768,13 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
     // Liveness is recommended but no longer strictly required for uploaded files in the UI
     // It remains mandatory for direct camera capture (which is handled by isDirectCapture being true)
     // Allow matching if session is technically complete, even if not perfectly 'verified'
-    const isSessionComplete = livenessStep === "complete" || livenessStep === "capture";
+    const isSessionComplete =
+      livenessStep === "complete" || livenessStep === "capture";
 
     if (!canMatch && isDirectCapture && !isSessionComplete) {
-      setError("Liveness verification failed. Please try the camera flow again.");
+      setError(
+        "Liveness verification failed. Please try the camera flow again.",
+      );
       return;
     }
 
@@ -653,14 +794,17 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
       console.warn("Geo capture failed or denied");
       setGeoError("⚠ Location unavailable.");
     } else {
-      reverseGeocode(geo.lat, geo.long).then(addr => {
+      reverseGeocode(geo.lat, geo.long).then((addr) => {
         console.log("🌍 Geo Address:", addr);
         setGeoAddress(addr);
       });
     }
 
     const matchAbort = new AbortController();
-    const matchTimeoutId = setTimeout(() => matchAbort.abort(), MATCH_REQUEST_TIMEOUT_MS);
+    const matchTimeoutId = setTimeout(
+      () => matchAbort.abort(),
+      MATCH_REQUEST_TIMEOUT_MS,
+    );
     const pInterval = startIndeterminateMatchProgress(setProgress);
 
     const fd = new FormData();
@@ -684,7 +828,11 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
     try {
       console.log(`📤 Sending match request to ${API_URL}/match ...`);
       console.log("Data: ", fd);
-      const res = await fetch(`${API_URL}/match`, { method: "POST", body: fd, signal: matchAbort.signal });
+      const res = await fetch(`${API_URL}/match`, {
+        method: "POST",
+        body: fd,
+        signal: matchAbort.signal,
+      });
       const data = await res.json();
       clearInterval(pInterval);
       clearTimeout(matchTimeoutId);
@@ -700,8 +848,13 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
         setPenaltyDetails(data.security_penalty_breakdown || []);
         if (data.capture_live_ok === false) {
           setCaptureLiveFailure({
-            reason: data.capture_live_reason || "Final capture did not pass live-face checks (screen, photo, or replay suspected).",
-            score: typeof data.capture_live_score === "number" ? data.capture_live_score : null,
+            reason:
+              data.capture_live_reason ||
+              "Final capture did not pass live-face checks (screen, photo, or replay suspected).",
+            score:
+              typeof data.capture_live_score === "number"
+                ? data.capture_live_score
+                : null,
           });
         } else {
           setCaptureLiveFailure(null);
@@ -739,7 +892,10 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
 
     try {
       console.log(`📤 Sending registration request to ${API_URL}/register ...`);
-      const res = await fetch(`${API_URL}/register`, { method: "POST", body: fd });
+      const res = await fetch(`${API_URL}/register`, {
+        method: "POST",
+        body: fd,
+      });
       const data = await res.json();
       if (data.error) {
         setError(data.error);
@@ -759,18 +915,25 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
 
   const handleReload = () => {
     window.location.reload();
-  }
+  };
 
   return (
     <div className="fm-page">
       {/* Toast Notification Pipeline */}
       <div className="fm-toast-pipeline">
-        {toasts.map(t => (
-          <div key={t.id} className={`fm-floating-toast ${t.type || "success"}`}>
+        {toasts.map((t) => (
+          <div
+            key={t.id}
+            className={`fm-floating-toast ${t.type || "success"}`}
+          >
             <div className="fm-toast-icon">
-              {t.type === "warning" ? <AlertTriangle size={18} color="#ffbf01" /> :
-                t.type === "error" ? <AlertOctagon size={18} color="#ff4444" /> :
-                  <UserCheck size={18} color="#24aa4d" />}
+              {t.type === "warning" ? (
+                <AlertTriangle size={18} color="#ffbf01" />
+              ) : t.type === "error" ? (
+                <AlertOctagon size={18} color="#ff4444" />
+              ) : (
+                <UserCheck size={18} color="#24aa4d" />
+              )}
             </div>
             <span>{t.msg}</span>
           </div>
@@ -782,11 +945,18 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
           <img src={bargadLogo} alt="Bargad" className="fm-header-logo" />
         </div>
         <div className="fm-header-profile" ref={profileMenuRef}>
-          <div className="fm-profile-avatar-wrap" onClick={() => setProfileMenuOpen(!profileMenuOpen)}>
+          <div
+            className="fm-profile-avatar-wrap"
+            onClick={() => setProfileMenuOpen(!profileMenuOpen)}
+          >
             {/* <div className="fm-profile-info">
               <span className="fm-profile-name">{userAgentLabel || "Agent"}</span>
             </div> */}
-            <svg className="fm-profile-avatar-svg" viewBox="0 0 24 24" fill="currentColor">
+            <svg
+              className="fm-profile-avatar-svg"
+              viewBox="0 0 24 24"
+              fill="currentColor"
+            >
               <path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v1c0 .55.45 1 1 1h14c.55 0 1-.45 1-1v-1c0-2.66-5.33-4-8-4z" />
             </svg>
           </div>
@@ -794,12 +964,24 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
           {profileMenuOpen && (
             <div className="fm-profile-dropdown">
               <div className="fm-dropdown-header">
-                <div className="fm-user-email">{userEmail || "Session active"}</div>
-                <div className="fm-user-label">{userAgentLabel || "Authorized Agent"}</div>
+                <div className="fm-user-email">
+                  {userEmail || "Session active"}
+                </div>
+                <div className="fm-user-label">
+                  {userAgentLabel || "Authorized Agent"}
+                </div>
               </div>
               <div className="fm-dropdown-divider" />
               <button className="fm-dropdown-item logout" onClick={onLogout}>
-                <svg className="fm-logout-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9" /></svg>
+                <svg
+                  className="fm-logout-icon"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                >
+                  <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9" />
+                </svg>
                 Log Out
               </button>
             </div>
@@ -808,34 +990,35 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
       </header>
 
       <div className={`fm-container ${showCamera ? "fm-container-wide" : ""}`}>
-
-        {
-          showCamera &&
+        {showCamera && (
           <div className="cancel-btn-top-liveness-steps">
-            <button className="fm-cancel-btn1" onClick={stopCamera}><ArrowLeft /> Cancel</button>
+            <button className="fm-cancel-btn1" onClick={stopCamera}>
+              <ArrowLeft /> Cancel
+            </button>
           </div>
-        }
-        {
-          !showCamera &&
+        )}
+        {!showCamera && (
           <div className="fm-header">
             <div className="fm-logo">⬡</div>
             <div>
               <h1>Face Match</h1>
-              <p>Complete liveness flow, then capture or upload to find matches.</p>
+              <p>
+                Complete liveness flow, then capture or upload to find matches.
+              </p>
             </div>
           </div>
-        }
-
+        )}
 
         <div className={showCamera ? "fm-upload-camera-row" : ""}>
-          {
-            !showCamera &&
-
+          {!showCamera && (
             <div className="fm-left-col">
               <div
                 className={`fm-dropzone ${preview ? "has-preview" : ""} ${dragging ? "dragging" : ""}`}
                 onClick={() => inputRef.current.click()}
-                onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
+                onDragOver={(e) => {
+                  e.preventDefault();
+                  setDragging(true);
+                }}
                 onDragLeave={() => setDragging(false)}
                 onDrop={(e) => {
                   e.preventDefault();
@@ -849,84 +1032,149 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
                   }
                 }}
               >
-                <input ref={inputRef} type="file" accept="image/*" hidden onChange={(e) => {
-                  const selectedFile = e.target.files[0];
-                  if (selectedFile) {
-                    setFile(selectedFile);
-                    setPreview(URL.createObjectURL(selectedFile));
-                    setError(null);
-                    setResults([]);
-                  }
-                }} />
-                {preview ? <img src={preview} alt="Preview" style={{ width: "100%", height: "100%", objectFit: "contain" }} /> : <div className="fm-drop-content"><p>Drag & drop or <span>click to upload</span></p></div>}
+                <input
+                  ref={inputRef}
+                  type="file"
+                  accept="image/*"
+                  hidden
+                  onChange={(e) => {
+                    const selectedFile = e.target.files[0];
+                    if (selectedFile) {
+                      setFile(selectedFile);
+                      setPreview(URL.createObjectURL(selectedFile));
+                      setError(null);
+                      setResults([]);
+                    }
+                  }}
+                />
+                {preview ? (
+                  <img
+                    src={preview}
+                    alt="Preview"
+                    style={{
+                      width: "100%",
+                      height: "100%",
+                      objectFit: "contain",
+                    }}
+                  />
+                ) : (
+                  <div className="fm-drop-content">
+                    <p>
+                      Drag & drop or <span>click to upload</span>
+                    </p>
+                  </div>
+                )}
                 {preview && !loading && (
-                  <button className="fm-clear-preview" onClick={(e) => {
-                    e.stopPropagation();
-                    setFile(null);
-                    setPreview(null);
-                    setResults([]);
-                    setError(null);
-                  }}>✕</button>
+                  <button
+                    className="fm-clear-preview"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setFile(null);
+                      setPreview(null);
+                      setResults([]);
+                      setError(null);
+                    }}
+                  >
+                    ✕
+                  </button>
                 )}
               </div>
               <div className="fm-btn-row">
-                <button className="fm-btn" onClick={() => handleMatch()} disabled={loading || results.length > 0} style={{ width: "100%" }}>
+                <button
+                  className="fm-btn"
+                  onClick={() => handleMatch()}
+                  disabled={loading || results.length > 0}
+                  style={{ width: "100%" }}
+                >
                   {loading ? <div className="fm-spinner" /> : null}
-                  {loading ? "Searching..." : results.length > 0 ? "Results Ready" : "Find Matches"}
+                  {loading
+                    ? "Searching..."
+                    : results.length > 0
+                      ? "Results Ready"
+                      : "Find Matches"}
                 </button>
-                <button className="fm-camera-btn" onClick={showCamera ? stopCamera : startCamera}>
+                <button
+                  className="fm-camera-btn"
+                  onClick={showCamera ? stopCamera : startCamera}
+                >
                   {showCamera ? "✕ Cancel" : "Take Selfie Instead"}
                 </button>
               </div>
             </div>
-          }
+          )}
 
           {showCamera && (
             <div className="fm-right-col">
               <div className="fm-camera-outer">
                 <div className="fm-camera-container">
                   <div className="fm-main-camera-contianer-relative">
-
-                    <video ref={videoRef} autoPlay playsInline muted className="fm-camera-feed" />
-                    <canvas ref={overlayCanvasRef} className="fm-mesh-overlay" />
+                    <video
+                      ref={videoRef}
+                      autoPlay
+                      playsInline
+                      muted
+                      className="fm-camera-feed"
+                    />
+                    <canvas
+                      ref={overlayCanvasRef}
+                      className="fm-mesh-overlay"
+                    />
                     <canvas ref={canvasRef} style={{ display: "none" }} />
                     <div className="fm-main-camera-contianer-absolute">
                       {showCamera && (
                         <div className="fm-liveness-overlay">
                           {/* Secure Scan State */}
-                          {["calibration", "depth", "light_challenge", "micro"].includes(livenessStep) && (
+                          {[
+                            "calibration",
+                            "depth",
+                            "light_challenge",
+                            "micro",
+                          ].includes(livenessStep) && (
                             <div className="fm-gesture-pill">
-                              <div className="fm-gesture-icon-wrap" style={{ background: '#24aa4d' }}>
+                              <div
+                                className="fm-gesture-icon-wrap"
+                                style={{ background: "#24aa4d" }}
+                              >
                                 <Activity size={18} />
                               </div>
-                              <span className="fm-gesture-text">Secure Scan...</span>
+                              <span className="fm-gesture-text">
+                                Secure Scan...
+                              </span>
                             </div>
                           )}
 
                           {/* Active Gesture Pill */}
-                          {livenessStep === "gesture" && sessionChallenges[challengeIndex] && (
-                            <div className="fm-gesture-pill-container">
-                              <div className="fm-gesture-pill">
-                                <div className="fm-gesture-icon-wrap">
-                                  {(() => {
-                                    const IconComp = CHALLENGE_UI[sessionChallenges[challengeIndex]]?.icon || Activity;
-                                    return <IconComp size={18} />;
-                                  })()}
+                          {livenessStep === "gesture" &&
+                            sessionChallenges[challengeIndex] && (
+                              <div className="fm-gesture-pill-container">
+                                <div className="fm-gesture-pill">
+                                  <div className="fm-gesture-icon-wrap">
+                                    {(() => {
+                                      const IconComp =
+                                        CHALLENGE_UI[
+                                          sessionChallenges[challengeIndex]
+                                        ]?.icon || Activity;
+                                      return <IconComp size={18} />;
+                                    })()}
+                                  </div>
+                                  <span className="fm-gesture-text">
+                                    {
+                                      CHALLENGE_UI[
+                                        sessionChallenges[challengeIndex]
+                                      ]?.label
+                                    }
+                                  </span>
                                 </div>
-                                <span className="fm-gesture-text">
-                                  {CHALLENGE_UI[sessionChallenges[challengeIndex]]?.label}
-                                </span>
+                                <div className="fm-gesture-dots">
+                                  {sessionChallenges.map((_, idx) => (
+                                    <div
+                                      key={idx}
+                                      className={`fm-gesture-dot ${idx === challengeIndex ? "active" : ""} ${idx < challengeIndex ? "completed" : ""}`}
+                                    />
+                                  ))}
+                                </div>
                               </div>
-                              <div className="fm-gesture-dots">
-                                {sessionChallenges.map((_, idx) => (
-                                  <div
-                                    key={idx}
-                                    className={`fm-gesture-dot ${idx === challengeIndex ? 'active' : ''} ${idx < challengeIndex ? 'completed' : ''}`}
-                                  />
-                                ))}
-                              </div>
-                            </div>
-                          )}
+                            )}
 
                           {/* Verification Complete Card */}
                           {/* {
@@ -964,46 +1212,71 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
                   {/* Animated Scanline */}
                   <div className="fm-scanline"></div>
 
-                  {error && <div className="fm-camera-error-overlay">{error}</div>}
+                  {error && (
+                    <div className="fm-camera-error-overlay">{error}</div>
+                  )}
 
                   {/* Multi-person Toast Alert */}
                   {multiPersonError && (
                     <div className="fm-multi-person-toast">
                       <AlertOctagon size={18} />
-                      <span>Multiple people detected — only one person allowed</span>
+                      <span>
+                        Multiple people detected — only one person allowed
+                      </span>
                     </div>
                   )}
 
                   <div className="fm-camera-actions">
-                    {(livenessLive || livenessStep === "complete" || livenessStep === "capture") && !multiPersonError && (
-                      <button className="fm-capture-btn" onClick={takeSelfie}>
-                        <Camera size={18} /> Capture Selfie
-                      </button>
-                    )}
+                    {(livenessLive ||
+                      livenessStep === "complete" ||
+                      livenessStep === "capture") &&
+                      !multiPersonError && (
+                        <button className="fm-capture-btn" onClick={takeSelfie}>
+                          <Camera size={18} /> Capture Selfie
+                        </button>
+                      )}
                   </div>
                 </div>
               </div>
-
             </div>
           )}
-
-
-
         </div>
 
         {/* Geo card */}
         {geoData && (
           <div className="fm-geo-card">
             <div className="fm-geo-map">
-              <MapContainer center={[parseFloat(geoData.lat), parseFloat(geoData.long)]} zoom={16} style={{ width: "120px", height: "110px" }} zoomControl={false} dragging={false} scrollWheelZoom={false} doubleClickZoom={false} attributionControl={false}>
-                <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" /><Marker position={[parseFloat(geoData.lat), parseFloat(geoData.long)]} />
+              <MapContainer
+                center={[parseFloat(geoData.lat), parseFloat(geoData.long)]}
+                zoom={16}
+                style={{ width: "120px", height: "110px" }}
+                zoomControl={false}
+                dragging={false}
+                scrollWheelZoom={false}
+                doubleClickZoom={false}
+                attributionControl={false}
+              >
+                <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
+                <Marker
+                  position={[parseFloat(geoData.lat), parseFloat(geoData.long)]}
+                />
               </MapContainer>
             </div>
             <div className="fm-geo-details">
-              <div className="fm-geo-city"><MapPin size={12} style={{ marginRight: 4 }} /> {geoAddress ? geoAddress.short : "Fetching..."} 🇮🇳</div>
-              {geoAddress && geoAddress.full && <div className="fm-geo-full-address">{geoAddress.full}</div>}
-              <div className="fm-geo-coords">Lat {parseFloat(geoData.lat).toFixed(6)}° &nbsp; Long {parseFloat(geoData.long).toFixed(6)}°</div>
-              <div className="fm-geo-time">{new Date(geoData.timestamp).toLocaleString()}</div>
+              <div className="fm-geo-city">
+                <MapPin size={12} style={{ marginRight: 4 }} />{" "}
+                {geoAddress ? geoAddress.short : "Fetching..."} 🇮🇳
+              </div>
+              {geoAddress && geoAddress.full && (
+                <div className="fm-geo-full-address">{geoAddress.full}</div>
+              )}
+              <div className="fm-geo-coords">
+                Lat {parseFloat(geoData.lat).toFixed(6)}° &nbsp; Long{" "}
+                {parseFloat(geoData.long).toFixed(6)}°
+              </div>
+              <div className="fm-geo-time">
+                {new Date(geoData.timestamp).toLocaleString()}
+              </div>
             </div>
           </div>
         )}
@@ -1011,7 +1284,10 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
 
         {loading && (
           <div className="fm-progress-wrapper">
-            <div className="fm-progress-bar" style={{ width: `${progress}%` }} />
+            <div
+              className="fm-progress-bar"
+              style={{ width: `${progress}%` }}
+            />
             <span>Searching Faces... {Math.round(progress)}%</span>
           </div>
         )}
@@ -1020,23 +1296,37 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
           <div className="fm-scan-wrapper">
             <img src={preview} alt="Scanning" className="fm-scan-img" />
             <div className="fm-scan-line" />
-            <div className="fm-scan-corners"><span className="corner tl" /><span className="corner tr" /><span className="corner bl" /><span className="corner br" /></div>
+            <div className="fm-scan-corners">
+              <span className="corner tl" />
+              <span className="corner tr" />
+              <span className="corner bl" />
+              <span className="corner br" />
+            </div>
             <div className="fm-scan-label">Analyzing Face...</div>
           </div>
         )}
 
-        {error && <div className="fm-error"><AlertTriangle size={16} style={{ marginRight: 8 }} /> {error}</div>}
+        {error && (
+          <div className="fm-error">
+            <AlertTriangle size={16} style={{ marginRight: 8 }} /> {error}
+          </div>
+        )}
 
         {results.length > 0 && !loading ? (
-          !captureLiveFailure && (results[0].confidence * 100).toFixed(0) >= 80 ? (
+          !captureLiveFailure &&
+          (results[0].confidence * 100).toFixed(0) >= 80 ? (
             <div>
               <div className="fm-verification-summary-bar">
                 <div className="fm-verified-badge">
                   <UserCheck size={18} />
-                  <span>Identity Verified (Doc: {results[0]?.registered_doc_type || "Aadhar"})</span>
+                  <span>
+                    Identity Verified (Doc:{" "}
+                    {results[0]?.registered_doc_type || "Aadhar"})
+                  </span>
                 </div>
                 <div className="fm-match-indicator">
-                  Top Match: <strong>{(results[0].confidence * 100).toFixed(0)}%</strong>
+                  Top Match:{" "}
+                  <strong>{(results[0].confidence * 100).toFixed(0)}%</strong>
                 </div>
               </div>
 
@@ -1052,7 +1342,7 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
                 <div className="fm-results-container">
                   <div className="fm-grid">
                     {results
-                      .filter(match => match.label !== "txt")
+                      .filter((match) => match.label !== "txt")
                       .slice(0, showAllResults ? undefined : 1)
                       .map((match, i) => (
                         <div className="fm-card result-card" key={i}>
@@ -1060,7 +1350,13 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
                           <div className="image-compare">
                             <div className="image-box">
                               <p>Matched (DB)</p>
-                              <img src={match.matched_image || (match.images && match.images[0])} alt="DB" />
+                              <img
+                                src={
+                                  match.matched_image ||
+                                  (match.images && match.images[0])
+                                }
+                                alt="DB"
+                              />
                             </div>
                             <div className="image-box">
                               <p>Captured (Live)</p>
@@ -1069,20 +1365,33 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
                           </div>
                           <div className="fm-card-body result-info">
                             <div className="fm-name-row">
-                              <h2 className="fm-match-title">{Math.round(match.confidence * 100)}% Match</h2>
+                              <h2 className="fm-match-title">
+                                {Math.round(match.confidence * 100)}% Match
+                              </h2>
                               <span className="doc-badge">
-                                VERIFIED (Doc: {match.registered_doc_type || "Aadhar"})
+                                VERIFIED (Doc:{" "}
+                                {match.registered_doc_type || "Aadhar"})
                               </span>
                             </div>
-                            <p className="fm-label-name">{(match.label || "Unknown").replace(/_/g, " ")}</p>
+                            <p className="fm-label-name">
+                              {(match.label || "Unknown").replace(/_/g, " ")}
+                            </p>
                             <div className="fm-bar-bg">
                               <div
                                 className="fm-bar-fill"
-                                style={{ width: `${match.confidence * 100}%`, background: getColor(match.confidence) }}
+                                style={{
+                                  width: `${match.confidence * 100}%`,
+                                  background: getColor(match.confidence),
+                                }}
                               />
                             </div>
                             <div className="fm-score-row">
-                              <span className="fm-badge" style={{ background: getColor(match.confidence) }}>
+                              <span
+                                className="fm-badge"
+                                style={{
+                                  background: getColor(match.confidence),
+                                }}
+                              >
                                 {getLabel(match.confidence)}
                               </span>
                             </div>
@@ -1091,17 +1400,23 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
                       ))}
                   </div>
 
-                  {results.filter(m => m.label !== "txt").length > 1 && !showAllResults && (
-                    <div className="fm-load-more-container">
-                      <button className="fm-load-more-btn" onClick={() => setShowAllResults(true)}>
-                        Load More Matches
-                      </button>
-                    </div>
-                  )}
+                  {results.filter((m) => m.label !== "txt").length > 1 &&
+                    !showAllResults && (
+                      <div className="fm-load-more-container">
+                        <button
+                          className="fm-load-more-btn"
+                          onClick={() => setShowAllResults(true)}
+                        >
+                          Load More Matches
+                        </button>
+                      </div>
+                    )}
 
                   {penaltyDetails.length > 0 && (
                     <div className="fm-penalty-container">
-                      <h3 className="fm-penalty-title">Security Penalty Breakdown</h3>
+                      <h3 className="fm-penalty-title">
+                        Security Penalty Breakdown
+                      </h3>
                       <table className="fm-penalty-table">
                         <thead>
                           <tr>
@@ -1115,7 +1430,9 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
                             <tr key={i}>
                               <td>{p.type}</td>
                               <td>{p.count}x</td>
-                              <td className="fm-penalty-red">-{Math.round(p.penalty * 100)}%</td>
+                              <td className="fm-penalty-red">
+                                -{Math.round(p.penalty * 100)}%
+                              </td>
                             </tr>
                           ))}
                         </tbody>
@@ -1131,22 +1448,28 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
                 <AlertTriangle size={16} style={{ marginRight: 8 }} />
                 {captureLiveFailure ? (
                   <>
-                    Security Check Failed: Final capture failed live-face verification
-                    {captureLiveFailure.score != null ? ` (PAD score ${captureLiveFailure.score})` : ""}.{" "}
-                    {captureLiveFailure.reason}
-                    {" "}Do not point the camera at a screen or printed photo; use your face directly, well lit.
+                    Security Check Failed: Final capture failed live-face
+                    verification
+                    {captureLiveFailure.score != null
+                      ? ` (PAD score ${captureLiveFailure.score})`
+                      : ""}
+                    . {captureLiveFailure.reason} Do not point the camera at a
+                    screen or printed photo; use your face directly, well lit.
                   </>
                 ) : (
                   <>
-                    Security Check Failed: Match confidence too low ({(results[0].confidence * 100).toFixed(0)}%).
-                    Please ensure you are the registered agent and not using a digital screen.
+                    Security Check Failed: Match confidence too low (
+                    {(results[0].confidence * 100).toFixed(0)}%). Please ensure
+                    you are the registered agent and not using a digital screen.
                   </>
                 )}
               </div>
 
               {penaltyDetails.length > 0 && (
                 <div className="fm-penalty-container">
-                  <h3 className="fm-penalty-title">Security Penalty Breakdown</h3>
+                  <h3 className="fm-penalty-title">
+                    Security Penalty Breakdown
+                  </h3>
                   <table className="fm-penalty-table">
                     <thead>
                       <tr>
@@ -1160,7 +1483,9 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
                         <tr key={i}>
                           <td>{p.type}</td>
                           <td>{p.count}x</td>
-                          <td className="fm-penalty-red">-{Math.round(p.penalty * 100)}%</td>
+                          <td className="fm-penalty-red">
+                            -{Math.round(p.penalty * 100)}%
+                          </td>
                         </tr>
                       ))}
                     </tbody>
@@ -1168,7 +1493,10 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
                 </div>
               )}
               <div className="fm-penalty-retry">
-                <p>Verification failed due to high security risk or low similarity. Please try again in a well-lit environment.</p>
+                <p>
+                  Verification failed due to high security risk or low
+                  similarity. Please try again in a well-lit environment.
+                </p>
                 <button className="fm-btn retry-btn" onClick={handleReload}>
                   <Camera size={18} /> Retry Verification
                 </button>
@@ -1179,7 +1507,9 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
 
         {/* Rejection Modal Removed as per user request to show inline table instead */}
       </div>
-      <div className="fm-footer-branding"><img src={bargadBranding} alt="Bargad" /></div>
+      <div className="fm-footer-branding">
+        <img src={bargadBranding} alt="Bargad" />
+      </div>
     </div>
   );
 }

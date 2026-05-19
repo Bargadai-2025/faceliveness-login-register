@@ -659,6 +659,7 @@ body {
   left: 0;
   width: 100%;
   height: 100%;
+  object-fit: cover;
   pointer-events: none;
   z-index: 5;
   transform: scaleX(-1);
@@ -2587,7 +2588,7 @@ body {
     bottom: 10px !important;
     transform: translateX(-50%) scale(0.9);
   }
-  .cancel-btn-top-liveness-steps {
+  .cancel-btn-top-livenes s-steps {
     top: 85px !important;
     left: 10px !important;
   }
