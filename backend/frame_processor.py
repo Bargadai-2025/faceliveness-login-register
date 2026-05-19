@@ -72,7 +72,7 @@ def _yolo_device_replay_risk(
     max_risk = 0.0
     hard_overlap = False
     try:
-        yolo_results = yolo(img, verbose=False, conf=0.48)
+        yolo_results = yolo(img, verbose=False, conf=0.35)
         for r in yolo_results:
             for box in r.boxes:
                 cls_name = r.names[int(box.cls[0])].lower()
@@ -88,7 +88,7 @@ def _yolo_device_replay_risk(
                 iou_face = inter_area / face_area
                 obj_w, obj_h = float(box.xywh[0][2]), float(box.xywh[0][3])
                 area_pct = (obj_w * obj_h) / (w * h + 1e-6)
-                if iou_face > 0.48:
+                if iou_face > 0.35:
                     hard_overlap = True
                 part = min(1.0, iou_face * 2.1 + min(0.35, area_pct * 2.8))
                 max_risk = max(max_risk, part)
