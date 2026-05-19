@@ -302,10 +302,16 @@ def compute_passive_liveness(img_bgr: np.ndarray, pts_68: Optional[List[Dict]] =
     rep = analyze_passive_spoof_single_frame(img_bgr, pts_68, strict=strict)
     health = max(0.0, min(1.0, 1.0 - rep["total_spoof_score"] / 100.0))
     is_live = bool(rep["is_live"])
+    
+    # USER REQUEST: Hard block ambient light / screen reflection
+    triggered_rules = rep.get("triggered_rules", [])
+    if "reflection" in triggered_rules or "rectangular_glare" in triggered_rules or rep.get("confidence_per_signal", {}).get("reflection_raw", 0.0) > 0.45:
+        return False, 0.0, "Ambient light / screen reflection detected. Please avoid capturing screens."
+        
     if is_live:
         reason = "OK"
     else:
-        rules = ", ".join(rep.get("triggered_rules") or [])[:200]
+        rules = ", ".join(triggered_rules)[:200]
         reason = f"Spoof score {rep['total_spoof_score']:.0f}/{rep.get('reject_threshold', 70):.0f}"
         if rules:
             reason += f" ({rules})"

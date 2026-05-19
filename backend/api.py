@@ -572,11 +572,20 @@ async def match_face(
             single_frame_mode=True,  # KEY: relaxed gate for selfie capture
         )
         live_ok = bool(spoof_detail["is_live"])
+        triggered_rules = spoof_detail.get("triggered_rules", [])
+        
+        # USER REQUEST: Explicitly block if ambient/reflected light from a screen is captured
+        if "reflection" in triggered_rules or "rectangular_glare" in triggered_rules or spoof_detail.get("confidence_per_signal", {}).get("reflection_raw", 0.0) > 0.45:
+            print("🚨 HARD REJECT: Ambient light / screen reflection detected.")
+            return {
+                "error": "Ambient light / screen reflection detected. Please avoid capturing photos of screens or devices."
+            }
+
         live_score = max(0.0, min(1.0, 1.0 - spoof_detail["total_spoof_score"] / 100.0))
         live_reason = "OK" if live_ok else (
-            "Weighted spoof: " + ", ".join(spoof_detail.get("triggered_rules") or [])[:220]
+            "Weighted spoof: " + ", ".join(triggered_rules)[:220]
         )
-        print(f"🔒 Spoof analysis: score={spoof_detail['total_spoof_score']:.1f}/{spoof_detail.get('reject_threshold', 68)}, live={live_ok}, rules={spoof_detail.get('triggered_rules', [])}")
+        print(f"🔒 Spoof analysis: score={spoof_detail['total_spoof_score']:.1f}/{spoof_detail.get('reject_threshold', 68)}, live={live_ok}, rules={triggered_rules}")
         if not live_ok:
             print(f"🚨 Single-frame spoof FAILED: score={spoof_detail['total_spoof_score']}/{spoof_detail.get('reject_threshold', 68)}")
             errcount += 35
