@@ -513,11 +513,14 @@ export default function FaceRegister({ userEmail, userAgentLabel, onLogout }) {
     // because liveness is already verified to reach the capture button.
     const isDirectCapture = !!fileOverride;
 
-    if (!fileToUse || (!canMatch && !isDirectCapture)) {
-      if (fileToUse && !canMatch) {
-        setError("Complete liveness flow first");
-        console.warn("Match blocked: canMatch is false");
-      }
+    if (!fileToUse) {
+      setError("Please capture a photo first");
+      return;
+    }
+
+    if (!canMatch) {
+      setError("Complete liveness flow first");
+      console.warn("Match blocked: canMatch is false");
       return;
     }
 

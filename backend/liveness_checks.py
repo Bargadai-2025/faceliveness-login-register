@@ -13,7 +13,7 @@ from face_detection import (
     compute_brightness_histogram,
 )
 
-SUSTAINED_FRAMES = 1
+SUSTAINED_FRAMES = 4
 HOLD_DURATION_SEC = 0.5
 
 

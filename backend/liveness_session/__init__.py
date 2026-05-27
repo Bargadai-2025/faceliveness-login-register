@@ -1,6 +1,7 @@
 """
 Liveness Session Manager — in-memory session state for backend-driven liveness.
 """
+import os
 import uuid
 import time
 import secrets
@@ -23,10 +24,10 @@ ALL_GESTURE_IDS = [
 LIGHT_CHALLENGES = ["white_flash", "blue_flash", "green_flash", "brightness_up", "brightness_down"]
 
 SESSION_TTL = 300  # 5 minutes max
-CALIBRATION_FRAMES = 5
+CALIBRATION_FRAMES = int(os.getenv("LIVENESS_CALIBRATION_FRAMES", "3"))
 GESTURE_COUNT_MIN = 3
 GESTURE_COUNT_MAX = 3
-GESTURE_COOLDOWN = 2.5  # Seconds to wait between gestures (Faster flow)
+GESTURE_COOLDOWN = float(os.getenv("LIVENESS_GESTURE_COOLDOWN_SEC", "1.5"))
 
 
 @dataclass

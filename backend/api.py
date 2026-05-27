@@ -15,6 +15,7 @@ for _venv_base in (os.path.join(_backend_dir, "venv"), os.path.join(_repo_root, 
         if os.path.isdir(venv_path) and venv_path not in sys.path:
             sys.path.insert(0, venv_path)
 
+import asyncio
 from dotenv import load_dotenv
 
 # Repo-root .env (typical) then backend/.env overrides.
@@ -36,7 +37,7 @@ import cloudinary
 import cloudinary.uploader
 
 from liveness_session import session_manager, ALL_GESTURE_IDS, LIGHT_CHALLENGES
-from frame_processor import process_frame
+from frame_processor import process_frame, warmup_yolo
 from face_detection import remove_background
 from embedding_pipeline import (
     FACE_DETECT_MAX_SIDE,
@@ -172,6 +173,7 @@ async def _startup():
         f"hard_reject_spoof={pad['hard_reject_spoof']}, db_host={host_hint}, faces_512={face_rows}, "
         f"torch={torch.__version__}"
     )
+    asyncio.create_task(asyncio.to_thread(warmup_yolo))
 
 
 @app.get("/health/match-config")
@@ -270,6 +272,8 @@ async def start_liveness_session(payload: Dict[str, Any] = Body(...)):
         except Exception as db_err:
             print(f"⚠️ PostgreSQL liveness log warning: {db_err}")
 
+        asyncio.create_task(asyncio.to_thread(warmup_yolo))
+
         return {
             "session_id": sess.session_id,
             "gestures": sess.gestures,
@@ -295,7 +299,9 @@ async def liveness_frame(
     if len(raw) == 0:
         raise HTTPException(status_code=400, detail="Empty frame")
 
-    result = process_frame(sess, raw, identity_callback=verify_identity_callback)
+    result = await asyncio.to_thread(
+        process_frame, sess, raw, verify_identity_callback
+    )
     return result
 
 
@@ -455,6 +461,7 @@ async def match_face(
     device_id: Optional[str] = Form(None),
     errcount: Optional[int] = Form(0),
     expected_label: Optional[str] = Form(None),
+    liveness_ref_photo: Optional[str] = Form(None),
 ):
     print("errcount : ", errcount)
     penalties_breakdown = []
@@ -463,24 +470,24 @@ async def match_face(
         f.write(await file.read())
 
     try:
-        # Optional liveness verification
-        if liveness_session_id and device_id:
-            now = datetime.utcnow()
-            # Check in-memory session first (backend-driven)
-            mem_sess = session_manager.get(liveness_session_id)
-            if mem_sess and mem_sess.step == "verified":
-                pass  # Backend-driven session verified
-            else:
-                # Fallback to PostgreSQL (legacy or already-completed)
-                sess = await get_valid_completed_liveness_session(
-                    session_id=liveness_session_id,
-                    device_id=device_id,
-                    now=now,
-                )
-                if not sess:
-                    return {"error": "Invalid or expired liveness session. Please start the camera flow again."}
+        # Strict liveness verification
+        if not liveness_session_id or not device_id:
+            return {"error": "Liveness session is strictly required. Please start the camera flow again."}
+
+        now = datetime.utcnow()
+        # Check in-memory session first (backend-driven)
+        mem_sess = session_manager.get(liveness_session_id)
+        if mem_sess and mem_sess.step == "complete":
+            pass  # Backend-driven session verified
         else:
-            print("⚠️ Match requested without liveness session (optional mode)")
+            # Fallback to PostgreSQL (legacy or already-completed)
+            sess = await get_valid_completed_liveness_session(
+                session_id=liveness_session_id,
+                device_id=device_id,
+                now=now,
+            )
+            if not sess:
+                return {"error": "Invalid or expired liveness session. Please start the camera flow again."}
 
         # 1. READ ORIGINAL IMAGE
         img_raw = cv2.imread(temp_path)
@@ -501,6 +508,40 @@ async def match_face(
 
         emb = face_out["embedding"]
         face_landmarks_mp = face_out["face_landmarks_mp"]
+
+        # FaceNet comparison with liveness reference photo if provided
+        if liveness_ref_photo:
+            try:
+                # Remove data URL header if present
+                if "," in liveness_ref_photo:
+                    _, base64_data = liveness_ref_photo.split(",", 1)
+                else:
+                    base64_data = liveness_ref_photo
+                img_data = base64.b64decode(base64_data)
+                nparr = np.frombuffer(img_data, np.uint8)
+                ref_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                if ref_img is None:
+                    return {"error": "Failed to decode the liveness reference photo."}
+
+                ref_face_out = extract_face_embedding(ref_img, mtcnn, model, DEVICE)
+                if not ref_face_out["ok"]:
+                    return {
+                        "error": "No face detected in the liveness reference photo. Please keep your face clearly visible and still during the preparation phase."
+                    }
+                ref_emb = ref_face_out["embedding"]
+
+                similarity_score = float(np.dot(ref_emb, emb))
+                print(f"🔄 FaceNet comparison score between liveness photo and capture image: {similarity_score:.4f}")
+
+                # Set threshold for liveness vs capture (0.70 is standard and safe)
+                LIVENESS_COMPARE_THRESHOLD = float(os.getenv("LIVENESS_COMPARE_THRESHOLD", "0.70"))
+                if similarity_score < LIVENESS_COMPARE_THRESHOLD:
+                    return {
+                        "error": "Liveness process user and captured image user are totally different."
+                    }
+            except Exception as e:
+                print(f"Error during liveness reference comparison: {e}")
+                return {"error": f"Liveness reference verification error: {str(e)}"}
 
         # 4. POST-SELFIE SECURITY (YOLO devices, ambient light, PAD spoof) — always runs
         sec = run_post_selfie_security(
