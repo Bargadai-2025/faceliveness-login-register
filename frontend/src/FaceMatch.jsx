@@ -1354,6 +1354,8 @@ const OVERLAY_LERP = 0.42;
 /** Must match JPEG sent to /liveness/frame (same crop as object-fit: cover in a 4:3 box). */
 const PROCESS_W = 640;
 const PROCESS_H = 480;
+const MULTI_PERSON_HARD_ERROR =
+  "Security Alert: Multiple user detected in video. Matching blocked.";
 
 function lerpPoints(prev, next, t) {
   if (!next?.length) return null;
@@ -1565,6 +1567,7 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
   const gesturePrepTimeoutRef = useRef(null);
   const gesturePrepDoneRef = useRef(false);
   const initCountdownIntervalRef = useRef(null);
+  const multiPersonErrorRef = useRef(false);
 
   const clearCameraTimers = useCallback(() => {
     if (initCountdownIntervalRef.current) {
@@ -1858,13 +1861,28 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
       overlayMeshRef.current = null;
     }
 
-    // Security alerts — always process (never skip on hidden backend steps)
+    // Multi-person: show hard error while detected; clear when only one person remains.
     if (data.multi_person) {
+      multiPersonErrorRef.current = true;
       setMultiPersonError(true);
-    } else {
-      setMultiPersonError(false);
+      setError(MULTI_PERSON_HARD_ERROR);
+      setChallengeMsg("Multiple user detected in video");
+      return;
     }
 
+    if (multiPersonErrorRef.current) {
+      multiPersonErrorRef.current = false;
+      setMultiPersonError(false);
+      setError((prev) =>
+        prev === MULTI_PERSON_HARD_ERROR || prev?.includes("Multiple user")
+          ? null
+          : prev,
+      );
+      if (livenessCompletedRef.current) {
+        setCanMatch(true);
+        setLivenessLive(true);
+      }
+    }
     const deviceNames = Array.isArray(data.devices_detected)
       ? data.devices_detected.join(", ")
       : "";
@@ -2147,6 +2165,7 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
     overlayDisplayMeshRef.current = null;
     gesturePrepDoneRef.current = false;
     setGesturePrepActive(false);
+    multiPersonErrorRef.current = false;
     setMultiPersonError(false);
     setChallengeMsg("");
     setError(null);
@@ -2154,6 +2173,10 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
 
   const takeSelfie = () => {
     console.log("📸 Capture button clicked");
+    if (multiPersonError) {
+      setError(MULTI_PERSON_HARD_ERROR);
+      return;
+    }
     const canvas = canvasRef.current;
     const video = videoRef.current;
     if (!canvas || !video) {
@@ -2204,6 +2227,11 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
     // If we are overriding with a direct file from capture, we bypass the state-based canMatch
     // because liveness is already verified to reach the capture button.
     const isDirectCapture = !!fileOverride;
+
+    if (multiPersonError) {
+      setError(MULTI_PERSON_HARD_ERROR);
+      return;
+    }
 
     if (!fileToUse) {
       setError("Please upload an image or take a selfie first.");
@@ -2523,28 +2551,28 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
                   </div>
                 )} */}
                   </div>
-            </div>
-          </div>
-
-          <div className="fm-challenges-pills">
-            {[1, 2, 3].map(num => {
-              const isActive = challengeIndex + 1 === num && livenessStep === "gesture";
-              const isCompleted = challengeIndex >= num || livenessLive;
-              return (
-                <div key={num} className={`fm-pill ${isActive ? 'active' : ''} ${isCompleted ? 'completed' : ''}`}>
-                  Challenge {num} <CheckCircle size={14} className="fm-pill-icon" />
                 </div>
-              )
-            })}
-            <div className={`fm-pill ${livenessLive ? 'active' : ''}`}>
-              Capture Selfie <Camera size={14} className="fm-pill-icon" />
-            </div>
-          </div>
-        </div>
+              </div>
 
-        <div className="fm-right-col">
+              <div className="fm-challenges-pills">
+                {[1, 2, 3].map(num => {
+                  const isActive = challengeIndex + 1 === num && livenessStep === "gesture";
+                  const isCompleted = !multiPersonError && (challengeIndex >= num || livenessLive);
+                  return (
+                    <div key={num} className={`fm-pill ${isActive ? 'active' : ''} ${isCompleted ? 'completed' : ''}`}>
+                      Challenge {num} <CheckCircle size={14} className="fm-pill-icon" />
+                    </div>
+                  )
+                })}
+                <div className={`fm-pill ${livenessLive && !multiPersonError ? 'active' : ''}`}>
+                  Capture Selfie <Camera size={14} className="fm-pill-icon" />
+                </div>
+              </div>
+            </div>
+
+            <div className="fm-right-col">
               {
-                (faceMatchCompleted || error) && !loading && (
+                (faceMatchCompleted || error || multiPersonError) && !loading && (
                   <>
                     {(error || multiPersonError) ? (
                       <div className="fm-security-alert-card">
@@ -2553,7 +2581,7 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
                           <span className="fm-alert-kicker">SECURITY ALERT</span>
                           <div className="error-font-fm-map-overlay">
                             {multiPersonError
-                              ? "Multiple user detected in video"
+                              ? (error || MULTI_PERSON_HARD_ERROR)
                               : error}
                           </div>
                         </div>
