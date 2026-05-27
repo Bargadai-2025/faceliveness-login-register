@@ -329,6 +329,97 @@ def compute_brightness_histogram(img_bgr: np.ndarray) -> Dict[str, float]:
     }
 
 
+def normalize_for_pad_analysis(
+    img_bgr: np.ndarray,
+    roi_bgr: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    CLAHE normalization so moiré/texture/scanline cues remain visible at
+    low, medium, and high phone brightness (100% display + screen replay).
+    """
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.8, tileGridSize=(8, 8))
+    norm_full = clahe.apply(gray)
+    if roi_bgr is not None and roi_bgr.size > 0:
+        roi_gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
+        norm_roi = clahe.apply(roi_gray)
+    else:
+        norm_roi = norm_full
+    return norm_full, norm_roi
+
+
+def signal_subpixel_grid(gray: np.ndarray) -> float:
+    """Regular LCD/OLED pixel grid visible when photographing a display."""
+    if gray is None or gray.size == 0:
+        return 0.0
+    h, w = gray.shape
+    if h < 24 or w < 24:
+        return 0.0
+    small = cv2.resize(gray, (min(256, w), min(256, h)), interpolation=cv2.INTER_AREA)
+    dft = np.fft.fft2(small.astype(np.float32))
+    mag = np.abs(np.fft.fftshift(dft))
+    mag = np.log(mag + 1.0)
+    crow, ccol = mag.shape[0] // 2, mag.shape[1] // 2
+    r = int(min(crow, ccol) * 0.12)
+    mask = np.ones_like(mag)
+    mask[crow - r : crow + r, ccol - r : ccol + r] = 0
+    ring = mag * mask
+    if not np.any(ring > 0):
+        return 0.0
+    mean_ring = float(np.mean(ring[ring > 0]))
+    peaks = ring > (mean_ring * 2.2)
+    peak_ratio = float(np.sum(peaks)) / float(ring.size + 1e-6)
+    return float(min(1.0, max(0.0, (peak_ratio - 0.0015) / 0.012)))
+
+
+def signal_rgb_channel_lock(roi_bgr: np.ndarray) -> float:
+    """Saturated emissive pixels with R≈G≈B (digital white), rare on skin pores."""
+    if roi_bgr is None or roi_bgr.size == 0:
+        return 0.0
+    bright = np.all(roi_bgr > 232, axis=-1)
+    if not np.any(bright):
+        return 0.0
+    pixels = roi_bgr[bright].astype(np.float32)
+    per_pixel_std = np.std(pixels, axis=1)
+    locked_ratio = float(np.mean(per_pixel_std < 9.0))
+    area_ratio = float(np.sum(bright)) / float(roi_bgr.shape[0] * roi_bgr.shape[1] + 1e-6)
+    return float(min(1.0, locked_ratio * 1.25 + area_ratio * 1.1))
+
+
+def analyze_high_brightness_screen_attack(
+    roi_bgr: np.ndarray,
+    roi_gray: np.ndarray,
+    norm_roi_gray: np.ndarray,
+) -> float:
+    """
+    Screen/photo/replay cues under high exposure (e.g. phone at 100% brightness).
+    Returns confidence 0–1.
+    """
+    if roi_gray is None or roi_gray.size == 0:
+        return 0.0
+    mean_b = float(np.mean(roi_gray))
+    if mean_b < 155:
+        return 0.0
+
+    is_emissive, _ = check_emissive_uniformity(roi_bgr)
+    grid = signal_subpixel_grid(norm_roi_gray if norm_roi_gray is not None else roi_gray)
+    rgb_lock = signal_rgb_channel_lock(roi_bgr)
+    if norm_roi_gray is not None and norm_roi_gray.size > 0:
+        scan = detect_scanline_artifacts(cv2.cvtColor(norm_roi_gray, cv2.COLOR_GRAY2BGR))
+    else:
+        scan = detect_scanline_artifacts(cv2.cvtColor(roi_gray, cv2.COLOR_GRAY2BGR))
+
+    lap = cv2.Laplacian(norm_roi_gray, cv2.CV_64F).var() if norm_roi_gray is not None and norm_roi_gray.size else 0.0
+    low_texture = float(max(0.0, min(1.0, 1.0 - lap / 260.0)))
+
+    score = 0.22 * float(is_emissive) + 0.28 * grid + 0.28 * rgb_lock + 0.22 * low_texture + 0.18 * scan
+    if mean_b > 200:
+        score *= 1.18
+    if mean_b > 225 and float(np.std(roi_gray)) < 22.0:
+        score = min(1.0, score + 0.15)
+    return float(min(1.0, score))
+
+
 def landmarks_to_serializable(pts_68: List[Dict]) -> List[Dict[str, float]]:
     """Convert landmark list to JSON-safe format."""
     return [{"x": round(p["x"], 1), "y": round(p["y"], 1)} for p in pts_68]
@@ -431,11 +522,14 @@ def check_emissive_uniformity(roi: np.ndarray) -> Tuple[bool, float]:
     mean_var = np.mean(variances) if variances else 100.0
     mean_brightness = np.mean(gray)
     
-    # Screen signature: High brightness + unnatural smoothness (low variance)
-    # In daylight, we need to be careful not to trigger this. 
-    # Real skin has texture (pores, hair) even in bright light.
-    # Digital screens are perfectly uniform.
-    is_emissive = mean_brightness > 195 and mean_var < 14.0 # Relaxed from 175/18.0
+    # Screen signature: emissive panel = bright + unnaturally uniform micro-texture.
+    # Stricter variance at very high brightness (phone 100% + screen replay).
+    if mean_brightness > 220:
+        is_emissive = mean_var < 10.5
+    elif mean_brightness > 195:
+        is_emissive = mean_var < 13.0
+    else:
+        is_emissive = mean_brightness > 175 and mean_var < 16.0
     return is_emissive, round(float(mean_var), 3)
 
 def check_screen_edges(img: np.ndarray, face_bbox: Tuple[int, int, int, int]) -> bool:

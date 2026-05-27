@@ -42,7 +42,7 @@ function FingerprintIcon() {
  */
 export default function LoginPage({ onLogin }) {
   const [error, setError] = useState("");
-  
+
   const [agents, setAgents] = useState([]);
   const [selectedAgent, setSelectedAgent] = useState("");
   const [loadingAgents, setLoadingAgents] = useState(true);

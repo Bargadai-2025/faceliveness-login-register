@@ -1498,6 +1498,8 @@ function SecurityAlertIcon({ size = 56 }) {
   );
 }
 
+const TASK_COMPLETE_SOUND = "/sounds/Task_complete.mp3";
+
 export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
   const [preview, setPreview] = useState(null);
   const [file, setFile] = useState(null);
@@ -1543,6 +1545,8 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
   /** Track if face match has been completed to remove start button */
   const [faceMatchCompleted, setFaceMatchCompleted] = useState(false);
 
+  const [click, setClick] = useState(false);
+
   const addToast = useCallback((msg, type = "success") => {
     const id = Date.now();
     setToasts((prev) => [...prev, { id, msg, type }]);
@@ -1567,6 +1571,9 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
   const frameIntervalRef = useRef(null);
   const livenessSessionIdRef = useRef(null);
   const livenessCompletedRef = useRef(false);
+  const prevGestureIdxRef = useRef(0);
+  const lastSoundChallengeRef = useRef(-1);
+  const audioCtxRef = useRef(null);
   const streamingRef = useRef(false);
   const profileMenuRef = useRef(null);
   const lastToastTimeRef = useRef(0);
@@ -1590,6 +1597,64 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
       clearTimeout(gesturePrepTimeoutRef.current);
       gesturePrepTimeoutRef.current = null;
     }
+  }, []);
+
+  const getAudioContext = useCallback(() => {
+    if (typeof window === "undefined") return null;
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (!AudioCtx) return null;
+    if (!audioCtxRef.current) {
+      audioCtxRef.current = new AudioCtx();
+    }
+    if (audioCtxRef.current.state === "suspended") {
+      audioCtxRef.current.resume().catch(() => { });
+    }
+    return audioCtxRef.current;
+  }, []);
+
+  const playSoundFromPath = useCallback(
+    (path, volume = 0.8) => {
+      if (typeof window === "undefined") return false;
+      getAudioContext();
+      try {
+        const a = new Audio(path);
+        a.volume = volume;
+        a.preload = "auto";
+        const p = a.play();
+        if (p && typeof p.catch === "function") p.catch(() => { });
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    [getAudioContext],
+  );
+
+  const playTaskCompleteSound = useCallback(() => {
+    playSoundFromPath(TASK_COMPLETE_SOUND, 0.85);
+  }, [playSoundFromPath]);
+
+  const unlockAudio = useCallback(() => {
+    getAudioContext();
+    playSoundFromPath(TASK_COMPLETE_SOUND, 0.001);
+  }, [getAudioContext, playSoundFromPath]);
+
+  const playSoundsForChallengeComplete = useCallback(
+    (completedChallengeIndex) => {
+      if (completedChallengeIndex < 0) return;
+      if (completedChallengeIndex <= lastSoundChallengeRef.current) return;
+      lastSoundChallengeRef.current = completedChallengeIndex;
+      playTaskCompleteSound();
+    },
+    [playTaskCompleteSound],
+  );
+
+  useEffect(() => {
+    return () => {
+      if (audioCtxRef.current && audioCtxRef.current.state !== "closed") {
+        audioCtxRef.current.close().catch(() => { });
+      }
+    };
   }, []);
 
   // Click outside profile menu
@@ -1940,13 +2005,33 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
     if (data.detail) setChallengeMsg(data.detail);
 
     if (data.step === "gesture" && data.gesture_idx !== undefined) {
+      const prevIdx = prevGestureIdxRef.current;
+      if (data.gesture_idx > prevIdx) {
+        playSoundsForChallengeComplete(prevIdx);
+      } else if (
+        data.detail &&
+        (data.detail.includes("Good! Next gesture") || data.detail.includes("Good! Next"))
+      ) {
+        const completedIdx = Math.max(0, (data.gesture_idx ?? 1) - 1);
+        playSoundsForChallengeComplete(completedIdx);
+      }
+      prevGestureIdxRef.current = data.gesture_idx;
       setChallengeIndex(data.gesture_idx);
       const completed = [];
       for (let i = 0; i < data.gesture_idx; i++) completed.push(true);
       setCompletedChallenges(completed);
     }
 
-    if (data.status === "verified" || data.step === "complete") {
+    if (data.step === "complete" && data.status === "processing") {
+      const lastIdx = sessionChallenges.length - 1;
+      if (lastIdx >= 0) {
+        playSoundsForChallengeComplete(lastIdx);
+      }
+      setChallengeIndex(sessionChallenges.length);
+      setCompletedChallenges(sessionChallenges.map(() => true));
+    }
+
+    if (data.status === "verified") {
       if (!livenessCompletedRef.current) {
         livenessCompletedRef.current = true;
         setCompletedSteps([
@@ -2060,6 +2145,9 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
 
   async function startCamera() {
     stopCamera();
+    unlockAudio();
+    prevGestureIdxRef.current = 0;
+    lastSoundChallengeRef.current = -1;
     setError(null);
     setFile(null);
     setPreview(null);
@@ -2150,12 +2238,15 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
     gesturePrepDoneRef.current = false;
     setGesturePrepActive(false);
     multiPersonErrorRef.current = false;
+    prevGestureIdxRef.current = 0;
+    lastSoundChallengeRef.current = -1;
     setMultiPersonError(false);
     setChallengeMsg("");
     setError(null);
   }
 
   const takeSelfie = () => {
+    setClick(!click);
     console.log("📸 Capture button clicked");
     if (multiPersonError) {
       setError(ERROR_LABELS.MULTI_PERSON);
@@ -2181,6 +2272,7 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
           return;
         }
         console.log("✅ Blob created, triggering match...");
+        playTaskCompleteSound();
         const f = new File([blob], "selfie.jpg", { type: "image/jpeg" });
         const currentSessionId = livenessSessionIdRef.current;
 
@@ -2390,6 +2482,11 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
     multiPerson: multiPersonError,
   });
 
+  const isSecureScanPhase =
+    showCamera &&
+    (["calibration", "depth", "light_challenge", "micro"].includes(livenessStep) ||
+      gesturePrepActive);
+
   return (
     <div className="fm-page">
       {/* Toast Notification Pipeline */}
@@ -2431,7 +2528,9 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
           <div className="fm-columns-row">
             <div className="fm-left-col">
               <div className="fm-camera-outer">
-                <div className="fm-camera-container">
+                <div
+                  className={`fm-camera-container${isSecureScanPhase ? " fm-secure-scan-active" : ""}`}
+                >
                   <div className="fm-main-camera-contianer-relative">
                     {
                       preview ?
@@ -2492,24 +2591,16 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
                       <div className="fm-scanline"></div>
                     )}
 
+                    {isSecureScanPhase && (
+                      <div className="fm-secure-scan-glow" aria-hidden="true" />
+                    )}
+
                     {showCamera && (
                       <div className="fm-liveness-overlay">
-                        {/* Secure Scan State */}
-                        {["calibration", "depth", "light_challenge", "micro"].includes(livenessStep) && (
-                          <div className="fm-gesture-pill">
-                            <div className="fm-gesture-icon-wrap" style={{ background: "#24aa4d" }}>
-                              <Activity size={18} />
-                            </div>
-                            <span className="fm-gesture-text">Secure Scan...</span>
-                          </div>
-                        )}
-
-                        {gesturePrepActive && (
-                          <div className="fm-gesture-pill">
-                            <div className="fm-gesture-icon-wrap" style={{ background: "#16562a" }}>
-                              <Loader2 size={18} className="fm-security-init-spinner" />
-                            </div>
-                            <span className="fm-gesture-text">Preparing challenge…</span>
+                        {isSecureScanPhase && (
+                          <div className="fm-setup-status" role="status" aria-live="polite">
+                            <Loader2 size={22} className="fm-setup-status-spinner" aria-hidden="true" />
+                            <p className="fm-setup-status-title">We&apos;re setting up</p>
                           </div>
                         )}
 
@@ -2549,17 +2640,30 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
                 </div>
               </div>
 
-              <div className="fm-challenges-pills">
-                {[1, 2, 3].map(num => {
-                  const isActive = challengeIndex + 1 === num && livenessStep === "gesture";
-                  const isCompleted = !multiPersonError && (challengeIndex >= num || livenessLive);
+              <div
+                className={`fm-challenges-pills${isSecureScanPhase ? " fm-challenges-pills--secure-scan" : ""}`}
+              >
+                {[1, 2, 3].map((num) => {
+                  const isActive =
+                    !isSecureScanPhase &&
+                    challengeIndex + 1 === num &&
+                    livenessStep === "gesture";
+                  const isCompleted =
+                    !isSecureScanPhase &&
+                    !multiPersonError &&
+                    (challengeIndex >= num || livenessLive);
                   return (
-                    <div key={num} className={`fm-pill ${isActive ? 'active' : ''} ${isCompleted ? 'completed' : ''}`}>
+                    <div
+                      key={num}
+                      className={`fm-pill${isSecureScanPhase ? " secure-scan" : ""}${isActive ? " active" : ""}${isCompleted ? " completed" : ""}`}
+                    >
                       Challenge {num} <CheckCircle size={14} className="fm-pill-icon" />
                     </div>
-                  )
+                  );
                 })}
-                <div className={`fm-pill ${livenessLive && !multiPersonError ? 'active' : ''}`}>
+                <div
+                  className={`fm-pill${isSecureScanPhase ? " secure-scan" : ""}${!isSecureScanPhase && livenessLive && !multiPersonError ? " active" : ""}${click ? " completed" : ""}`}
+                >
                   Capture Selfie <Camera size={14} className="fm-pill-icon" />
                 </div>
               </div>

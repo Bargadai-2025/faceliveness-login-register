@@ -26,6 +26,10 @@ from face_detection import (
     compute_sensor_authenticity,
     analyze_eye_reflections,
     detect_display_refresh_rate,
+    normalize_for_pad_analysis,
+    signal_subpixel_grid,
+    signal_rgb_channel_lock,
+    analyze_high_brightness_screen_attack,
 )
 
 
@@ -67,6 +71,8 @@ def load_spoof_weights() -> Dict[str, float]:
         "temporal_stream_integrity": _f("SPOOF_WEIGHT_TEMPORAL_STREAM", 20.0),
         "sensor_authenticity": _f("SPOOF_WEIGHT_SENSOR_AUTH", 15.0),
         "environment_authenticity": _f("SPOOF_WEIGHT_ENV_AUTH", 15.0),
+        "high_brightness_screen": _f("SPOOF_WEIGHT_HIGH_BRIGHT_SCREEN", 22.0),
+        "pixel_grid": _f("SPOOF_WEIGHT_PIXEL_GRID", 12.0),
     }
 
 
@@ -124,10 +130,13 @@ def classify_reflection(
 
     area_ratio = best_area / float(h * w + 1e-6)
 
+    roi_mean = float(np.mean(v))
+
     # Small highlight in upper face = likely skin / forehead shine
-    # RELAXED: threshold raised from 0.04 to 0.06 to tolerate natural forehead shine
     if area_ratio < 0.06 and forehead_y < 0.60 and best_cy < 0.50:
-        return "natural_skin", min(1.0, area_ratio * 12.0)
+        # Under very high exposure, small highlights can still be screen glare
+        if roi_mean < 210:
+            return "natural_skin", min(1.0, area_ratio * 12.0)
 
     # Large bright blob, not confined to forehead
     if area_ratio > 0.10:  # Raised from 0.08
@@ -140,7 +149,10 @@ def classify_reflection(
     if 0.06 <= area_ratio <= 0.10:
         return "phone_screen_reflection", min(1.0, area_ratio * 8.0)
 
-    # Default: treat as natural skin (benefit of the doubt)
+    # High-brightness scene: do not default to natural skin without evidence
+    if roi_mean > 205 and area_ratio >= 0.04:
+        return "phone_screen_reflection", min(1.0, area_ratio * 6.0)
+
     return "natural_skin", 0.25
 
 
@@ -323,24 +335,50 @@ def _gather_raw_signals(
     global_high_sat = float(np.sum(global_sat > 200) / (global_sat.size + 1e-6))
     global_high_val = float(np.sum(global_val > 230) / (global_val.size + 1e-6))
 
-    # Environmental lighting dampening
-    env_damp = 1.0
-    if global_high_sat > 0.32 or global_high_val > 0.38:
-        env_damp = 0.55 if strict else 0.68
+    norm_gray, norm_roi_gray = normalize_for_pad_analysis(img_bgr, roi_bgr)
+    roi_mean_brightness = float(np.mean(roi_gray)) if roi_gray.size else float(np.mean(gray))
+    high_bright_scene = roi_mean_brightness > 175 or global_high_val > 0.32
 
-    moire = signal_moire(gray) * env_damp
-    texture = signal_texture_degraded(gray, roi_gray) * env_damp
-    scan = float(detect_scanline_artifacts(img_bgr))
+    # Dampen only unreliable glare/reflection cues in bright scenes — NOT screen imaging signals.
+    glare_damp = 1.0
+    if global_high_sat > 0.32 or global_high_val > 0.38:
+        glare_damp = 0.62 if strict else 0.75
+
+    # Amplify moiré/texture/grid detection when scene is over-exposed (phone 100% + screen replay).
+    screen_sens = 1.0
+    if high_bright_scene:
+        screen_sens = 1.32 if strict else 1.18
+
+    moire_raw = max(signal_moire(gray), signal_moire(norm_gray))
+    moire = min(1.0, moire_raw * screen_sens)
+    texture = min(
+        1.0,
+        max(
+            signal_texture_degraded(gray, roi_gray),
+            signal_texture_degraded(norm_gray, norm_roi_gray),
+        )
+        * screen_sens,
+    )
+    scan = max(
+        float(detect_scanline_artifacts(img_bgr)),
+        float(detect_scanline_artifacts(cv2.cvtColor(norm_gray, cv2.COLOR_GRAY2BGR))),
+    )
     peak = float(detect_peak_saturation(roi_bgr))
     glare_ratio = float(detect_specular_highlights(roi_bgr))
     color_div = float(compute_color_diversity(roi_bgr))
 
     is_emissive, _ = check_emissive_uniformity(roi_bgr)
-    emissive_boost = 0.35 if is_emissive else 0.0
+    emissive_boost = 0.42 if is_emissive else 0.0
+    if high_bright_scene and is_emissive:
+        emissive_boost = 0.55
 
-    border = signal_screen_border(img_bgr, face_bbox) * env_damp
+    border = min(1.0, signal_screen_border(img_bgr, face_bbox) * screen_sens)
 
-    flicker = signal_flicker(roi_luminance_history or []) * env_damp
+    flicker = signal_flicker(roi_luminance_history or []) * glare_damp
+
+    pixel_grid = min(1.0, signal_subpixel_grid(norm_roi_gray) * screen_sens)
+    rgb_lock = min(1.0, signal_rgb_channel_lock(roi_bgr) * (1.15 if high_bright_scene else 1.0))
+    hi_bright_screen = analyze_high_brightness_screen_attack(roi_bgr, roi_gray, norm_roi_gray)
 
     lm_hist = landmark_centroid_history or []
     flat_p = signal_flat_plane(lm_hist, roi_luminance_history or [])
@@ -374,24 +412,27 @@ def _gather_raw_signals(
     refresh_rate = detect_display_refresh_rate(img_bgr)
 
     return {
-        "moire": float(min(1.0, moire_combined + emissive_boost * 0.3)),
-        "flat_plane": float(min(1.0, flat_p + (0.18 if is_emissive else 0.0))),
+        "moire": float(min(1.0, moire_combined + emissive_boost * 0.3 + pixel_grid * 0.2)),
+        "flat_plane": float(min(1.0, flat_p + (0.22 if is_emissive else 0.0) + hi_bright_screen * 0.15)),
         "screen_border": border,
         "flicker": float(min(1.0, flicker + refresh_rate * 0.5)),
-        "reflection_raw": float(min(1.0, glare_for_score * 2.5 + peak * 1.2)),  # Reduced multipliers
-        "texture_degraded": float(min(1.0, texture + (0.15 if color_div < 0.025 else 0.0))),
-        "rect_glare": float(min(1.0, rect_g + 0.25 * peak)),  # Reduced from 0.35
+        "reflection_raw": float(min(1.0, (glare_for_score * 2.5 + peak * 1.2) * glare_damp)),
+        "texture_degraded": float(min(1.0, texture + (0.15 if color_div < 0.025 else 0.0) + rgb_lock * 0.12)),
+        "rect_glare": float(min(1.0, rect_g + 0.25 * peak)),
         "bg_uniform_motion": bg_mot,
         "perspective": persp,
         "video_call_replay": rtc_comp,
         "sensor_authenticity": sensor_auth,
         "eye_screen_reflection": eye_refl,
         "display_refresh_probability": refresh_rate,
+        "high_brightness_screen": hi_bright_screen,
+        "pixel_grid": pixel_grid,
         "_refl_label": refl_label,
         "_refl_conf": refl_conf,
         "_scan": scan,
         "_peak": peak,
         "_glare": glare_ratio,
+        "_roi_mean_brightness": roi_mean_brightness,
     }
 
 
@@ -455,6 +496,8 @@ def aggregate_weighted_score(
     total += glare_bucket
 
     total += wcontrib("texture_degraded", "texture_degraded")
+    total += wcontrib("high_brightness_screen", "high_brightness_screen")
+    total += wcontrib("pixel_grid", "pixel_grid")
     total += wcontrib("bg_uniform_motion", "bg_uniform_motion")
     total += wcontrib("perspective", "perspective")
 
@@ -493,6 +536,8 @@ def aggregate_weighted_score(
         "sensor_authenticity",
         "temporal_stream_integrity",
         "environment_authenticity",
+        "high_brightness_screen",
+        "pixel_grid",
     ):
         if per_signal_conf.get(key, 0) >= 0.42:
             triggered.append(key)
@@ -578,7 +623,7 @@ def _apply_correlation_gate(
         # Each co-occurring signal adds 12 points to the score.
         screen_indicative_signals = [
             "moire", "texture_degraded", "flat_plane", "screen_border",
-            "bg_uniform_motion", "perspective",
+            "bg_uniform_motion", "perspective", "high_brightness_screen", "pixel_grid",
         ]
         screen_count = sum(
             1 for s in screen_indicative_signals
@@ -590,6 +635,17 @@ def _apply_correlation_gate(
             reasons.append(
                 f"screen_evidence_fusion (+{screen_boost:.0f} from {screen_count} co-occurring screen signals)"
             )
+
+        hi_bright = float(per_signal.get("high_brightness_screen", 0.0))
+        if hi_bright >= 0.45:
+            hb_boost = 14.0 + hi_bright * 18.0
+            adj += hb_boost
+            reasons.append(f"high_brightness_screen_attack (+{hb_boost:.1f})")
+
+        pixel_g = float(per_signal.get("pixel_grid", 0.0))
+        if pixel_g >= 0.40 and hi_bright >= 0.30:
+            adj += 10.0
+            reasons.append("pixel_grid_with_high_brightness")
 
         # Also check for moderate device_replay (YOLO saw device but not overlapping face)
         device_score = max(float(per_signal.get("device_replay", 0.0)), float(extra.get("device_replay", 0.0)))
@@ -678,9 +734,14 @@ def analyze_passive_spoof_single_frame(
     per_signal_clean = {k: round(float(v), 4) for k, v in per_signal.items() if not str(k).startswith("_")}
     per_signal_clean["reflection_label"] = refl_label
 
-    # Glare/reflection-only triggers NEVER reject (even in single-frame mode)
+    # Glare/reflection-only triggers NEVER reject (unless high-brightness screen attack is present)
     non_glare_triggers = [t for t in triggered if t not in ("reflection", "rectangular_glare", "flicker")]
-    if not non_glare_triggers and total >= reject_threshold - 5.0:
+    hi_bright_sig = float(per_signal.get("high_brightness_screen", 0.0))
+    if (
+        not non_glare_triggers
+        and hi_bright_sig < 0.38
+        and total >= reject_threshold - 5.0
+    ):
         total = min(total, reject_threshold - 8.0)
 
     is_live = total < reject_threshold

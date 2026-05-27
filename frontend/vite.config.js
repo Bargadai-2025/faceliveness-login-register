@@ -21,6 +21,8 @@ export default defineConfig(({ mode }) => {
   return {
     plugins: [react()],
     server: {
+      port: 5173,
+      strictPort: true,
       proxy: {
         // Same-origin in dev when VITE_API_URL is empty (see .env.development).
         // Avoids CORS preflight to remote nginx returning 405 on OPTIONS.

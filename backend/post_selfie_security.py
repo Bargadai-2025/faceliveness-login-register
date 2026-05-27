@@ -140,23 +140,32 @@ def check_face_environment_light(
             "detail": f"Mean brightness {brightness:.0f} (max {cfg['max_face_brightness']:.0f}). Reduce direct light on face.",
             "penalty": 0.12,
         })
-    if brightness_std < cfg["min_face_brightness_std"]:
+    min_std = float(cfg["min_face_brightness_std"])
+    if brightness > 200:
+        min_std = max(min_std, 20.0)
+    if brightness > 225:
+        min_std = max(min_std, 22.0)
+
+    if brightness_std < min_std:
         issues.append({
             "type": "Uniform Lighting (Screen-Like)",
             "detail": (
-                f"Very low brightness variation (std {brightness_std:.1f}). "
+                f"Very low brightness variation (std {brightness_std:.1f}, need ≥{min_std:.0f}). "
                 "May indicate a flat emissive screen rather than natural skin."
             ),
-            "penalty": 0.18,
+            "penalty": 0.22 if brightness > 200 else 0.18,
         })
 
     gray = cv2.cvtColor(target, cv2.COLOR_BGR2GRAY)
     clipped = float(np.mean(gray >= 250))
-    if clipped > cfg["max_clipped_highlight_ratio"]:
+    clip_max = float(cfg["max_clipped_highlight_ratio"])
+    if brightness > 210:
+        clip_max = min(clip_max, 0.10)
+    if clipped > clip_max:
         issues.append({
             "type": "Specular Screen Glare",
-            "detail": f"Saturated highlights {clipped * 100:.1f}% of face ROI (max {cfg['max_clipped_highlight_ratio'] * 100:.0f}%).",
-            "penalty": 0.20,
+            "detail": f"Saturated highlights {clipped * 100:.1f}% of face ROI (max {clip_max * 100:.0f}%).",
+            "penalty": 0.24 if brightness > 210 else 0.20,
         })
 
     return issues
