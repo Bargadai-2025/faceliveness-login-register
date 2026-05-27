@@ -1305,6 +1305,12 @@ import {
   matchFetchErrorMessage,
   startIndeterminateMatchProgress,
 } from "./matchUiUtils";
+import {
+  ERROR_LABELS,
+  formatSecurityError,
+  isDigitalMediaMessage,
+  resolveSecurityDisplayError,
+} from "./securityErrorMessages";
 import "./FaceMatch.css";
 import bargadLogo from "./bargad-logo.png";
 import bargadBranding from "./bargad-branding (1).svg?url";
@@ -1354,9 +1360,6 @@ const OVERLAY_LERP = 0.42;
 /** Must match JPEG sent to /liveness/frame (same crop as object-fit: cover in a 4:3 box). */
 const PROCESS_W = 640;
 const PROCESS_H = 480;
-const MULTI_PERSON_HARD_ERROR =
-  "Security Alert: Multiple user detected in video. Matching blocked.";
-
 function lerpPoints(prev, next, t) {
   if (!next?.length) return null;
   if (!prev?.length || prev.length !== next.length) return next.map((p) => ({ ...p }));
@@ -1367,19 +1370,19 @@ function lerpPoints(prev, next, t) {
 }
 
 const CHALLENGE_UI = {
-  turn_left: { label: "Turn your head LEFT", icon: ArrowLeft },
-  turn_right: { label: "Turn your head RIGHT", icon: ArrowRight },
-  nod: { label: "NOD your head down", icon: ArrowDown },
-  look_up: { label: "LOOK slightly up", icon: ArrowUp },
-  smile: { label: "SMILE", icon: Smile },
-  mouth_open: { label: "OPEN your mouth wide", icon: Smile },
-  move_closer: { label: "Move CLOSER", icon: Maximize },
+  turn_left: { label: "Turn your Head Left", icon: ArrowLeft },
+  turn_right: { label: "Turn your Head Right", icon: ArrowRight },
+  nod: { label: "Move your Head Down", icon: ArrowDown },
+  look_up: { label: "Look slightly up", icon: ArrowUp },
+  smile: { label: "Smile", icon: Smile },
+  mouth_open: { label: "Open your mouth wide", icon: Smile },
+  move_closer: { label: "Move Closer", icon: Maximize },
   move_farther: { label: "Move Away", icon: Maximize },
-  shake_head: { label: "Shake head NO", icon: Activity },
-  look_left_hold: { label: "Look LEFT & HOLD", icon: ArrowLeft },
-  look_right_hold: { label: "Look RIGHT & HOLD", icon: ArrowRight },
-  look_up_hold: { label: "Look UP & HOLD", icon: ArrowUp },
-  look_down_hold: { label: "Look DOWN & HOLD", icon: ArrowDown },
+  shake_head: { label: "Shake head No", icon: Activity },
+  look_left_hold: { label: "Look Left & Hold", icon: ArrowLeft },
+  look_right_hold: { label: "Look Right & Hold", icon: ArrowRight },
+  look_up_hold: { label: "Look Up & Hold", icon: ArrowUp },
+  look_down_hold: { label: "Look Down & Hold", icon: ArrowDown },
 };
 
 // 68-pt landmark segment indices (MediaPipe → 68 mapping on server)
@@ -1546,6 +1549,11 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
     setTimeout(() => {
       setToasts((prev) => prev.filter((t) => t.id !== id));
     }, 3500);
+  }, []);
+
+  /** Only one of the 23 official security errors is stored; otherwise null (no alert). */
+  const applySecurityError = useCallback((message, hints = {}) => {
+    setError(formatSecurityError(message, hints));
   }, []);
 
   const videoRef = useRef();
@@ -1865,7 +1873,7 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
     if (data.multi_person) {
       multiPersonErrorRef.current = true;
       setMultiPersonError(true);
-      setError(MULTI_PERSON_HARD_ERROR);
+      setError(ERROR_LABELS.MULTI_PERSON);
       setChallengeMsg("Multiple user detected in video");
       return;
     }
@@ -1874,7 +1882,7 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
       multiPersonErrorRef.current = false;
       setMultiPersonError(false);
       setError((prev) =>
-        prev === MULTI_PERSON_HARD_ERROR || prev?.includes("Multiple user")
+        prev === ERROR_LABELS.MULTI_PERSON || prev?.includes("Multiple Users")
           ? null
           : prev,
       );
@@ -1897,17 +1905,7 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
         deviceDetail.includes("electronic"));
 
     if (isDeviceAlert) {
-      const now = Date.now();
-      if (now - lastDeviceToastRef.current > DEVICE_TOAST_INTERVAL_MS) {
-        lastDeviceToastRef.current = now;
-        addToast(
-          data.detail ||
-          (deviceNames
-            ? `mobile phone detected — move away from camera`
-            : "Electronic device detected near camera"),
-          "warning",
-        );
-      }
+      applySecurityError(data.detail, { digitalMedia: true });
       setErrcount((prev) => prev + 10);
     }
 
@@ -1966,33 +1964,19 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
     if (data.status === "rejected" || data.status === "failed") {
       if (data.status === "rejected") {
         setErrcount((prev) => prev + 10);
-        addToast("Security Alert: Electronic device detected.", "error");
-        // Silently log rejection without stopping camera or showing modal
+        applySecurityError(data.detail, { digitalMedia: true });
         console.warn("Security rejection caught:", data.detail);
       } else {
-        setError(data.detail || "Liveness check failed");
+        applySecurityError(data.detail || "Liveness check failed");
       }
     } else if (data.status === "processing") {
       const d = data.detail || "";
 
-      // Increment errcount for suspicious activity (e.g. digital screen, identity mismatch)
-      if (data.is_suspicious) {
-        // Increment by 10 per event/frame as requested
+      if (data.is_suspicious && !isDeviceAlert) {
         setErrcount((prev) => prev + 10);
-
-        // Show small popup at top
-        const now = Date.now();
-        if (
-          now - lastToastTimeRef.current > DEVICE_TOAST_INTERVAL_MS &&
-          !isDeviceAlert
-        ) {
-          addToast(
-            data.detail ||
-            "Security Warning: Potential device or non-live media detected.",
-            "warning",
-          );
-          lastToastTimeRef.current = now;
-        }
+        applySecurityError(d, {
+          digitalMedia: isDigitalMediaMessage(d),
+        });
       }
 
       if (
@@ -2001,8 +1985,8 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
         d.includes("too far") ||
         d.includes("No face")
       ) {
-        setError(d);
-      } else {
+        applySecurityError(d);
+      } else if (!data.is_suspicious) {
         setError(null);
       }
     }
@@ -2070,7 +2054,7 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
         setLivenessStep("capture");
       }
     } catch {
-      setError("Verification failed");
+      applySecurityError("Verification failed");
     }
   }
 
@@ -2108,7 +2092,7 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
         }
         sessData = await sessRes.json();
       } catch (e) {
-        setError(`Session failed: ${e.message}`);
+        applySecurityError(`Session failed: ${e.message}`);
         setLivenessSessionLoading(false);
         return;
       }
@@ -2124,7 +2108,7 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
         };
         mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
       } catch (e) {
-        setError(`Camera access denied: ${e.message}`);
+        applySecurityError(`Camera access denied: ${e.message}`);
         setLivenessSessionLoading(false);
         return;
       }
@@ -2136,7 +2120,7 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
       setLivenessStep("camera");
       setChallengeMsg("Waiting for gesture...");
     } catch (e) {
-      setError(`Unexpected error: ${e.message}`);
+      applySecurityError(`Unexpected error: ${e.message}`);
     } finally {
       setLivenessSessionLoading(false);
     }
@@ -2174,7 +2158,7 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
   const takeSelfie = () => {
     console.log("📸 Capture button clicked");
     if (multiPersonError) {
-      setError(MULTI_PERSON_HARD_ERROR);
+      setError(ERROR_LABELS.MULTI_PERSON);
       return;
     }
     const canvas = canvasRef.current;
@@ -2193,7 +2177,7 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
       (blob) => {
         if (!blob) {
           console.error("Failed to create blob from canvas");
-          setError("Capture failed: Could not process image.");
+          applySecurityError("Capture failed: Could not process image.");
           return;
         }
         console.log("✅ Blob created, triggering match...");
@@ -2229,18 +2213,18 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
     const isDirectCapture = !!fileOverride;
 
     if (multiPersonError) {
-      setError(MULTI_PERSON_HARD_ERROR);
+      setError(ERROR_LABELS.MULTI_PERSON);
       return;
     }
 
     if (!fileToUse) {
-      setError("Please upload an image or take a selfie first.");
+      applySecurityError("Please upload an image or take a selfie first.");
       return;
     }
 
     // Strict liveness gating: no match is allowed without a verified session
     if (!canMatch && !faceMatchCompleted) {
-      setError(
+      applySecurityError(
         "Liveness verification must be fully completed before matching. Please restart the camera flow.",
       );
       return;
@@ -2311,19 +2295,26 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
 
       if (data.error) {
         console.error("❌ Match error from backend:", data.error);
-        setError(data.error);
+        applySecurityError(data.error);
         setCaptureLiveFailure(null);
         setProgress(0);
       } else if (data.capture_live_ok === false) {
         console.error("❌ Capture live failed:", data.capture_live_reason);
-        setError(data.capture_live_reason || "Security Alert: High risk of digital spoofing detected. Matching blocked.");
+        applySecurityError(
+          data.capture_live_reason ||
+            "Security Alert: High risk of digital spoofing detected. Matching blocked.",
+          { digitalMedia: true },
+        );
         setCaptureLiveFailure(null);
         setResults([]);
         setPenaltyDetails([]);
         setProgress(0);
       } else if (errcount > 0) {
         console.error("❌ Liveness errors detected during session.");
-        setError("Security Alert: Suspicious activity or device detected during liveness session. Matching blocked.");
+        applySecurityError(
+          "Security Alert: Suspicious activity or device detected during liveness session. Matching blocked.",
+          { digitalMedia: true },
+        );
         setCaptureLiveFailure(null);
         setResults([]);
         setPenaltyDetails([]);
@@ -2343,7 +2334,7 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
       }
     } catch (err) {
       console.error("❌ Match request failed:", err);
-      setError(matchFetchErrorMessage(err));
+      applySecurityError(matchFetchErrorMessage(err));
       setProgress(0);
       clearInterval(pInterval);
       clearTimeout(matchTimeoutId);
@@ -2354,7 +2345,7 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
 
   const handleRegister = async () => {
     if (!file || !registerName) {
-      setError("Please provide a name and capture a selfie first.");
+      applySecurityError("Please provide a name and capture a selfie first.");
       return;
     }
     setLoading(true);
@@ -2376,7 +2367,7 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
       });
       const data = await res.json();
       if (data.error) {
-        setError(data.error);
+        applySecurityError(data.error);
       } else {
         setRegistrationSuccess(`Successfully registered ${registerName}!`);
         setRegisterMode(false);
@@ -2385,7 +2376,7 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
         setLivenessStep("idle");
       }
     } catch (err) {
-      setError("Registration failed. Please try again.");
+      applySecurityError("Registration failed. Please try again.");
     } finally {
       setLoading(false);
     }
@@ -2394,6 +2385,10 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
   const handleReload = () => {
     window.location.reload();
   };
+
+  const securityAlertMessage = resolveSecurityDisplayError(error, {
+    multiPerson: multiPersonError,
+  });
 
   return (
     <div className="fm-page">
@@ -2572,17 +2567,15 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
 
             <div className="fm-right-col">
               {
-                (faceMatchCompleted || error || multiPersonError) && !loading && (
+                !loading && (faceMatchCompleted || securityAlertMessage) && (
                   <>
-                    {(error || multiPersonError) ? (
+                    {securityAlertMessage ? (
                       <div className="fm-security-alert-card">
                         <SecurityAlertIcon size={56} />
                         <div className="fm-security-alert-text">
                           <span className="fm-alert-kicker">SECURITY ALERT</span>
                           <div className="error-font-fm-map-overlay">
-                            {multiPersonError
-                              ? (error || MULTI_PERSON_HARD_ERROR)
-                              : error}
+                            {securityAlertMessage}
                           </div>
                         </div>
                       </div>

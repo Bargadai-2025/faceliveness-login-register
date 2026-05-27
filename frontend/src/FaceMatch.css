@@ -294,7 +294,7 @@ body {
   height: 24px;
   display: block;
   object-fit: contain;
-  transform: scale(1.0);
+  transform: scale(0.8);
 }
 
 /* Header */
@@ -1556,7 +1556,7 @@ body {
 .fm-geo-coords {
   font-size: 12px;
   color: #aaa;
-  font-family: monospace;
+  font-family: "Century Gothic", CenturyGothic, AppleGothic, sans-serif;
   margin-top: 2px;
 }
 
@@ -2988,7 +2988,7 @@ body {
   align-items: center;
   justify-content: center;
   flex: 1;
-  padding: 42px 30px;
+  padding: 35x 30px;
   width: 100%;
   background-image: url(/src/assets/bg-facematch.png);
   background-size: cover;
@@ -3006,6 +3006,7 @@ body {
   max-width: 1100px;
   margin: 0 auto;
   align-items: start;
+  max-height: 600px;
 }
 
 .fm-columns-row {
@@ -3789,7 +3790,7 @@ body {
   display: flex;
   gap: 12px;
   flex: 1;
-  min-height: 240px;
+  max-height: 255px;
 }
 
 .fm-match-box {
