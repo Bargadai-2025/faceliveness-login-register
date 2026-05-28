@@ -17,7 +17,8 @@ from spoof_scoring import (
     count_display_imaging_signals,
     has_display_attack_corroboration,
 )
-from device_filter import filter_devices_for_attack
+from device_filter import filter_devices_for_attack, is_phone_tablet_name
+from screen_replay_analysis import has_physical_fullframe_signals, has_structural_fullframe_signals
 
 
 def _f(name: str, default: float) -> float:
@@ -224,8 +225,11 @@ def compute_identity_continuity_risk(assessment: Dict[str, Any]) -> Tuple[float,
             notes.append(f"ratio_drift={drift:.3f}")
 
     if assessment.get("device_only_at_capture") and not assessment.get("laptop_capture_context"):
-        risk_parts.append(75.0)
-        notes.append("device_only_at_capture")
+        if not assessment.get("liveness_session_verified"):
+            risk_parts.append(75.0)
+            notes.append("device_only_at_capture")
+        else:
+            notes.append("device_only_at_capture_ignored_liveness_ok")
 
     if assessment.get("no_face_in_challenge_crop"):
         risk_parts.append(90.0)
@@ -266,13 +270,27 @@ def compute_fullframe_replay_risk(match_context: Optional[Dict[str, Any]]) -> Tu
     score = float(mc.get("fullframe_replay_score", 0.0))
     if score <= 0.01:
         return 0.0, notes
-    risk = min(100.0, score * 98.0)
+    signals = mc.get("fullframe_signals") or []
+    liveness_ok = bool(mc.get("liveness_session_verified"))
+    has_physical = has_physical_fullframe_signals(signals)
+    has_struct = has_structural_fullframe_signals(signals)
+    bezel = float(mc.get("frame_bezel", 0.0))
+    border = float(mc.get("frame_screen_border", 0.0))
+    has_physical = has_physical or bezel >= 0.45 or border >= 0.42
+
+    if liveness_ok and not has_physical:
+        return min(22.0, score * 28.0), ["fullframe_artifact_only_liveness_ok"]
+
+    if liveness_ok and not has_struct:
+        return min(28.0, score * 40.0), ["fullframe_soft_only_liveness_ok"]
+
+    risk = min(100.0, score * 88.0)
     n_sig = int(mc.get("fullframe_signal_count", 0))
-    if n_sig >= 2:
-        risk = min(100.0, risk + 8.0 * (n_sig - 1))
-        notes.append(f"fullframe_signals={n_sig}")
-    if mc.get("fullframe_replay_flag"):
-        risk = max(risk, 72.0)
+    if has_struct and n_sig >= 2:
+        risk = min(100.0, risk + 6.0 * (n_sig - 1))
+        notes.append(f"fullframe_struct_signals={n_sig}")
+    if mc.get("fullframe_replay_flag") and has_physical:
+        risk = max(risk, 68.0)
         notes.append("fullframe_replay_flag")
     return risk, notes
 
@@ -285,53 +303,66 @@ def _is_match_screen_replay(
     match_context: Optional[Dict[str, Any]] = None,
     identity_assessment: Optional[Dict[str, Any]] = None,
 ) -> bool:
-    """Phone/screen replay at selfie — multi-cue, not glare-only."""
+    """Phone/screen replay at selfie — multi-cue; trust completed liveness for live webcam."""
     mc = match_context or {}
     if not mc.get("match_selfie"):
         return False
-    if mc.get("fullframe_replay_flag"):
-        return True
-    ff = float(mc.get("fullframe_replay_score", 0.0))
-    ff_sig = int(mc.get("fullframe_signal_count", 0))
-    if ff >= 0.48:
-        return True
-    if ff >= 0.36 and ff_sig >= 3:
-        return True
-    if ff >= 0.30 and ff_sig >= 2 and (
-        factors.display_imaging_risk >= 18.0
-        or factors.pad_spoof_risk >= 32.0
-        or float(mc.get("global_moire", 0)) >= 0.24
-    ):
-        return True
     assessment = identity_assessment or {}
-    if factors.hard_device_overlap:
-        return True
+    liveness_ok = bool(mc.get("liveness_session_verified") or assessment.get("liveness_session_verified"))
     replay_devices = filter_devices_for_attack(
         devices_found, hard_overlap=factors.hard_device_overlap
     )
+    ff_signals = mc.get("fullframe_signals") or []
+    has_physical_ff = has_physical_fullframe_signals(ff_signals)
+    has_struct_ff = has_structural_fullframe_signals(ff_signals)
+    bezel_ff = float(mc.get("frame_bezel", frame_bezel_score))
+    border_ff = float(mc.get("frame_screen_border", 0.0))
+    has_physical_ff = has_physical_ff or bezel_ff >= 0.45 or border_ff >= 0.42
+
+    if factors.hard_device_overlap and replay_devices:
+        return True
+
+    if liveness_ok and not factors.hard_device_overlap:
+        if mc.get("fullframe_replay_flag") and has_physical_ff:
+            return True
+        if bezel_ff >= 0.45 or border_ff >= 0.42 or frame_bezel_score >= 0.45:
+            return True
+        phone_devices = [d for d in (replay_devices or []) if is_phone_tablet_name(d)]
+        if phone_devices and factors.device_risk >= 62.0:
+            return True
+        return False
+
+    if mc.get("fullframe_replay_flag") and has_physical_ff:
+        return True
+    ff = float(mc.get("fullframe_replay_score", 0.0))
+    ff_sig = int(mc.get("fullframe_signal_count", 0))
+    if has_physical_ff and ff >= 0.55:
+        return True
+    if has_physical_ff and ff >= 0.48 and ff_sig >= 2:
+        return True
     if assessment.get("device_only_at_capture") and not assessment.get("laptop_capture_context"):
         return True
-    if frame_bezel_score >= 0.35:
+    if frame_bezel_score >= 0.40:
         return True
     if replay_devices and (
-        factors.display_imaging_risk >= 32.0
-        or factors.pad_spoof_risk >= 50.0
-        or factors.device_risk >= 50.0
+        factors.display_imaging_risk >= 38.0
+        or factors.pad_spoof_risk >= 55.0
+        or factors.device_risk >= 55.0
     ):
         return True
-    if frame_bezel_score >= 0.38 and (
-        factors.display_imaging_risk >= 22.0 or factors.pad_spoof_risk >= 40.0
+    if frame_bezel_score >= 0.42 and (
+        factors.display_imaging_risk >= 28.0 or factors.pad_spoof_risk >= 48.0
     ):
         return True
-    if factors.device_risk >= 48.0 and factors.display_imaging_risk >= 22.0:
+    if factors.device_risk >= 52.0 and factors.display_imaging_risk >= 28.0:
         return True
-    if factors.device_risk >= 42.0 and factors.pad_spoof_risk >= 48.0:
+    if factors.device_risk >= 48.0 and factors.pad_spoof_risk >= 52.0:
         return True
     refl = str(mc.get("reflection_label") or "")
     if refl in ("phone_screen_reflection", "monitor_glare", "rectangular_source"):
-        if factors.display_imaging_risk >= 22.0 or factors.pad_spoof_risk >= 40.0:
+        if factors.display_imaging_risk >= 28.0 or factors.pad_spoof_risk >= 48.0:
             return True
-    if float(mc.get("frame_bezel", 0.0)) >= 0.35:
+    if float(mc.get("frame_bezel", 0.0)) >= 0.40:
         return True
     return False
 
@@ -345,19 +376,23 @@ def _prefer_digital_over_identity_mismatch(
     identity_assessment: Optional[Dict[str, Any]] = None,
 ) -> bool:
     """Screen replay often lowers challenge↔selfie similarity — show digital-screen error, not identity."""
+    assessment = identity_assessment or {}
+    liveness_ok = bool(assessment.get("liveness_session_verified"))
+    replay_devices = filter_devices_for_attack(devices_found, hard_overlap=False)
+    if liveness_ok and not replay_devices and frame_bezel_score < 0.42:
+        return False
     if screen_replay:
         return True
-    assessment = identity_assessment or {}
     if assessment.get("device_only_at_capture") and not assessment.get("laptop_capture_context"):
+        if not liveness_ok:
+            return True
+    if replay_devices and factors.device_risk >= 45.0:
         return True
-    replay_devices = filter_devices_for_attack(devices_found, hard_overlap=False)
-    if replay_devices and factors.device_risk >= 38.0:
+    if frame_bezel_score >= 0.38:
         return True
-    if frame_bezel_score >= 0.32:
+    if factors.device_risk >= 48.0:
         return True
-    if factors.device_risk >= 40.0:
-        return True
-    if factors.display_imaging_risk >= 24.0 and factors.pad_spoof_risk >= 38.0:
+    if factors.display_imaging_risk >= 32.0 and factors.pad_spoof_risk >= 45.0:
         return True
     return False
 
@@ -399,7 +434,20 @@ def decide_security_verdict(
         }
 
     high_count = factors.high_factor_count()
+    assessment = identity_assessment or {}
+    liveness_ok = bool(assessment.get("liveness_session_verified"))
+    replay_devices = filter_devices_for_attack(devices_found, hard_overlap=False)
     if composite_risk >= RISK_REJECT_THRESHOLD and high_count >= RISK_CONFIRM_FACTORS_MIN:
+        if liveness_ok and not replay_devices and not factors.hard_device_overlap:
+            return {
+                "verdict": "pass_penalty",
+                "composite_risk": round(composite_risk, 2),
+                "reason": f"Elevated risk {composite_risk:.0f} — liveness verified, penalty only",
+                "user_message": None,
+                "digital_media": False,
+                "user_mismatch": False,
+                "confidence_penalty": round((composite_risk - RISK_PENALTY_THRESHOLD) * 0.002, 4),
+            }
         return {
             "verdict": "reject",
             "composite_risk": round(composite_risk, 2),
@@ -473,7 +521,9 @@ def evaluate_match_security(
     match_selfie = bool(mc.get("match_selfie"))
 
     replay_devices = filter_devices_for_attack(
-        devices_found, hard_overlap=device_hard_overlap
+        devices_found,
+        hard_overlap=device_hard_overlap,
+        device_replay_score=device_replay_score,
     )
     dr, n1 = compute_device_risk(
         device_replay_score,

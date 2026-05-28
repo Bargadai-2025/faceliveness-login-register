@@ -698,6 +698,11 @@ async def match_face(
             penalties_breakdown=penalties_breakdown,
             identity_assessment=identity_assessment,
             stream_risk_ema=stream_risk_ema,
+            liveness_session_verified=bool(
+                mem_sess_verify
+                and getattr(mem_sess_verify, "all_gestures_done", False)
+                and getattr(mem_sess_verify, "step", "") in ("complete", "capture", "verified")
+            ),
         )
         if sec.get("error"):
             out = {

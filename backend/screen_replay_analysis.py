@@ -27,9 +27,48 @@ def _f(name: str, default: float) -> float:
         return default
 
 
-MATCH_FULLFRAME_HARD_REJECT = _f("MATCH_FULLFRAME_HARD_REJECT", 0.48)
-MATCH_FULLFRAME_SCREEN_REPLAY = _f("MATCH_FULLFRAME_SCREEN_REPLAY", 0.36)
-MATCH_FULLFRAME_MIN_SIGNALS = int(_f("MATCH_FULLFRAME_MIN_SIGNALS", 3))
+MATCH_FULLFRAME_HARD_REJECT = _f("MATCH_FULLFRAME_HARD_REJECT", 0.58)
+MATCH_FULLFRAME_SCREEN_REPLAY = _f("MATCH_FULLFRAME_SCREEN_REPLAY", 0.50)
+MATCH_FULLFRAME_MIN_SIGNALS = int(_f("MATCH_FULLFRAME_MIN_SIGNALS", 2))
+
+STRUCTURAL_FULLFRAME_SIGNALS = frozenset({
+    "phone_bezel",
+    "screen_border",
+    "scanline_banding",
+    "blur_plus_moire",
+    "soft_face_on_screen",
+})
+
+# Visible phone/monitor frame — reliable replay cue; artifact signals alone false-positive on webcam.
+PHYSICAL_FULLFRAME_SIGNALS = frozenset({
+    "phone_bezel",
+    "screen_border",
+})
+
+ARTIFACT_FULLFRAME_SIGNALS = frozenset({
+    "scanline_banding",
+    "blur_plus_moire",
+    "soft_face_on_screen",
+})
+
+SOFT_FULLFRAME_SIGNALS = frozenset({
+    "moire",
+    "multi_region_moire",
+    "flat_panel_lighting",
+    "flat_regions",
+})
+
+
+def has_structural_fullframe_signals(signals) -> bool:
+    return bool(set(signals or []) & STRUCTURAL_FULLFRAME_SIGNALS)
+
+
+def has_physical_fullframe_signals(signals) -> bool:
+    return bool(set(signals or []) & PHYSICAL_FULLFRAME_SIGNALS)
+
+
+def has_artifact_fullframe_signals(signals) -> bool:
+    return bool(set(signals or []) & ARTIFACT_FULLFRAME_SIGNALS)
 
 
 def normalize_via_png(img_bgr: np.ndarray) -> np.ndarray:
@@ -231,15 +270,15 @@ def analyze_fullframe_screen_replay(
         signals.append("moire")
     if float(best.get("moire_regions_high", 0)) >= 0.44:
         signals.append("multi_region_moire")
-    if global_banding >= 0.26 or float(best.get("banding_max", 0)) >= 0.30:
+    if global_banding >= 0.36 or float(best.get("banding_max", 0)) >= 0.40:
         signals.append("scanline_banding")
     if bezel >= 0.30:
         signals.append("phone_bezel")
     if border >= 0.28:
         signals.append("screen_border")
-    if global_blur >= 0.38 and global_moire >= 0.20:
+    if global_blur >= 0.45 and global_moire >= 0.28:
         signals.append("blur_plus_moire")
-    if face_blur >= 0.35 and global_moire >= 0.18:
+    if face_blur >= 0.48 and global_moire >= 0.26:
         signals.append("soft_face_on_screen")
     if light_uniform >= 0.42:
         signals.append("flat_panel_lighting")
@@ -247,17 +286,20 @@ def analyze_fullframe_screen_replay(
         signals.append("flat_regions")
 
     replay_likelihood = (
-        0.22 * max(global_moire, float(best.get("moire_max", 0)))
-        + 0.14 * float(best.get("moire_mean", 0))
-        + 0.12 * max(global_banding, float(best.get("banding_max", 0)))
-        + 0.14 * bezel
-        + 0.10 * border
-        + 0.10 * global_blur
-        + 0.08 * face_blur
-        + 0.10 * light_uniform
+        0.10 * max(global_moire, float(best.get("moire_max", 0)))
+        + 0.08 * float(best.get("moire_mean", 0))
+        + 0.14 * max(global_banding, float(best.get("banding_max", 0)))
+        + 0.18 * bezel
+        + 0.14 * border
+        + 0.06 * global_blur
+        + 0.12 * face_blur
+        + 0.04 * light_uniform
     )
-    if len(signals) >= 2:
-        replay_likelihood += 0.06 * (len(signals) - 1)
+    struct_count = len(signals)
+    if has_structural_fullframe_signals(signals):
+        replay_likelihood += 0.08 * struct_count
+    elif struct_count >= 2:
+        replay_likelihood += 0.03 * (struct_count - 1)
     replay_likelihood = float(min(1.0, replay_likelihood))
 
     return {
@@ -277,31 +319,39 @@ def analyze_fullframe_screen_replay(
     }
 
 
-def is_fullframe_screen_replay(report: Dict[str, Any]) -> bool:
-    """Hard screen-replay decision — needs structural cues, not moiré noise alone."""
+def is_fullframe_screen_replay(
+    report: Dict[str, Any],
+    *,
+    liveness_verified: bool = False,
+) -> bool:
+    """Hard screen-replay — physical frame cues required when liveness already passed."""
     score = float(report.get("replay_likelihood", 0))
     n_sig = int(report.get("signal_count", 0))
     signals = set(report.get("signals") or [])
-    structural = {
-        "phone_bezel",
-        "screen_border",
-        "scanline_banding",
-        "blur_plus_moire",
-        "soft_face_on_screen",
-    }
-    has_struct = bool(signals & structural)
-    moire_tags = {"moire", "multi_region_moire", "flat_panel_lighting", "flat_regions"}
+    bezel = float(report.get("bezel_score", 0.0))
+    border = float(report.get("screen_border_score", 0.0))
+    has_physical = has_physical_fullframe_signals(signals) or bezel >= 0.45 or border >= 0.42
+    has_struct = has_structural_fullframe_signals(signals)
 
-    if has_struct and score >= MATCH_FULLFRAME_HARD_REJECT:
+    if liveness_verified and not has_physical:
+        return False
+    if not has_struct:
+        return False
+
+    if score >= MATCH_FULLFRAME_HARD_REJECT and has_physical:
         return True
-    if has_struct and score >= MATCH_FULLFRAME_SCREEN_REPLAY and n_sig >= MATCH_FULLFRAME_MIN_SIGNALS:
+    if (
+        score >= MATCH_FULLFRAME_SCREEN_REPLAY
+        and n_sig >= MATCH_FULLFRAME_MIN_SIGNALS
+        and has_physical
+    ):
         return True
-    if "phone_bezel" in signals and score >= 0.42:
+    if "phone_bezel" in signals and score >= 0.48:
         return True
-    if "soft_face_on_screen" in signals and score >= 0.48:
+    if "screen_border" in signals and score >= 0.50 and border >= 0.35:
         return True
-    if "blur_plus_moire" in signals and score >= 0.44:
+    if "soft_face_on_screen" in signals and score >= 0.58 and has_physical:
         return True
-    if score >= 0.65 and n_sig >= 4 and signals & moire_tags and len(signals - moire_tags) >= 1:
+    if "blur_plus_moire" in signals and score >= 0.55 and has_physical:
         return True
     return False

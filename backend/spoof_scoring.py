@@ -144,12 +144,33 @@ def has_display_attack_corroboration(
     # POST /match only — stricter phone-replay rules; liveness stream passes match_context=None
     if mc.get("match_selfie"):
         ff_score = float(mc.get("fullframe_replay_score", 0.0))
-        if mc.get("fullframe_replay_flag"):
+        ff_signals = mc.get("fullframe_signals") or []
+        liveness_ok = bool(mc.get("liveness_session_verified"))
+        from screen_replay_analysis import has_physical_fullframe_signals
+
+        bezel_ff = float(mc.get("frame_bezel", 0.0))
+        border_ff = float(mc.get("frame_screen_border", 0.0))
+        has_physical_ff = (
+            has_physical_fullframe_signals(ff_signals)
+            or bezel_ff >= 0.45
+            or border_ff >= 0.42
+        )
+
+        if mc.get("fullframe_replay_flag") and has_physical_ff:
             return True
-        if ff_score >= 0.50:
+        if liveness_ok:
+            if devices_found:
+                return True
+            if device_replay_score >= 0.22:
+                return True
+            if has_physical_ff and ff_score >= 0.52:
+                return True
+            # Do not unlock display path from moiré/artifact-only on verified liveness webcam
+        elif ff_score >= 0.55 and has_physical_ff:
             return True
-        if ff_score >= 0.42 and int(mc.get("fullframe_signal_count", 0)) >= 3:
-            return True
+        elif ff_score >= 0.48 and int(mc.get("fullframe_signal_count", 0)) >= 2:
+            if has_physical_ff:
+                return True
         bezel = float(mc.get("frame_bezel", 0.0))
         screen_border = float(mc.get("frame_screen_border", 0.0))
         refl = str(mc.get("reflection_label") or "")
@@ -171,7 +192,8 @@ def has_display_attack_corroboration(
         if bezel >= 0.32 and (moire >= 0.22 or tex >= 0.30):
             return True
         if count_display_imaging_signals(per_signal, threshold=0.28) >= 2:
-            return True
+            if not liveness_ok or has_physical_ff:
+                return True
         if hi >= 0.42 and (moire >= 0.26 or grid >= 0.26):
             return True
 
