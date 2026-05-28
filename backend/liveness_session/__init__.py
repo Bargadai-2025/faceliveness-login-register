@@ -10,15 +10,17 @@ import numpy as np
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any, Tuple
 
-# ── Full gesture pool (25 gestures) ──
+# Must match frontend CHALLENGE_UI (FaceMatch.jsx / FaceRegister.jsx) — 3 picked per session.
 ALL_GESTURE_IDS = [
-    "turn_left", "turn_right", "nod", "look_up", "smile",
-    "mouth_open", 
-    # "blink_both", 
-     "move_closer", "move_farther", "shake_head", "look_left_hold", "look_right_hold", "look_up_hold",
+    "turn_left",
+    "turn_right",
+    "smile",
+    "mouth_open",
+    "move_closer",
+    "move_farther",
+    "shake_head",
+    "look_up_hold",
     "look_down_hold",
-    #  "head_forward", "head_backward",
-    # "raise_eyebrows_hold",
 ]
 
 LIGHT_CHALLENGES = ["white_flash", "blue_flash", "green_flash", "brightness_up", "brightness_down"]
@@ -70,6 +72,8 @@ class LivenessSession:
     gesture_instruction_time: Optional[float] = None
     is_transitioning: bool = False
     gesture_challenge_baseline: Optional[Dict[str, Any]] = None
+    gesture_turn_peak: float = 0.0
+    gesture_pitch_peak: float = 0.0
 
     # Timing
     reaction_times: List[float] = field(default_factory=list)
@@ -180,6 +184,8 @@ class LivenessSession:
         self.was_blink_closed = False
         self.hold_start_time = None
         self.gesture_challenge_baseline = None
+        self.gesture_turn_peak = 0.0
+        self.gesture_pitch_peak = 0.0
         self.gesture_instruction_time = time.time()
         self.is_transitioning = True  # Mark as transitioning
         if self.all_gestures_done:

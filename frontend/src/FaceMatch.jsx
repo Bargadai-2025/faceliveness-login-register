@@ -1302,6 +1302,7 @@ import { getApiBase } from "./apiBase";
 import { getCoverSourceRect } from "./cameraDrawUtils";
 import {
   MATCH_REQUEST_TIMEOUT_MS,
+  isReplayDeviceAlert,
   matchFetchErrorMessage,
   startIndeterminateMatchProgress,
 } from "./matchUiUtils";
@@ -1404,7 +1405,7 @@ const CHALLENGE_UI = {
   move_farther: { label: "Move Away", icon: Maximize },
   shake_head: { label: "Shake head left & right (NO)", icon: Activity },
   look_up_hold: { label: "Look Up", icon: ArrowUp },
-  look_down_hold: { label: "Look Down", icon: ArrowDown },
+  look_down_hold: { label: "Slightly Look Down", icon: ArrowDown },
 };
 
 // 68-pt landmark segment indices (MediaPipe → 68 mapping on server)
@@ -1601,7 +1602,12 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
     livenessSessionIdRef.current = null;
     livenessCompletedRef.current = false;
     setLivenessStep("idle");
+    setCompletedChallenges([]);
+    setChallengeIndex(0);
+    prevGestureIdxRef.current = 0;
+    setShowCamera(false);
     sessionStorage.removeItem("liveness_ref_photo");
+    // Keep security `error` visible until user taps RESTART; startCamera clears it.
   }, []);
 
   const matchRetriesRef = useRef(0);
@@ -2083,19 +2089,7 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
         setLivenessLive(true);
       }
     }
-    const deviceNames = Array.isArray(data.devices_detected)
-      ? data.devices_detected.join(", ")
-      : "";
-    const deviceDetail = (data.detail || "").toLowerCase();
-    const isDeviceAlert =
-      data.is_suspicious &&
-      (data.display_attack ||
-        deviceNames ||
-        deviceDetail.includes("device") ||
-        deviceDetail.includes("phone") ||
-        deviceDetail.includes("tablet") ||
-        deviceDetail.includes("laptop") ||
-        deviceDetail.includes("electronic"));
+    const isDeviceAlert = isReplayDeviceAlert(data);
 
     if (isDeviceAlert) {
       applySecurityError(data.detail, { digitalMedia: true });
@@ -2659,6 +2653,11 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
   };
 
   const handleReload = () => {
+    setError(null);
+    setCaptureLiveFailure(null);
+    setCompletedChallenges([]);
+    setChallengeIndex(0);
+    stopCamera();
     window.location.reload();
   };
 

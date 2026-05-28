@@ -19,6 +19,12 @@ from spoof_scoring import (
 )
 from liveness_risk_engine import evaluate_match_security
 from screen_frame_detection import analyze_match_frame_context
+from screen_replay_analysis import analyze_fullframe_screen_replay, is_fullframe_screen_replay
+from device_filter import (
+    adjust_device_replay_score,
+    filter_devices_for_attack,
+    is_laptop_only_devices,
+)
 
 # Screen-like reflection labels from spoof_scoring.classify_reflection
 SCREEN_REFLECTION_LABELS = frozenset({
@@ -339,34 +345,63 @@ def run_post_selfie_security(
             conf=cfg["yolo_conf"],
             hard_iou=cfg["device_hard_iou"],
         )
-        device_replay_score = dr
-        print(f"🔒 YOLO selfie scan: risk={dr:.3f}, hard_overlap={device_hard}, devices={devices_found}")
+        device_replay_score = adjust_device_replay_score(
+            dr, devices_found, hard_overlap=device_hard
+        )
+        devices_for_attack = filter_devices_for_attack(
+            devices_found, hard_overlap=device_hard
+        )
+        if is_laptop_only_devices(devices_found) and not device_hard:
+            print(
+                f"💻 Laptop capture context (ambient): YOLO saw {devices_found}, "
+                "not treating as replay device"
+            )
+        print(
+            f"🔒 YOLO selfie scan: risk={device_replay_score:.3f}, "
+            f"hard_overlap={device_hard}, devices={devices_for_attack or devices_found}"
+        )
 
-        if dr > cfg["device_near_face_dr"]:
-            print(f"⚠️ Device near face: risk={dr:.3f}")
+        if device_replay_score > cfg["device_near_face_dr"] and devices_for_attack:
+            print(f"⚠️ Device near face: risk={device_replay_score:.3f}")
             errcount += cfg["errcount_device_near_face"]
             penalties_breakdown.append({
                 "type": "Electronic Device Near Face",
                 "penalty": round(cfg["errcount_device_near_face"] * 0.01, 2),
                 "count": 1,
-                "detail": f"Device near face (risk={dr:.2f})" + (
-                    f": {', '.join(devices_found)}" if devices_found else ""
-                ),
+                "detail": f"Device near face (risk={device_replay_score:.2f}): "
+                f"{', '.join(devices_for_attack)}",
             })
-        elif devices_found:
+        elif devices_for_attack:
             errcount += cfg["errcount_device_in_frame"]
             penalties_breakdown.append({
                 "type": "Electronic Device In Frame",
                 "penalty": round(cfg["errcount_device_in_frame"] * 0.01, 2),
                 "count": 1,
-                "detail": f"Detected: {', '.join(devices_found)}",
+                "detail": f"Detected: {', '.join(devices_for_attack)}",
             })
 
-    bezel_score, frame_screen_border = analyze_match_frame_context(img_raw)
+    face_bbox_match = face_bbox
+    fullframe_report = analyze_fullframe_screen_replay(
+        img_raw, face_bbox=face_bbox_match
+    )
+    bezel_score = float(fullframe_report.get("bezel_score", 0.0))
+    frame_screen_border = float(fullframe_report.get("screen_border_score", 0.0))
+    fullframe_replay_score = float(fullframe_report.get("replay_likelihood", 0.0))
+    fullframe_replay = is_fullframe_screen_replay(fullframe_report)
+
+    if fullframe_replay_score >= 0.28:
+        print(
+            f"🖥️ Full-frame screen replay: {fullframe_replay_score:.3f} "
+            f"signals={fullframe_report.get('signals')}"
+        )
     if bezel_score >= 0.35:
         print(f"📱 Frame bezel score: {bezel_score:.3f}")
     if frame_screen_border >= 0.35:
         print(f"🖥️ Frame screen-border score: {frame_screen_border:.3f}")
+
+    devices_for_security = filter_devices_for_attack(
+        devices_found, hard_overlap=bool(device_hard)
+    )
 
     extra_signals: Dict[str, float] = {}
     if device_replay_score > 0.01:
@@ -375,6 +410,8 @@ def run_post_selfie_security(
         extra_signals["frame_bezel"] = bezel_score
     if frame_screen_border > 0.05:
         extra_signals["frame_screen_border"] = frame_screen_border
+    if fullframe_replay_score > 0.05:
+        extra_signals["fullframe_replay"] = fullframe_replay_score
 
     spoof_detail = analyze_passive_spoof_single_frame(
         img_raw,
@@ -390,15 +427,22 @@ def run_post_selfie_security(
         "match_selfie": True,
         "frame_bezel": bezel_score,
         "frame_screen_border": frame_screen_border,
+        "fullframe_replay_score": fullframe_replay_score,
+        "fullframe_signal_count": int(fullframe_report.get("signal_count", 0)),
+        "fullframe_signals": list(fullframe_report.get("signals") or []),
+        "fullframe_replay_flag": fullframe_replay,
+        "global_moire": float(fullframe_report.get("global_moire", 0.0)),
+        "global_banding": float(fullframe_report.get("global_banding", 0.0)),
         "reflection_label": reflection_label,
-        "devices_found_list": list(devices_found),
+        "devices_found_list": list(devices_for_security),
+        "laptop_capture_context": is_laptop_only_devices(devices_found),
     }
     light_issues = check_face_environment_light(
         img_raw,
         face_landmarks_mp,
         cfg,
         spoof_per_signal=per_signal,
-        devices_found=devices_found,
+        devices_found=devices_for_security,
         device_replay_score=device_replay_score,
         match_context=match_context,
     )
@@ -417,12 +461,17 @@ def run_post_selfie_security(
         "Weighted spoof: " + ", ".join(triggered_rules)[:220]
     )
 
+    effective_hard_overlap = bool(device_hard) and bool(devices_for_security)
+    identity_merged = dict(identity_assessment or {})
+    if match_context.get("laptop_capture_context"):
+        identity_merged["laptop_capture_context"] = True
+
     security = evaluate_match_security(
         spoof_detail=spoof_detail,
         device_replay_score=device_replay_score,
-        devices_found=devices_found,
-        device_hard_overlap=bool(device_hard),
-        identity_assessment=identity_assessment,
+        devices_found=devices_for_security,
+        device_hard_overlap=effective_hard_overlap,
+        identity_assessment=identity_merged,
         errcount=errcount,
         stream_risk_ema=stream_risk_ema,
         match_context=match_context,
@@ -443,9 +492,21 @@ def run_post_selfie_security(
         "detail": f"Composite {composite_risk:.0f}/100 — {security.get('reason', '')}",
     })
 
+    if fullframe_replay and verdict != "reject":
+        verdict = "reject"
+        security = dict(security)
+        security["verdict"] = "reject"
+        security["screen_replay"] = True
+        security["digital_media"] = True
+        security["reason"] = (
+            f"Full-frame screen replay ({fullframe_replay_score:.2f}): "
+            f"{', '.join(fullframe_report.get('signals') or [])}"
+        )
+        composite_risk = max(composite_risk, float(security.get("composite_risk", 0)))
+
     if verdict == "reject":
-        screen_replay = bool(security.get("screen_replay"))
-        digital_media = bool(security.get("digital_media", screen_replay))
+        screen_replay = bool(security.get("screen_replay")) or fullframe_replay
+        digital_media = bool(security.get("digital_media", screen_replay)) or fullframe_replay
         if screen_replay or digital_media:
             msg = (
                 "Security Alert: Digital screen or photo replay detected. "

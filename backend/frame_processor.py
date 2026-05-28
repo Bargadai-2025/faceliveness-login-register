@@ -25,7 +25,9 @@ from face_detection import (
 )
 from liveness_checks import (
     analyze_true_3d_deformation, check_micro_expressions,
-    analyze_active_spectral_reflectance, evaluate_gesture, SUSTAINED_FRAMES,
+    analyze_active_spectral_reflectance,
+    evaluate_gesture,
+    sustain_frames_for_gesture,
     build_pose_snapshot,
     parallax_replay_risk,
     biological_motion_replay_risk,
@@ -44,6 +46,11 @@ from spoof_scoring import (
     count_display_imaging_signals,
 )
 from challenge_frame_verification import capture_challenge_frame
+from device_filter import (
+    adjust_device_replay_score,
+    filter_devices_for_attack,
+    should_raise_liveness_device_alert,
+)
 
 # ── YOLO device detection ──
 _yolo_model = None
@@ -81,6 +88,8 @@ def _begin_gesture_phase(session: LivenessSession, pts_68, pts_478) -> Dict[str,
     session.gesture_instruction_time = time.time()
     session.is_transitioning = True
     session.gesture_challenge_baseline = None
+    session.gesture_turn_peak = 0.0
+    session.gesture_pitch_peak = 0.0
     session.gesture_sustain_count = 0
     session.shake_history = []
     session.shake_completed = False
@@ -351,26 +360,40 @@ def process_frame(session: LivenessSession, frame_bytes: bytes, identity_callbac
                 img, face_bbox, w, h, yolo
             )
             if device_hard:
-                names = ", ".join(devices_found) if devices_found else "device"
+                attack_hard = filter_devices_for_attack(
+                    devices_found, hard_overlap=True
+                )
+                if attack_hard:
+                    names = ", ".join(attack_hard)
+                    return _device_alert_response(
+                        session,
+                        pts_68,
+                        pts_478,
+                        f"Security Alert: {names} overlapping face — remove from view",
+                        attack_hard,
+                        dr,
+                        hard_overlap=True,
+                    )
+                device_hard = False
+            dr = adjust_device_replay_score(dr, devices_found, hard_overlap=device_hard)
+            raise_alert, alert_devices = should_raise_liveness_device_alert(
+                devices_found,
+                dr,
+                device_visible=device_visible,
+                hard_overlap=device_hard,
+                near_face_threshold=DEVICE_NEAR_FACE_DR,
+            )
+            if raise_alert and alert_devices:
+                names = ", ".join(alert_devices)
                 return _device_alert_response(
                     session,
                     pts_68,
                     pts_478,
-                    f"Security Alert: {names} overlapping face — remove from view",
-                    devices_found,
-                    dr,
-                    hard_overlap=True,
-                )
-            if devices_found and (dr >= DEVICE_NEAR_FACE_DR or device_visible):
-                return _device_alert_response(
-                    session,
-                    pts_68,
-                    pts_478,
-                    # f"Electronic device detected ({', '.join(devices_found)}) — move away from camera",
-                    f"Electronic device detected (Mobile phone) — move away from camera",
-                    devices_found,
+                    f"Electronic device detected ({names}) — move away from camera",
+                    alert_devices,
                     dr,
                 )
+            devices_found = filter_devices_for_attack(devices_found, hard_overlap=device_hard)
 
         if _should_run_full_spoof_pipeline(session):
             env_auth = check_background_parallax(
@@ -438,12 +461,15 @@ def process_frame(session: LivenessSession, frame_bytes: bytes, identity_callbac
                 triggered_rules = list(spoof_report.get("triggered_rules") or [])
                 per_sig = spoof_report.get("confidence_per_signal") or {}
                 imaging_count = count_display_imaging_signals(per_sig, threshold=0.38)
-                display_attack = bool(devices_found) or (
+                attack_devices = filter_devices_for_attack(
+                    devices_found, hard_overlap=False
+                )
+                display_attack = bool(attack_devices) or (
                     has_display_attack_corroboration(
                         per_sig,
                         triggered_rules,
                         device_replay_score=dr,
-                        devices_found=devices_found,
+                        devices_found=attack_devices or None,
                     )
                     and (
                         imaging_count >= 2
@@ -705,6 +731,15 @@ def process_frame(session: LivenessSession, frame_bytes: bytes, identity_callbac
                 "mesh": landmarks_to_serializable(pts_478),
             }
         elif session.is_transitioning:
+            # Capture neutral pose at challenge start (before user turns).
+            if session.gesture_challenge_baseline is None and session.baseline:
+                session.gesture_challenge_baseline = build_pose_snapshot(
+                    pts_68, session.baseline
+                )
+                session.gesture_sustain_count = 0
+                session.gesture_turn_peak = 0.0
+                session.gesture_pitch_peak = 0.0
+
             elapsed = time.time() - session.gesture_instruction_time
             extra_cooldown = GESTURE_COOLDOWN if session.current_gesture_idx > 0 else 0.0
             wait_sec = GESTURE_INSTRUCTION_SEC + extra_cooldown
@@ -725,11 +760,6 @@ def process_frame(session: LivenessSession, frame_bytes: bytes, identity_callbac
                     "mesh": landmarks_to_serializable(pts_478),
                     "gesture_prep": True,
                 }
-            if session.gesture_challenge_baseline is None and session.baseline:
-                session.gesture_challenge_baseline = build_pose_snapshot(
-                    pts_68, session.baseline
-                )
-                session.gesture_sustain_count = 0
             session.is_transitioning = False
 
         gesture = session.current_gesture
@@ -737,7 +767,8 @@ def process_frame(session: LivenessSession, frame_bytes: bytes, identity_callbac
             passed = evaluate_gesture(gesture, pts_68, session.baseline, session)
             if passed:
                 session.gesture_sustain_count += 1
-                if session.gesture_sustain_count >= SUSTAINED_FRAMES:
+                need_frames = sustain_frames_for_gesture(gesture)
+                if session.gesture_sustain_count >= need_frames:
                     capture_challenge_frame(
                         session,
                         img,

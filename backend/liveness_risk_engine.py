@@ -17,6 +17,7 @@ from spoof_scoring import (
     count_display_imaging_signals,
     has_display_attack_corroboration,
 )
+from device_filter import filter_devices_for_attack
 
 
 def _f(name: str, default: float) -> float:
@@ -164,6 +165,10 @@ def compute_display_imaging_risk(
         if bezel >= 0.38:
             fusion = min(100.0, fusion + 12.0 + bezel * 15.0)
             notes.append("match_bezel_imaging_boost")
+        ff_risk, ff_notes = compute_fullframe_replay_risk(mc)
+        if ff_risk > 0:
+            fusion = max(fusion, ff_risk)
+            notes.extend(ff_notes)
 
     return float(min(100.0, fusion)), notes
 
@@ -218,7 +223,7 @@ def compute_identity_continuity_risk(assessment: Dict[str, Any]) -> Tuple[float,
             risk_parts.append(min(100.0, drift * 120.0))
             notes.append(f"ratio_drift={drift:.3f}")
 
-    if assessment.get("device_only_at_capture"):
+    if assessment.get("device_only_at_capture") and not assessment.get("laptop_capture_context"):
         risk_parts.append(75.0)
         notes.append("device_only_at_capture")
 
@@ -254,6 +259,24 @@ _DIGITAL_SCREEN_USER_MESSAGE = (
 )
 
 
+def compute_fullframe_replay_risk(match_context: Optional[Dict[str, Any]]) -> Tuple[float, List[str]]:
+    """Risk from PNG-normalized multi-region full-frame screen analysis."""
+    mc = match_context or {}
+    notes: List[str] = []
+    score = float(mc.get("fullframe_replay_score", 0.0))
+    if score <= 0.01:
+        return 0.0, notes
+    risk = min(100.0, score * 98.0)
+    n_sig = int(mc.get("fullframe_signal_count", 0))
+    if n_sig >= 2:
+        risk = min(100.0, risk + 8.0 * (n_sig - 1))
+        notes.append(f"fullframe_signals={n_sig}")
+    if mc.get("fullframe_replay_flag"):
+        risk = max(risk, 72.0)
+        notes.append("fullframe_replay_flag")
+    return risk, notes
+
+
 def _is_match_screen_replay(
     factors: RiskFactors,
     *,
@@ -266,17 +289,31 @@ def _is_match_screen_replay(
     mc = match_context or {}
     if not mc.get("match_selfie"):
         return False
-    assessment = identity_assessment or {}
-    # Phone visible only at selfie (classic replay) — not an identity swap
-    if assessment.get("device_only_at_capture"):
+    if mc.get("fullframe_replay_flag"):
         return True
+    ff = float(mc.get("fullframe_replay_score", 0.0))
+    ff_sig = int(mc.get("fullframe_signal_count", 0))
+    if ff >= 0.48:
+        return True
+    if ff >= 0.36 and ff_sig >= 3:
+        return True
+    if ff >= 0.30 and ff_sig >= 2 and (
+        factors.display_imaging_risk >= 18.0
+        or factors.pad_spoof_risk >= 32.0
+        or float(mc.get("global_moire", 0)) >= 0.24
+    ):
+        return True
+    assessment = identity_assessment or {}
     if factors.hard_device_overlap:
         return True
-    if devices_found:
+    replay_devices = filter_devices_for_attack(
+        devices_found, hard_overlap=factors.hard_device_overlap
+    )
+    if assessment.get("device_only_at_capture") and not assessment.get("laptop_capture_context"):
         return True
     if frame_bezel_score >= 0.35:
         return True
-    if devices_found and (
+    if replay_devices and (
         factors.display_imaging_risk >= 32.0
         or factors.pad_spoof_risk >= 50.0
         or factors.device_risk >= 50.0
@@ -311,9 +348,10 @@ def _prefer_digital_over_identity_mismatch(
     if screen_replay:
         return True
     assessment = identity_assessment or {}
-    if assessment.get("device_only_at_capture"):
+    if assessment.get("device_only_at_capture") and not assessment.get("laptop_capture_context"):
         return True
-    if devices_found:
+    replay_devices = filter_devices_for_attack(devices_found, hard_overlap=False)
+    if replay_devices and factors.device_risk >= 38.0:
         return True
     if frame_bezel_score >= 0.32:
         return True
@@ -434,10 +472,13 @@ def evaluate_match_security(
     mc = match_context or {}
     match_selfie = bool(mc.get("match_selfie"))
 
+    replay_devices = filter_devices_for_attack(
+        devices_found, hard_overlap=device_hard_overlap
+    )
     dr, n1 = compute_device_risk(
         device_replay_score,
         hard_overlap=device_hard_overlap,
-        devices_found=devices_found,
+        devices_found=replay_devices or None,
         match_selfie=match_selfie,
         frame_bezel_score=frame_bezel_score,
     )
@@ -448,7 +489,7 @@ def evaluate_match_security(
         spoof_detail,
         match_context=match_context,
         device_replay_score=device_replay_score,
-        devices_found=devices_found,
+        devices_found=replay_devices or None,
     )
     factors.pad_spoof_risk = pad
     factors.factor_notes.extend(n2)
@@ -456,11 +497,16 @@ def evaluate_match_security(
     disp, n3 = compute_display_imaging_risk(
         spoof_detail,
         device_replay_score=device_replay_score,
-        devices_found=devices_found,
+        devices_found=replay_devices or None,
         match_context=match_context,
     )
     factors.display_imaging_risk = disp
     factors.factor_notes.extend(n3)
+
+    ff_only, n_ff = compute_fullframe_replay_risk(match_context)
+    if ff_only > factors.display_imaging_risk:
+        factors.display_imaging_risk = ff_only
+        factors.factor_notes.extend(n_ff)
 
     ident, n4 = compute_identity_continuity_risk(identity_assessment)
     factors.identity_continuity_risk = ident
@@ -471,20 +517,24 @@ def evaluate_match_security(
     factors.factor_notes.extend(n5)
 
     composite = fuse_composite_risk(factors)
+    identity_with_laptop = dict(identity_assessment)
+    if match_context.get("laptop_capture_context"):
+        identity_with_laptop["laptop_capture_context"] = True
+
     screen_replay = _is_match_screen_replay(
         factors,
-        devices_found=devices_found,
+        devices_found=replay_devices,
         frame_bezel_score=frame_bezel_score,
         match_context=match_context,
-        identity_assessment=identity_assessment,
+        identity_assessment=identity_with_laptop,
     )
     decision = decide_security_verdict(
         factors,
         composite,
         screen_replay=screen_replay,
-        devices_found=devices_found,
+        devices_found=replay_devices,
         frame_bezel_score=frame_bezel_score,
-        identity_assessment=identity_assessment,
+        identity_assessment=identity_with_laptop,
     )
     decision["screen_replay"] = screen_replay
     decision["risk_factors"] = factors.to_dict()

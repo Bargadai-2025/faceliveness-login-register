@@ -51,3 +51,24 @@ export async function parseJsonResponse(res) {
 export function isRetryAllowed(data) {
   return Boolean(data?.retry_allowed);
 }
+
+/** True when backend completed registration (handles 200 + success or legacy shape). */
+export function isRegistrationSuccess(data, res) {
+  if (!res?.ok) return false;
+  if (data?.success === true) return true;
+  if (data?.error) return false;
+  return Boolean(data?.face_label || data?.email || data?.message);
+}
+
+export function parseRegisterFailureMessage(res, data) {
+  if (res?.status === 404 || data?.detail === "Not Found") {
+    return (
+      "Register API not found. Start the backend (uvicorn on port 8000) " +
+      "or set VITE_API_URL for production."
+    );
+  }
+  if (res?.status >= 500) {
+    return parseApiDetail(data, "Server error during registration. Please try again shortly.");
+  }
+  return parseApiDetail(data, "Registration failed. Please try again.");
+}

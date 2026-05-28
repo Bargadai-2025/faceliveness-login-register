@@ -13,6 +13,7 @@ import cv2
 import numpy as np
 
 from face_detection import get_face_roi
+from device_filter import filter_devices_for_attack, is_laptop_only_devices
 
 
 def _f(name: str, default: float) -> float:
@@ -113,7 +114,7 @@ def capture_challenge_frame(
     )
     session.challenge_snapshots.append(snap)
 
-    for d in snap.devices_in_frame:
+    for d in filter_devices_for_attack(snap.devices_in_frame, hard_overlap=False):
         if d not in session.challenge_devices_seen:
             session.challenge_devices_seen.append(d)
 
@@ -190,8 +191,12 @@ def assess_challenge_continuity(
         out["face_ratio_drift"] = abs(selfie_ratio - med_ratio) / (med_ratio + 1e-6)
 
     challenge_devices = set(getattr(session, "challenge_devices_seen", []) or [])
-    selfie_devs = set(selfie_devices or [])
-    out["device_only_at_capture"] = bool(not challenge_devices and selfie_devs)
+    selfie_devs = list(selfie_devices or [])
+    selfie_replay = filter_devices_for_attack(selfie_devs, hard_overlap=False)
+    challenge_replay = filter_devices_for_attack(list(challenge_devices), hard_overlap=False)
+    out["device_only_at_capture"] = bool(not challenge_replay and selfie_replay)
+    if is_laptop_only_devices(selfie_devs) and not selfie_replay:
+        out["laptop_capture_context"] = True
 
     return out
 

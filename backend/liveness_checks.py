@@ -15,18 +15,129 @@ from face_detection import (
 )
 
 SUSTAINED_FRAMES = int(os.getenv("LIVENESS_SUSTAINED_FRAMES", "5"))
-HOLD_DURATION_SEC = float(os.getenv("LIVENESS_HOLD_DURATION_SEC", "0.22"))
-GESTURE_INSTRUCTION_SEC = float(os.getenv("LIVENESS_GESTURE_INSTRUCTION_SEC", "0.45"))
+TURN_SUSTAINED_FRAMES = int(os.getenv("LIVENESS_TURN_SUSTAINED_FRAMES", "2"))
+TURN_YAW_FRAC = float(os.getenv("LIVENESS_TURN_YAW_FRAC", "0.032"))
+TURN_YAW_MIN_PX = float(os.getenv("LIVENESS_TURN_YAW_MIN_PX", "3"))
+# Set LIVENESS_TURN_MIRROR=1 only if left/right challenges feel reversed on your camera.
+TURN_MIRROR = os.getenv("LIVENESS_TURN_MIRROR", "0").strip().lower() in ("1", "true", "yes")
+PITCH_FRAC = float(os.getenv("LIVENESS_PITCH_FRAC", "0.028"))
+PITCH_MIN_PX = float(os.getenv("LIVENESS_PITCH_MIN_PX", "2.5"))
+HOLD_DURATION_SEC = float(os.getenv("LIVENESS_HOLD_DURATION_SEC", "0.10"))
+GESTURE_INSTRUCTION_SEC = float(os.getenv("LIVENESS_GESTURE_INSTRUCTION_SEC", "0.35"))
+HOLD_SUSTAINED_FRAMES = int(os.getenv("LIVENESS_HOLD_SUSTAINED_FRAMES", "2"))
+
+_HOLD_GESTURES = frozenset({
+    "look_left_hold", "look_right_hold", "look_up_hold", "look_down_hold",
+})
+
+
+def sustain_frames_for_gesture(gesture_id: str) -> int:
+    if gesture_id in ("turn_left", "turn_right"):
+        return max(1, TURN_SUSTAINED_FRAMES)
+    if gesture_id in _HOLD_GESTURES:
+        return max(1, HOLD_SUSTAINED_FRAMES)
+    return max(1, SUSTAINED_FRAMES)
+
+
+def _turn_yaw_delta(gesture_id: str, nose_offset: float, base_nose_cx: float) -> float:
+    """Signed yaw proxy: positive when the user turns toward the challenged direction."""
+    if gesture_id == "turn_left":
+        delta = nose_offset - base_nose_cx
+        return -delta if TURN_MIRROR else delta
+    delta = base_nose_cx - nose_offset
+    return -delta if TURN_MIRROR else delta
+
+
+def _evaluate_turn_gesture(
+    gesture_id: str,
+    pts_68: List[Dict],
+    ref: Dict[str, Any],
+    session: Any,
+    face_w: float,
+) -> bool:
+    """Head turns — peak tracking so a quick turn still completes."""
+    face_center_x = (pts_68[0]["x"] + pts_68[16]["x"]) / 2
+    nose_offset = pts_68[30]["x"] - face_center_x
+    base_nose_cx = ref["nose_center_x"]
+    delta = _turn_yaw_delta(gesture_id, nose_offset, base_nose_cx)
+    thresh = max(TURN_YAW_MIN_PX, face_w * TURN_YAW_FRAC)
+
+    peak = float(getattr(session, "gesture_turn_peak", 0.0) or 0.0)
+    if delta > peak:
+        session.gesture_turn_peak = delta
+
+    return delta >= thresh or peak >= thresh
+
+
+def _evaluate_pitch_hold(
+    direction: str,
+    pts_68: List[Dict],
+    ref: Dict[str, Any],
+    session: Any,
+    face_w: float,
+) -> bool:
+    """Look up / look down — nose, chin, and brow–chin ratio with peak tracking."""
+    cur_nose_y = float(pts_68[30]["y"])
+    base_nose_y = float(ref["nose_tip_y"])
+    cur_chin_y = float(pts_68[8]["y"])
+    base_chin_y = float(ref.get("chin_y", cur_chin_y))
+    brow_y = (pts_68[19]["y"] + pts_68[24]["y"]) / 2.0
+    chin_brow_ratio = (cur_chin_y - brow_y) / (face_w + 1e-6)
+    base_ratio = float(ref.get("chin_brow_ratio", chin_brow_ratio))
+
+    if direction == "down":
+        d_nose = cur_nose_y - base_nose_y
+        d_chin = cur_chin_y - base_chin_y
+        d_ratio = chin_brow_ratio - base_ratio
+        delta = max(d_nose, d_chin * 0.9, d_ratio * face_w * 0.85)
+    else:
+        d_nose = base_nose_y - cur_nose_y
+        d_brow = float(ref.get("brow_y", brow_y)) - brow_y
+        d_ratio = base_ratio - chin_brow_ratio
+        delta = max(d_nose, d_brow * 0.85, d_ratio * face_w * 0.85)
+
+    thresh = max(PITCH_MIN_PX, face_w * PITCH_FRAC)
+    peak = float(getattr(session, "gesture_pitch_peak", 0.0) or 0.0)
+    if delta > peak:
+        session.gesture_pitch_peak = delta
+
+    pose_ok = delta >= thresh or peak >= thresh
+    if not pose_ok:
+        session.hold_start_time = None
+        return peak >= thresh * 0.92
+
+    if session.hold_start_time is None:
+        session.hold_start_time = time.time()
+    held = (time.time() - session.hold_start_time) >= HOLD_DURATION_SEC
+    return held or peak >= thresh * 1.05
+
+
+def _evaluate_yaw_hold(
+    direction: str,
+    pts_68: List[Dict],
+    ref: Dict[str, Any],
+    session: Any,
+    face_w: float,
+) -> bool:
+    """Look left / look right — same yaw logic as turn_left / turn_right."""
+    gid = "turn_left" if direction == "left" else "turn_right"
+    return _evaluate_turn_gesture(gid, pts_68, ref, session, face_w)
 
 
 def build_pose_snapshot(pts_68: List[Dict], cal_baseline: Dict[str, Any]) -> Dict[str, Any]:
     """Pose at the moment a challenge is shown — gestures must move away from this."""
     face_center_x = (pts_68[0]["x"] + pts_68[16]["x"]) / 2
+    face_w = max(abs(pts_68[16]["x"] - pts_68[0]["x"]), 1.0)
+    brow_y = (pts_68[19]["y"] + pts_68[24]["y"]) / 2.0
+    chin_y = float(pts_68[8]["y"])
     expr = estimate_expression(pts_68, cal_baseline)
     return {
         "nose_center_x": pts_68[30]["x"] - face_center_x,
         "nose_tip_y": pts_68[30]["y"],
-        "face_width": abs(pts_68[16]["x"] - pts_68[0]["x"]),
+        "chin_y": chin_y,
+        "brow_y": brow_y,
+        "chin_brow_ratio": (chin_y - brow_y) / face_w,
+        "face_width": face_w,
         "left_ear": compute_ear(pts_68, 36),
         "right_ear": compute_ear(pts_68, 42),
         "mar": compute_mar(pts_68),
@@ -219,13 +330,8 @@ def evaluate_gesture(
         return max(minimum, face_w * frac)
 
     # ── Original 18 gestures ──
-    if gesture_id == "turn_left":
-        delta = nose_offset - base_nose_cx
-        return delta > _threshold(0.05, 5)
-
-    elif gesture_id == "turn_right":
-        delta = base_nose_cx - nose_offset
-        return delta > _threshold(0.05, 5)
+    if gesture_id in ("turn_left", "turn_right"):
+        return _evaluate_turn_gesture(gesture_id, pts_68, ref, session, face_w)
 
     elif gesture_id == "nod":
         delta = cur_nose_y - base_nose_y
@@ -300,24 +406,11 @@ def evaluate_gesture(
             session.was_blink_closed = False
         return session.blink_count >= 2
 
-    elif gesture_id in ("look_left_hold", "look_right_hold",
-                        "look_up_hold", "look_down_hold"):
+    elif gesture_id in _HOLD_GESTURES:
         direction = gesture_id.replace("look_", "").replace("_hold", "")
-        if direction == "left":
-            ok = (nose_offset - base_nose_cx) > _threshold(0.05, 4)
-        elif direction == "right":
-            ok = (base_nose_cx - nose_offset) > _threshold(0.05, 4)
-        elif direction == "up":
-            ok = (base_nose_y - cur_nose_y) > _threshold(0.045, 4)
-        else:  # down
-            ok = (cur_nose_y - base_nose_y) > _threshold(0.045, 4)
-        if ok:
-            if session.hold_start_time is None:
-                session.hold_start_time = time.time()
-            return (time.time() - session.hold_start_time) >= HOLD_DURATION_SEC
-        else:
-            session.hold_start_time = None
-            return False
+        if direction in ("left", "right"):
+            return _evaluate_yaw_hold(direction, pts_68, ref, session, face_w)
+        return _evaluate_pitch_hold(direction, pts_68, ref, session, face_w)
 
     elif gesture_id == "head_forward":
         return cur_face_w > base_face_width * 1.14

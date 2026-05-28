@@ -124,6 +124,11 @@ def has_display_attack_corroboration(
     match_context: Optional[Dict[str, Any]] = None,
 ) -> bool:
     """True when multiple independent cues indicate a digital display, not ambient room light."""
+    mc = match_context or {}
+    if mc.get("laptop_capture_context"):
+        devices_found = None
+        device_replay_score = min(float(device_replay_score), 0.10)
+
     if devices_found:
         return True
     if device_replay_score >= 0.28:
@@ -137,8 +142,14 @@ def has_display_attack_corroboration(
     border = float(per_signal.get("screen_border", 0.0))
 
     # POST /match only — stricter phone-replay rules; liveness stream passes match_context=None
-    mc = match_context or {}
     if mc.get("match_selfie"):
+        ff_score = float(mc.get("fullframe_replay_score", 0.0))
+        if mc.get("fullframe_replay_flag"):
+            return True
+        if ff_score >= 0.50:
+            return True
+        if ff_score >= 0.42 and int(mc.get("fullframe_signal_count", 0)) >= 3:
+            return True
         bezel = float(mc.get("frame_bezel", 0.0))
         screen_border = float(mc.get("frame_screen_border", 0.0))
         refl = str(mc.get("reflection_label") or "")

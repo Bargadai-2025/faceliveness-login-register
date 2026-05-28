@@ -63,7 +63,6 @@ const DIGITAL_KEYWORDS = [
   "screen",
   "phone",
   "tablet",
-  "laptop",
   "mobile",
   "device",
   "electronic",

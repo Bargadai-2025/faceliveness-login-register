@@ -3,9 +3,18 @@ import { getApiBase } from "./apiBase";
 import { getCoverSourceRect } from "./cameraDrawUtils";
 import {
   MATCH_REQUEST_TIMEOUT_MS,
+  REGISTER_REQUEST_TIMEOUT_MS,
+  isReplayDeviceAlert,
   matchFetchErrorMessage,
+  registerFetchErrorMessage,
   startIndeterminateMatchProgress,
 } from "./matchUiUtils";
+import { ERROR_LABELS } from "./securityErrorMessages";
+import {
+  isRegistrationSuccess,
+  parseJsonResponse,
+  parseRegisterFailureMessage,
+} from "./apiUtils";
 import "./FaceMatch.css";
 import { ToastContainer, toast } from 'react-toastify';
 import 'react-toastify/dist/ReactToastify.css';
@@ -36,26 +45,15 @@ const PROCESS_H = 480;
 const SHOW_FACE_MESH_OVERLAY = false;
 
 const CHALLENGE_UI = {
-  turn_left: { label: "Turn your head LEFT", icon: ArrowLeft },
-  turn_right: { label: "Turn your head RIGHT", icon: ArrowRight },
-  nod: { label: "NOD your head down", icon: ArrowDown },
-  look_up: { label: "LOOK slightly up", icon: ArrowUp },
-  smile: { label: "Please SMILE", icon: Smile },
-  // surprised: { label: "Look SURPRISED", icon: Smile },
-  mouth_open: { label: "OPEN your mouth wide", icon: Smile },
-  // wide_eyes: { label: "OPEN eyes wide", icon: Eye },
-  // blink_both: { label: "BLINK both eyes", icon: Eye },
-  // raise_eyebrows: { label: "Raise your EYEBROWS", icon: Activity },
-  // pucker_lips: { label: "PUCKER your lips", icon: Smile },
-  // frown: { label: "FROWN (sad face)", icon: Smile },
+  turn_left: { label: "Turn your Head Left", icon: ArrowLeft },
+  turn_right: { label: "Turn your Head Right", icon: ArrowRight },
+  smile: { label: "Smile", icon: Smile },
+  mouth_open: { label: "Open your mouth", icon: Smile },
   move_closer: { label: "Move Closer", icon: Maximize },
   move_farther: { label: "Move Away", icon: Maximize },
   shake_head: { label: "Shake head left & right (NO)", icon: Activity },
-  // blink_twice_fast: { label: "BLINK twice fast", icon: Eye },
-  look_left_hold: { label: "Look LEFT & HOLD", icon: ArrowLeft },
-  look_right_hold: { label: "Look RIGHT & HOLD", icon: ArrowRight },
-  look_up_hold: { label: "Look UP & HOLD", icon: ArrowUp },
-  look_down_hold: { label: "Look DOWN & HOLD", icon: ArrowDown },
+  look_up_hold: { label: "Look Up", icon: ArrowUp },
+  look_down_hold: { label: "Look Down", icon: ArrowDown },
   // head_forward: { label: "Move head FORWARD", icon: ArrowUp },
   // head_backward: { label: "Move head BACKWARD", icon: ArrowDown },
   // eye_left_right: { label: "Move eyes L to R", icon: Eye },
@@ -143,6 +141,7 @@ export default function FaceRegister({ userEmail, userAgentLabel, onLogout, onRe
   const frameIntervalRef = useRef(null);
   const livenessSessionIdRef = useRef(null);
   const registrationSessionIdRef = useRef(null);
+  const registerAbortRef = useRef(null);
   const livenessCompletedRef = useRef(false);
   const streamingRef = useRef(false);
   const profileMenuRef = useRef(null);
@@ -288,10 +287,21 @@ export default function FaceRegister({ userEmail, userAgentLabel, onLogout, onRe
       }
     }
 
+    if (isReplayDeviceAlert(data)) {
+      setRejectionError(ERROR_LABELS.DIGITAL_MEDIA);
+      stopCamera();
+      return;
+    }
+
     if (data.status === "rejected" || data.status === "failed") {
-      // If it's a hard rejection (fraud), show a big popup and stop the camera
       if (data.status === "rejected") {
-        setRejectionError(data.detail || "Security Alert: Electronic device detected.");
+        const detail = String(data.detail || "");
+        const digital =
+          data.display_attack === true ||
+          /photograph|digital screen|phone|tablet|replay/i.test(detail);
+        setRejectionError(
+          digital ? ERROR_LABELS.DIGITAL_MEDIA : detail || ERROR_LABELS.SECURITY_ALERT,
+        );
         stopCamera();
       } else {
         setError(data.detail || "Liveness check failed");
@@ -548,6 +558,8 @@ export default function FaceRegister({ userEmail, userAgentLabel, onLogout, onRe
     }
   };
   const handleRegister = async () => {
+    if (loading) return;
+
     if (!file) {
       setError("Please complete liveness and capture your live photo first.");
       return;
@@ -556,6 +568,12 @@ export default function FaceRegister({ userEmail, userAgentLabel, onLogout, onRe
       setError("Please enter a valid email address.");
       return;
     }
+
+    registerAbortRef.current?.abort();
+    const abort = new AbortController();
+    registerAbortRef.current = abort;
+    const timeoutId = setTimeout(() => abort.abort(), REGISTER_REQUEST_TIMEOUT_MS);
+
     setLoading(true);
     setError(null);
     setRegistrationSuccess(null);
@@ -572,31 +590,23 @@ export default function FaceRegister({ userEmail, userAgentLabel, onLogout, onRe
     }
     fd.append("device_id", getOrCreateDeviceId());
 
+    const registerUrl = `${API_URL}/register`;
+
     try {
-      console.log(`📤 Sending registration request to ${API_URL}/register ...`);
-      const res = await fetch(`${API_URL}/register`, { method: "POST", body: fd });
-      const data = await res.json().catch(() => ({}));
-      const failMsg =
-        res.status === 404 || data.detail === "Not Found"
-          ? "Register API not found. Restart the backend (uvicorn on port 8000) or check VITE_API_URL."
-          : data.error ||
-          (Array.isArray(data.detail)
-            ? data.detail.map((d) => d.msg || JSON.stringify(d)).join(", ")
-            : typeof data.detail === "string"
-              ? data.detail
-              : null);
-      if (!res.ok || failMsg) {
-        const msg = failMsg || "Registration failed.";
-        setError(msg);
-        toast.error(`Registration failed: ${msg}`);
-      } else {
-        // toast.success(`Successfully registered ${firstName} ${lastName}!`);
+      console.log(`📤 Sending registration request to ${registerUrl} ...`);
+      const res = await fetch(registerUrl, {
+        method: "POST",
+        body: fd,
+        signal: abort.signal,
+      });
+      clearTimeout(timeoutId);
+
+      const data = await parseJsonResponse(res);
+
+      if (isRegistrationSuccess(data, res)) {
         const faceLabel = data.face_label || emailNorm;
-        toast.success(`Successfully registered ${emailNorm}!`);
+        toast.success(data.message || `Successfully registered ${emailNorm}!`);
         setRegistrationSuccess(`Successfully registered ${emailNorm}!`);
-        if (onRegistered) {
-          onRegistered(emailNorm, faceLabel);
-        }
         setRegisterMode(false);
         setFirstName("");
         setMiddleName("");
@@ -609,13 +619,31 @@ export default function FaceRegister({ userEmail, userAgentLabel, onLogout, onRe
         setCanMatch(false);
         setLivenessLive(false);
         setLivenessStep("idle");
-
-        window.location.href('/');
+        setLoading(false);
+        try {
+          onRegistered?.(emailNorm, faceLabel);
+        } catch (cbErr) {
+          console.warn("onRegistered callback:", cbErr);
+        }
+        window.setTimeout(() => {
+          window.location.href = "/";
+        }, 400);
+        return;
       }
+
+      const msg = parseRegisterFailureMessage(res, data);
+      setError(msg);
+      toast.error(msg);
     } catch (err) {
-      setError("Registration failed. Please try again.");
-      toast.error("Registration failed. Please check your connection.");
+      clearTimeout(timeoutId);
+      const msg = registerFetchErrorMessage(err);
+      console.error("❌ Registration request failed:", err);
+      setError(msg);
+      toast.error(msg);
     } finally {
+      if (registerAbortRef.current === abort) {
+        registerAbortRef.current = null;
+      }
       setLoading(false);
     }
   }; 
