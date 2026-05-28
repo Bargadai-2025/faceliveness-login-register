@@ -1311,6 +1311,12 @@ import {
   resolveSecurityDisplayError,
   resolveSecurityErrorLabel,
 } from "./securityErrorMessages";
+import {
+  isRetryAllowed,
+  parseApiDetail,
+  parseJsonResponse,
+  sanitizeUserMessage,
+} from "./apiUtils";
 import "./FaceMatch.css";
 import bargadLogo from "./bargad-logo.png";
 import bargadBranding from "./bargad-branding (1).svg?url";
@@ -1350,7 +1356,11 @@ L.Icon.Default.mergeOptions({
 
 const API_URL = getApiBase();
 const DEVICE_KEY = "facematch_device_id";
+/** Only block match when liveness accumulated substantial display-attack penalties. */
+const MATCH_ERRCOUNT_BLOCK_THRESHOLD = 30;
 const FRAME_INTERVAL_MS = 16;
+/** Selfie retries before full flow reset (banking PoC). */
+const MATCH_MAX_SELFIE_RETRIES = 2;
 /** Short countdown; probe frames run security checks before main stream. */
 const INIT_COUNTDOWN_SEC = 1;
 const CHALLENGE_PREP_DELAY_MS = 250;
@@ -1375,20 +1385,26 @@ function lerpPoints(prev, next, t) {
   }));
 }
 
+// "Turn your Head Left"
+// "Turn your Head Right"
+// "Smile"
+// "Open your mouth"
+// "Move Closer"
+// "Move Away"
+// "Shake head left & right (NO)"
+// "Look Up"
+// "Look Down"
+
 const CHALLENGE_UI = {
   turn_left: { label: "Turn your Head Left", icon: ArrowLeft },
   turn_right: { label: "Turn your Head Right", icon: ArrowRight },
-  nod: { label: "Move your Head Down", icon: ArrowDown },
-  look_up: { label: "Look slightly up", icon: ArrowUp },
   smile: { label: "Smile", icon: Smile },
-  mouth_open: { label: "Open your mouth wide", icon: Smile },
+  mouth_open: { label: "Open your mouth", icon: Smile },
   move_closer: { label: "Move Closer", icon: Maximize },
   move_farther: { label: "Move Away", icon: Maximize },
   shake_head: { label: "Shake head left & right (NO)", icon: Activity },
-  look_left_hold: { label: "Look Left & Hold", icon: ArrowLeft },
-  look_right_hold: { label: "Look Right & Hold", icon: ArrowRight },
-  look_up_hold: { label: "Look Up & Hold", icon: ArrowUp },
-  look_down_hold: { label: "Look Down & Hold", icon: ArrowDown },
+  look_up_hold: { label: "Look Up", icon: ArrowUp },
+  look_down_hold: { label: "Look Down", icon: ArrowDown },
 };
 
 // 68-pt landmark segment indices (MediaPipe → 68 mapping on server)
@@ -1588,15 +1604,36 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
     sessionStorage.removeItem("liveness_ref_photo");
   }, []);
 
+  const matchRetriesRef = useRef(0);
+
   const handleMatchFailure = useCallback(
     (message, hints = {}) => {
-      const label = resolveSecurityErrorLabel(message, hints);
+      const safeMsg = sanitizeUserMessage(message, hints);
+      const label = resolveSecurityErrorLabel(safeMsg, hints);
+      const canRetry =
+        hints.retryAllowed &&
+        !hints.userMismatch &&
+        matchRetriesRef.current < MATCH_MAX_SELFIE_RETRIES;
+
+      if (canRetry) {
+        matchRetriesRef.current += 1;
+        setError(ERROR_LABELS.VERIFICATION_FAILED);
+        addToast(
+          `Please try again (${matchRetriesRef.current}/${MATCH_MAX_SELFIE_RETRIES}). Face the camera in steady lighting.`,
+          "error",
+        );
+        setLoading(false);
+        setProgress(0);
+        return;
+      }
+
       setError(label);
       const toastText =
         label === ERROR_LABELS.USER_MISMATCH
           ? "This face does not match the logged-in account."
-          : message || label;
+          : safeMsg || label;
       addToast(toastText, "error");
+      matchRetriesRef.current = 0;
       resetAfterMatchFailure();
     },
     [addToast, resetAfterMatchFailure],
@@ -2052,7 +2089,8 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
     const deviceDetail = (data.detail || "").toLowerCase();
     const isDeviceAlert =
       data.is_suspicious &&
-      (deviceNames ||
+      (data.display_attack ||
+        deviceNames ||
         deviceDetail.includes("device") ||
         deviceDetail.includes("phone") ||
         deviceDetail.includes("tablet") ||
@@ -2147,11 +2185,15 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
     } else if (data.status === "processing") {
       const d = data.detail || "";
 
-      if (data.is_suspicious && !isDeviceAlert) {
-        setErrcount((prev) => prev + 10);
-        applySecurityError(d, {
-          digitalMedia: isDigitalMediaMessage(d),
-        });
+      if (data.is_suspicious && data.display_attack && !isDeviceAlert) {
+        setErrcount((prev) => prev + 3);
+        // Do not flash security card mid-challenge — reduces false alarms in bright rooms.
+      } else if (data.is_suspicious && !data.display_attack) {
+        setErrcount((prev) => prev + 1);
+      }
+
+      if (typeof data.stream_risk === "number" && data.stream_risk > 55) {
+        setErrcount((prev) => prev + 2);
       }
 
       if (d.includes("blocked") || d.includes("No face")) {
@@ -2205,7 +2247,16 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
         method: "POST",
         body: fd,
       });
-      const data = await res.json();
+      const data = await parseJsonResponse(res);
+      if (!res.ok && data.error) {
+        const msg = parseApiDetail(data, ERROR_LABELS.LIVENESS_FAILED);
+        if (res.status === 429 || data.retry_allowed) {
+          console.warn("Liveness frame rate limited / retry:", msg);
+        } else if (res.status === 400) {
+          applySecurityError(msg);
+        }
+        return;
+      }
       await handleBackendResponse(data);
     } catch (e) {
       console.warn("Stream error:", e);
@@ -2220,21 +2271,22 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ session_id: livenessSessionIdRef.current }),
       });
-      const data = await res.json();
+      const data = await parseJsonResponse(res);
       if (res.ok && data.ok) {
         setCanMatch(true);
         setLivenessLive(true);
         setLivenessStep("capture");
       } else {
-        const msg =
-          data.detail ||
-          "Liveness verification incomplete. Please restart and complete all challenges.";
-        applySecurityError(msg);
-        addToast(msg, "error");
+        const msg = parseApiDetail(
+          data,
+          "Liveness verification incomplete. Please restart and complete all challenges.",
+        );
+        applySecurityError(sanitizeUserMessage(msg));
+        addToast(parseApiDetail(data, ERROR_LABELS.LIVENESS_INCOMPLETE), "error");
         livenessCompletedRef.current = false;
       }
     } catch {
-      applySecurityError("Verification failed");
+      applySecurityError(ERROR_LABELS.VERIFICATION_FAILED);
     }
   }
 
@@ -2269,13 +2321,17 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
             agent_label: userAgentLabel,
           }),
         });
+        const sessJson = await parseJsonResponse(sessRes);
         if (!sessRes.ok) {
-          const errBody = await sessRes.text();
-          throw new Error(`Server error ${sessRes.status}: ${errBody}`);
+          applySecurityError(
+            sanitizeUserMessage(parseApiDetail(sessJson, ERROR_LABELS.SESSION_FAILED)),
+          );
+          setLivenessSessionLoading(false);
+          return;
         }
-        sessData = await sessRes.json();
+        sessData = sessJson;
       } catch (e) {
-        applySecurityError(`Session failed: ${e.message}`);
+        applySecurityError(ERROR_LABELS.SESSION_FAILED);
         setLivenessSessionLoading(false);
         return;
       }
@@ -2481,38 +2537,63 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
         body: fd,
         signal: matchAbort.signal,
       });
-      const data = await res.json();
+      const data = await parseJsonResponse(res);
       clearInterval(pInterval);
       clearTimeout(matchTimeoutId);
 
       if (data.error) {
         console.error("❌ Match error from backend:", data.error);
+        const screenReplay =
+          data.screen_replay === true || data.digital_media === true;
+        const rawErr = parseApiDetail(data, data.error);
+        const errText = screenReplay ? ERROR_LABELS.DIGITAL_MEDIA : rawErr;
         const userMismatch =
-          /registered|logged in|identity mismatch|does not match your/i.test(
-            String(data.error),
-          );
-        handleMatchFailure(data.error, { userMismatch });
+          !screenReplay &&
+          (data.user_mismatch === true ||
+            /user identity mismatch|registered|logged in|identity mismatch|does not match your/i.test(
+              String(rawErr),
+            ));
+        const digitalMedia =
+          screenReplay ||
+          (data.security_verdict === "reject" &&
+            !userMismatch &&
+            (data.composite_risk ?? 0) >= 48);
+        handleMatchFailure(errText, {
+          userMismatch: screenReplay ? false : userMismatch,
+          digitalMedia,
+          retryAllowed: isRetryAllowed(data),
+        });
         setCaptureLiveFailure(null);
         setProgress(0);
-      } else if (data.capture_live_ok === false) {
-        console.error("❌ Capture live failed:", data.capture_live_reason);
+      } else if (data.security_verdict === "reject") {
         handleMatchFailure(
-          data.capture_live_reason ||
-            "Security Alert: High risk of digital spoofing detected. Matching blocked.",
-          { digitalMedia: true },
+          parseApiDetail(
+            data,
+            "Security Alert: Digital screen or photo replay detected. Do not use a photograph or digital screen.",
+          ),
+          {
+            digitalMedia: true,
+            retryAllowed: isRetryAllowed(data),
+          },
         );
         setCaptureLiveFailure(null);
         setProgress(0);
-      } else if (errcount > 0) {
-        console.error("❌ Liveness errors detected during session.");
+      } else if (
+        data.capture_live_ok === false &&
+        data.security_verdict !== "pass" &&
+        data.security_verdict !== "pass_penalty"
+      ) {
+        console.error("❌ Capture live failed:", data.capture_live_reason);
         handleMatchFailure(
-          "Security Alert: Suspicious activity or device detected during liveness session. Matching blocked.",
+          data.capture_live_reason ||
+          "Security Alert: High risk of digital spoofing detected. Matching blocked.",
           { digitalMedia: true },
         );
         setCaptureLiveFailure(null);
         setProgress(0);
       } else {
         console.log("✅ Match successful", data.matches?.length, "results");
+        matchRetriesRef.current = 0;
         setResults(data.matches || []);
         setPenaltyDetails(data.security_penalty_breakdown || []);
         setCaptureLiveFailure(null);
@@ -2526,7 +2607,10 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
       }
     } catch (err) {
       console.error("❌ Match request failed:", err);
-      handleMatchFailure(matchFetchErrorMessage(err));
+      handleMatchFailure(matchFetchErrorMessage(err), {
+        retryAllowed: true,
+        networkError: true,
+      });
       setProgress(0);
       clearInterval(pInterval);
       clearTimeout(matchTimeoutId);

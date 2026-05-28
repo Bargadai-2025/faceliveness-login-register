@@ -131,6 +131,12 @@ class LivenessSession:
     last_agent_check_time: float = 0.0
     digital_screen_fail_count: int = 0
 
+    # In-memory gesture challenge snapshots (cleared after /match; never persisted)
+    challenge_snapshots: List[Any] = field(default_factory=list)
+    challenge_devices_seen: List[str] = field(default_factory=list)
+    # Rolling stream risk EMA (0–100) from liveness frames; cleared with session
+    stream_risk_ema: float = 0.0
+
     @property
     def expired(self) -> bool:
         return (time.time() - self.created_at) > SESSION_TTL
@@ -217,7 +223,13 @@ class SessionManager:
 
     def remove(self, session_id: str):
         with self._lock:
-            self._sessions.pop(session_id, None)
+            sess = self._sessions.pop(session_id, None)
+            if sess is not None:
+                try:
+                    from challenge_frame_verification import clear_challenge_snapshots
+                    clear_challenge_snapshots(sess)
+                except Exception:
+                    pass
 
     def _cleanup(self):
         expired = [k for k, v in self._sessions.items() if v.expired]
@@ -225,5 +237,15 @@ class SessionManager:
             del self._sessions[k]
 
 
-# Global singleton
-session_manager = SessionManager()
+def _build_session_manager():
+    """In-memory + optional Redis (see session_store.py)."""
+    try:
+        from session_store import HybridSessionManager
+
+        return HybridSessionManager()
+    except Exception:
+        return SessionManager()
+
+
+# Global singleton (Redis-backed when REDIS_URL is set)
+session_manager = _build_session_manager()

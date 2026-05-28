@@ -15,6 +15,7 @@ from liveness_session import (
     LIGHT_CHALLENGES,
     GESTURE_COOLDOWN,
     GESTURE_INSTRUCTION_SEC,
+    session_manager,
 )
 from face_detection import (
     decode_frame, detect_faces, compute_ear, compute_head_pose,
@@ -38,7 +39,11 @@ from spoof_scoring import (
     centroid_of_landmarks,
     downsample_gray,
     load_thresholds,
+    has_display_attack_corroboration,
+    is_display_related_spoof_trigger,
+    count_display_imaging_signals,
 )
+from challenge_frame_verification import capture_challenge_frame
 
 # ── YOLO device detection ──
 _yolo_model = None
@@ -46,7 +51,7 @@ _yolo_warmup_done = False
 YOLO_WEIGHTS = os.getenv("YOLO_WEIGHTS", "yolov8n.pt")
 LIVENESS_YOLO_CONF = float(os.getenv("LIVENESS_YOLO_CONF", "0.28"))
 DEVICE_NEAR_FACE_DR = float(os.getenv("LIVENESS_DEVICE_NEAR_DR", "0.12"))
-LIVENESS_FAST_SETUP = os.getenv("LIVENESS_FAST_SETUP", "1").strip().lower() in (
+LIVENESS_FAST_SETUP = os.getenv("LIVENESS_FAST_SETUP", "0").strip().lower() in (
     "1",
     "true",
     "yes",
@@ -200,6 +205,11 @@ def _yolo_device_replay_risk(
     return float(min(1.0, max_risk)), hard_overlap, devices_found, device_visible_in_frame
 
 
+def _attach_stream_meta(session: LivenessSession, payload: Dict[str, Any]) -> Dict[str, Any]:
+    payload["stream_risk"] = round(float(getattr(session, "stream_risk_ema", 0.0)), 1)
+    return payload
+
+
 def _device_alert_response(
     session: LivenessSession,
     pts_68,
@@ -210,7 +220,7 @@ def _device_alert_response(
     *,
     hard_overlap: bool = False,
 ) -> Dict[str, Any]:
-    return {
+    return _attach_stream_meta(session, {
         "status": "processing",
         "detail": detail,
         "step": session.step,
@@ -218,11 +228,12 @@ def _device_alert_response(
         "mesh": landmarks_to_serializable(pts_478),
         "progress": session.progress_pct,
         "is_suspicious": True,
+        "display_attack": True,
         "multi_person": False,
         "devices_detected": devices_found,
         "device_replay": round(dr, 3),
         "spoof_debug": {"device_replay": round(dr, 3), "hard_overlap": hard_overlap},
-    }
+    })
 
 
 def process_frame(session: LivenessSession, frame_bytes: bytes, identity_callback=None) -> Dict[str, Any]:
@@ -329,6 +340,8 @@ def process_frame(session: LivenessSession, frame_bytes: bytes, identity_callbac
             session.roi_luminance_history.pop(0)
 
     # ── YOLO every frame; full spoof PAD when not in early calibration ──
+    devices_found_frame: List[str] = []
+    dr_frame = 0.0
     if _should_run_security_scan(session):
         yolo = _get_yolo()
         dr = 0.0
@@ -360,14 +373,18 @@ def process_frame(session: LivenessSession, frame_bytes: bytes, identity_callbac
                 )
 
         if _should_run_full_spoof_pipeline(session):
+            env_auth = check_background_parallax(
+                session.last_gray_small, curr_gray_small, session.landmark_centroid_history
+            )
+            if dr < 0.12 and not devices_found:
+                env_auth *= 0.22
+
             extra_signals: Dict[str, float] = {
                 "depth_parallax": parallax_replay_risk(session.landmark_history),
                 "biological": biological_motion_replay_risk(session.landmark_history),
                 "challenge": challenge_consistency_replay_risk(session),
                 "temporal_stream_integrity": check_temporal_stream_integrity(session.landmark_history),
-                "environment_authenticity": check_background_parallax(
-                    session.last_gray_small, curr_gray_small, session.landmark_centroid_history
-                ),
+                "environment_authenticity": env_auth,
                 "device_replay": dr,
             }
 
@@ -385,6 +402,7 @@ def process_frame(session: LivenessSession, frame_bytes: bytes, identity_callbac
             th_all = load_thresholds()
             alpha = float(th_all.get("ema_alpha", 0.22))
             session.replay_risk_ema = alpha * current_fused + (1.0 - alpha) * float(session.replay_risk_ema)
+            session.stream_risk_ema = 0.25 * current_fused + 0.75 * float(session.stream_risk_ema)
             session.fraud_ema_history.append(round(session.replay_risk_ema, 2))
             if len(session.fraud_ema_history) > 30:
                 session.fraud_ema_history = session.fraud_ema_history[-30:]
@@ -417,41 +435,66 @@ def process_frame(session: LivenessSession, frame_bytes: bytes, identity_callbac
                     session.fraud_cooldown_frames = 0
 
             if session.spoof_temporal_hits >= temporal_hits_required:
-                session.spoof_temporal_hits = 0
-                rejection_reason = (
-                    f"Sustained replay risk ({temporal_hits_required}+ frames, EMA={session.replay_risk_ema:.1f})"
+                triggered_rules = list(spoof_report.get("triggered_rules") or [])
+                per_sig = spoof_report.get("confidence_per_signal") or {}
+                imaging_count = count_display_imaging_signals(per_sig, threshold=0.38)
+                display_attack = bool(devices_found) or (
+                    has_display_attack_corroboration(
+                        per_sig,
+                        triggered_rules,
+                        device_replay_score=dr,
+                        devices_found=devices_found,
+                    )
+                    and (
+                        imaging_count >= 2
+                        or float(per_sig.get("high_brightness_screen", 0.0)) >= 0.52
+                        or dr >= 0.28
+                    )
                 )
-                session.fraud_rejection_reasons.append(rejection_reason)
 
-                per_signal_avgs = {}
-                for sig_key, sig_hist in session.per_signal_history.items():
-                    if sig_hist:
-                        per_signal_avgs[sig_key] = round(sum(sig_hist[-8:]) / len(sig_hist[-8:]), 3)
+                if not display_attack:
+                    session.spoof_temporal_hits = max(0, session.spoof_temporal_hits - 2)
+                else:
+                    session.spoof_temporal_hits = 0
+                    rejection_reason = (
+                        f"Sustained display/replay risk ({temporal_hits_required}+ frames, "
+                        f"EMA={session.replay_risk_ema:.1f})"
+                    )
+                    session.fraud_rejection_reasons.append(rejection_reason)
 
-                return {
-                    "status": "processing",
-                    "detail": "Security Alert: sustained presentation-attack risk (multi-signal + temporal)",
-                    "step": session.step,
-                    "landmarks": landmarks_to_serializable(pts_68),
-                    "mesh": landmarks_to_serializable(pts_478),
-                    "progress": session.progress_pct,
-                    "is_suspicious": True,
-                    "multi_person": False,
-                    "spoof_debug": {
-                        "final_replay_risk": round(session.replay_risk_ema, 2),
-                        "frame_fused_score": round(current_fused, 2),
-                        "smoothed_window": round(smoothed, 2),
-                        "temporal_hits_required": temporal_hits_required,
-                        "triggered_rules": spoof_report.get("triggered_rules", []),
-                        "confidence_per_signal": spoof_report.get("confidence_per_signal", {}),
-                        "extra_signals_used": spoof_report.get("extra_signals_used", {}),
-                        "correlation_gate_notes": spoof_report.get("correlation_gate_notes", []),
-                        "fraud_ema_history": list(session.fraud_ema_history[-16:]),
-                        "per_signal_rolling_averages": per_signal_avgs,
-                        "rejection_reason": rejection_reason,
-                        "fraud_rejection_count": len(session.fraud_rejection_reasons),
-                    },
-                }
+                    per_signal_avgs = {}
+                    for sig_key, sig_hist in session.per_signal_history.items():
+                        if sig_hist:
+                            per_signal_avgs[sig_key] = round(sum(sig_hist[-8:]) / len(sig_hist[-8:]), 3)
+
+                    return _attach_stream_meta(session, {
+                        "status": "processing",
+                        "detail": "Security Alert: sustained presentation-attack risk (display/replay)",
+                        "step": session.step,
+                        "landmarks": landmarks_to_serializable(pts_68),
+                        "mesh": landmarks_to_serializable(pts_478),
+                        "progress": session.progress_pct,
+                        "is_suspicious": True,
+                        "display_attack": True,
+                        "multi_person": False,
+                        "spoof_debug": {
+                            "final_replay_risk": round(session.replay_risk_ema, 2),
+                            "frame_fused_score": round(current_fused, 2),
+                            "smoothed_window": round(smoothed, 2),
+                            "temporal_hits_required": temporal_hits_required,
+                            "triggered_rules": spoof_report.get("triggered_rules", []),
+                            "confidence_per_signal": spoof_report.get("confidence_per_signal", {}),
+                            "extra_signals_used": spoof_report.get("extra_signals_used", {}),
+                            "correlation_gate_notes": spoof_report.get("correlation_gate_notes", []),
+                            "fraud_ema_history": list(session.fraud_ema_history[-16:]),
+                            "per_signal_rolling_averages": per_signal_avgs,
+                            "rejection_reason": rejection_reason,
+                            "fraud_rejection_count": len(session.fraud_rejection_reasons),
+                        },
+                    })
+
+        devices_found_frame = list(devices_found)
+        dr_frame = dr
 
     session.last_gray_small = curr_gray_small
 
@@ -569,7 +612,8 @@ def process_frame(session: LivenessSession, frame_bytes: bytes, identity_callbac
 
     # ── LIGHT CHALLENGE PHASE ──
     if session.step == "light_challenge":
-        stats = compute_brightness_histogram(img)
+        light_target = roi if roi is not None and roi.size > 0 else img
+        stats = compute_brightness_histogram(light_target)
         if len(session.light_pre_frames) < LIGHT_PRE_FRAMES:
             session.light_pre_frames.append(stats)
             return {
@@ -694,6 +738,14 @@ def process_frame(session: LivenessSession, frame_bytes: bytes, identity_callbac
             if passed:
                 session.gesture_sustain_count += 1
                 if session.gesture_sustain_count >= SUSTAINED_FRAMES:
+                    capture_challenge_frame(
+                        session,
+                        img,
+                        pts_68,
+                        devices_found=devices_found_frame or None,
+                    )
+                    if hasattr(session_manager, "touch"):
+                        session_manager.touch(session, force=True)
                     session.advance_gesture()
                     if session.all_gestures_done:
                         return {
@@ -740,4 +792,7 @@ def process_frame(session: LivenessSession, frame_bytes: bytes, identity_callbac
             "mesh": landmarks_to_serializable(pts_478),
         }
 
-    return {"status": "error", "detail": "Unknown step", "mesh": None}
+    payload = {"status": "error", "detail": "Unknown step", "mesh": None}
+    if hasattr(session, "stream_risk_ema"):
+        payload["stream_risk"] = round(float(session.stream_risk_ema), 1)
+    return payload

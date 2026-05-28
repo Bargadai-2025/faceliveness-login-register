@@ -3,5 +3,8 @@
     "builder": "DOCKERFILE",
     "dockerfilePath": "backend/Dockerfile"
   },
-  "deploy": {}
+  "deploy": {
+    "healthcheckPath": "/health/live",
+    "healthcheckTimeout": 120
+  }
 }

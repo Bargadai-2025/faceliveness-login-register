@@ -303,11 +303,6 @@ def compute_passive_liveness(img_bgr: np.ndarray, pts_68: Optional[List[Dict]] =
     health = max(0.0, min(1.0, 1.0 - rep["total_spoof_score"] / 100.0))
     is_live = bool(rep["is_live"])
     
-    # USER REQUEST: Hard block ambient light / screen reflection
-    triggered_rules = rep.get("triggered_rules", [])
-    if "reflection" in triggered_rules or "rectangular_glare" in triggered_rules or rep.get("confidence_per_signal", {}).get("reflection_raw", 0.0) > 0.45:
-        return False, 0.0, "Ambient light / screen reflection detected. Please avoid capturing screens."
-        
     if is_live:
         reason = "OK"
     else:
@@ -319,13 +314,15 @@ def compute_passive_liveness(img_bgr: np.ndarray, pts_68: Optional[List[Dict]] =
 
 
 def compute_brightness_histogram(img_bgr: np.ndarray) -> Dict[str, float]:
-    """Compute brightness stats for light-challenge verification."""
+    """Compute brightness stats for light-challenge verification (face ROI preferred)."""
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    texture_var = float(cv2.Laplacian(gray, cv2.CV_64F).var()) if gray.size > 0 else 0.0
     return {
         "brightness": float(np.mean(gray)),
         "brightness_std": float(np.std(gray)),
         "saturation": float(np.mean(hsv[:, :, 1])),
+        "texture_var": texture_var,
     }
 
 

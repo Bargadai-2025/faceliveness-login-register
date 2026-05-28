@@ -127,8 +127,7 @@ def analyze_active_spectral_reflectance(
     challenge_color: str,
 ) -> Tuple[bool, float]:
     """
-    Replaces old check_light_response.
-    Analyzes RGB decay timing and emissive resistance.
+    Face-ROI light challenge: real skin responds to flash; emissive displays resist change.
     """
     if not pre_stats or not post_stats:
         return True, 0.5
@@ -141,16 +140,25 @@ def analyze_active_spectral_reflectance(
     post_sat = np.mean([s["saturation"] for s in post_stats])
     sat_delta = abs(post_sat - pre_sat)
 
-    # Real skin reflects flash diffusely
-    if challenge_color in ("white_flash", "brightness_up"):
-        passed = bright_delta > 2.0
-    elif challenge_color in ("blue_flash", "green_flash"):
-        passed = bright_delta > 1.5 or sat_delta > 1.5
-    else:
-        passed = bright_delta > 1.8
+    pre_tex = np.mean([s.get("texture_var", 200.0) for s in pre_stats])
+    post_tex = np.mean([s.get("texture_var", 200.0) for s in post_stats])
+    tex_delta = abs(post_tex - pre_tex)
 
-    # Emissive resistance (displays don't change brightness much)
+    # Real skin reflects flash diffusely on face ROI
+    if challenge_color in ("white_flash", "brightness_up"):
+        passed = bright_delta > 1.8 or tex_delta > 25.0
+    elif challenge_color in ("blue_flash", "green_flash"):
+        passed = bright_delta > 1.2 or sat_delta > 1.2 or tex_delta > 18.0
+    else:
+        passed = bright_delta > 1.5 or tex_delta > 20.0
+
+    # Emissive display: high brightness, almost no ROI response, flat micro-texture
     emissive_score = 1.0 - min((bright_delta + sat_delta) / 15.0, 1.0)
+    if post_bright > 175 and bright_delta < 1.4 and post_tex < 95.0:
+        return False, round(emissive_score, 3)
+    if passed and post_bright > 190 and bright_delta < 1.6 and emissive_score > 0.82:
+        return False, round(emissive_score, 3)
+
     return passed, round(emissive_score, 3)
 
 
@@ -692,8 +700,9 @@ def check_background_parallax(last_gray_small: Optional[np.ndarray], curr_gray_s
         
     ratio = face_motion / (bg_motion * 120.0 + 1e-6)
     
-    # Low face motion vs high background motion = highly suspicious
-    if ratio < 0.4 and bg_motion > 0.01:
-        return float(min(1.0, (0.4 - ratio) / 0.4 + (bg_motion - 0.01) * 10.0))
-        
+    # Low face motion vs high background motion — only when motion is significant
+    # (ignore subtle window/tube flicker that should not flag real users)
+    if ratio < 0.35 and bg_motion > 0.022:
+        return float(min(1.0, (0.35 - ratio) / 0.35 + (bg_motion - 0.022) * 8.0))
+
     return 0.0

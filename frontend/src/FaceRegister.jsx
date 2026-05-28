@@ -547,7 +547,6 @@ export default function FaceRegister({ userEmail, userAgentLabel, onLogout, onRe
       setLoading(false);
     }
   };
-
   const handleRegister = async () => {
     if (!file) {
       setError("Please complete liveness and capture your live photo first.");
@@ -610,6 +609,8 @@ export default function FaceRegister({ userEmail, userAgentLabel, onLogout, onRe
         setCanMatch(false);
         setLivenessLive(false);
         setLivenessStep("idle");
+
+        window.location.href('/');
       }
     } catch (err) {
       setError("Registration failed. Please try again.");
@@ -617,7 +618,7 @@ export default function FaceRegister({ userEmail, userAgentLabel, onLogout, onRe
     } finally {
       setLoading(false);
     }
-  };
+  }; 
 
 
   const handleStartRegistration = () => {

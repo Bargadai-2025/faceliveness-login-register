@@ -12,7 +12,13 @@ import cv2
 import numpy as np
 
 from face_detection import compute_brightness_histogram, get_face_roi
-from spoof_scoring import analyze_passive_spoof_single_frame, _f
+from spoof_scoring import (
+    analyze_passive_spoof_single_frame,
+    has_display_attack_corroboration,
+    _f,
+)
+from liveness_risk_engine import evaluate_match_security
+from screen_frame_detection import analyze_match_frame_context
 
 # Screen-like reflection labels from spoof_scoring.classify_reflection
 SCREEN_REFLECTION_LABELS = frozenset({
@@ -31,20 +37,20 @@ def _flag(name: str, default: bool) -> bool:
 
 def load_post_selfie_config() -> Dict[str, Any]:
     return {
-        "yolo_conf": _f("MATCH_YOLO_CONF", 0.28),
+        "yolo_conf": _f("MATCH_YOLO_CONF", 0.22),
         "device_near_face_dr": _f("MATCH_DEVICE_NEAR_FACE_DR", 0.18),
         "device_hard_iou": _f("MATCH_DEVICE_HARD_IOU", 0.32),
-        "reflection_raw_max": _f("MATCH_REFLECTION_RAW_MAX", 0.38),
+        "reflection_raw_max": _f("MATCH_REFLECTION_RAW_MAX", 0.48),
         "hard_reject_spoof": _flag("MATCH_HARD_REJECT_SPOOF", True),
         "hard_reject_screen_reflection": _flag("MATCH_HARD_REJECT_SCREEN_REFLECTION", True),
-        "min_face_brightness": _f("MATCH_MIN_FACE_BRIGHTNESS", 42.0),
-        "max_face_brightness": _f("MATCH_MAX_FACE_BRIGHTNESS", 248.0),
-        "min_face_brightness_std": _f("MATCH_MIN_FACE_BRIGHTNESS_STD", 14.0),
-        "max_clipped_highlight_ratio": _f("MATCH_MAX_CLIPPED_HIGHLIGHT_RATIO", 0.14),
+        "min_face_brightness": _f("MATCH_MIN_FACE_BRIGHTNESS", 35.0),
+        "max_face_brightness": _f("MATCH_MAX_FACE_BRIGHTNESS", 252.0),
+        "min_face_brightness_std": _f("MATCH_MIN_FACE_BRIGHTNESS_STD", 10.0),
+        "max_clipped_highlight_ratio": _f("MATCH_MAX_CLIPPED_HIGHLIGHT_RATIO", 0.20),
         "errcount_device_near_face": int(_f("MATCH_ERRCOUNT_DEVICE_NEAR_FACE", 40)),
         "errcount_device_in_frame": int(_f("MATCH_ERRCOUNT_DEVICE_IN_FRAME", 30)),
         "errcount_spoof_fail": int(_f("MATCH_ERRCOUNT_SPOOF_FAIL", 35)),
-        "errcount_bad_lighting": int(_f("MATCH_ERRCOUNT_BAD_LIGHTING", 15)),
+        "errcount_bad_lighting": int(_f("MATCH_ERRCOUNT_BAD_LIGHTING", 8)),
     }
 
 
@@ -54,7 +60,6 @@ def _classify_device_display_name(cls_name: str, obj_w: float, obj_h: float, are
     base = DEVICE_CLASSES.get(cls_name, cls_name.title())
     if cls_name == "cell phone":
         ar = obj_w / (obj_h + 1e-6)
-        # Large near-square phone bbox → likely tablet
         if 0.72 <= ar <= 1.38 and area_pct >= 0.055:
             return "Tablet"
     if cls_name == "laptop":
@@ -104,6 +109,17 @@ def scan_yolo_devices(
                 if iou_face > hard_iou:
                     hard_overlap = True
                 part = min(1.0, iou_face * 2.1 + min(0.40, area_pct * 3.0))
+                cx_norm = float((bx[0] + bx[2]) * 0.5 / (w + 1e-6))
+                # Phone held to camera: device on frame edge or large in frame
+                if cls_name in ("cell phone", "tv", "monitor", "laptop"):
+                    if area_pct >= 0.05:
+                        part = max(part, 0.38)
+                    if area_pct >= 0.10:
+                        part = max(part, 0.52)
+                    if cx_norm < 0.24 or cx_norm > 0.76:
+                        part = max(part, 0.45)
+                    if cls_name == "cell phone" and area_pct >= 0.06:
+                        part = max(part, 0.48)
                 max_risk = max(max_risk, part)
     except Exception as e:
         print(f"YOLO selfie scan error: {e}")
@@ -115,10 +131,15 @@ def check_face_environment_light(
     img_bgr: np.ndarray,
     pts_68: Optional[List[Dict[str, Any]]],
     cfg: Dict[str, Any],
+    *,
+    spoof_per_signal: Optional[Dict[str, float]] = None,
+    devices_found: Optional[List[str]] = None,
+    device_replay_score: float = 0.0,
+    match_context: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Returns list of lighting issues (empty if OK).
-    Each item: {type, detail, penalty_fraction}
+    Face-ROI lighting checks. Ambient room light (tube, sun, window) should NOT
+    penalize unless display-attack corroboration is present.
     """
     issues: List[Dict[str, Any]] = []
     roi = get_face_roi(img_bgr, pts_68) if pts_68 else None
@@ -128,60 +149,97 @@ def check_face_environment_light(
     brightness = stats["brightness"]
     brightness_std = stats["brightness_std"]
 
+    display_attack = has_display_attack_corroboration(
+        spoof_per_signal,
+        device_replay_score=device_replay_score,
+        devices_found=devices_found,
+        match_context=match_context,
+    )
+
+    # Usability: face too dark to verify
     if brightness < cfg["min_face_brightness"]:
         issues.append({
             "type": "Face Too Dark",
-            "detail": f"Mean brightness {brightness:.0f} (min {cfg['min_face_brightness']:.0f}). Use better front lighting.",
-            "penalty": 0.15,
+            "detail": (
+                f"Mean face brightness {brightness:.0f} (min {cfg['min_face_brightness']:.0f}). "
+                "Use better front lighting."
+            ),
+            "penalty": 0.10,
         })
+
+    # Extreme over-exposure only (not normal bright room / sunlight)
     if brightness > cfg["max_face_brightness"]:
         issues.append({
             "type": "Face Over-Exposed",
-            "detail": f"Mean brightness {brightness:.0f} (max {cfg['max_face_brightness']:.0f}). Reduce direct light on face.",
-            "penalty": 0.12,
-        })
-    min_std = float(cfg["min_face_brightness_std"])
-    if brightness > 200:
-        min_std = max(min_std, 20.0)
-    if brightness > 225:
-        min_std = max(min_std, 22.0)
-
-    if brightness_std < min_std:
-        issues.append({
-            "type": "Uniform Lighting (Screen-Like)",
             "detail": (
-                f"Very low brightness variation (std {brightness_std:.1f}, need ≥{min_std:.0f}). "
-                "May indicate a flat emissive screen rather than natural skin."
+                f"Mean face brightness {brightness:.0f} (max {cfg['max_face_brightness']:.0f}). "
+                "Reduce direct light on face."
             ),
-            "penalty": 0.22 if brightness > 200 else 0.18,
+            "penalty": 0.08,
         })
 
-    gray = cv2.cvtColor(target, cv2.COLOR_BGR2GRAY)
-    clipped = float(np.mean(gray >= 250))
-    clip_max = float(cfg["max_clipped_highlight_ratio"])
-    if brightness > 210:
-        clip_max = min(clip_max, 0.10)
-    if clipped > clip_max:
-        issues.append({
-            "type": "Specular Screen Glare",
-            "detail": f"Saturated highlights {clipped * 100:.1f}% of face ROI (max {clip_max * 100:.0f}%).",
-            "penalty": 0.24 if brightness > 210 else 0.20,
-        })
+    # Screen-like uniformity / glare — only when display attack is corroborated
+    if display_attack:
+        min_std = float(cfg["min_face_brightness_std"])
+        if brightness > 200:
+            min_std = max(min_std, 18.0)
+        if brightness > 225:
+            min_std = max(min_std, 20.0)
+
+        if brightness_std < min_std and brightness > 170:
+            issues.append({
+                "type": "Uniform Lighting (Screen-Like)",
+                "detail": (
+                    f"Low face texture variation (std {brightness_std:.1f}) with display indicators. "
+                    "Do not use a phone or tablet screen."
+                ),
+                "penalty": 0.20,
+            })
+
+        gray = cv2.cvtColor(target, cv2.COLOR_BGR2GRAY)
+        clipped = float(np.mean(gray >= 250))
+        clip_max = float(cfg["max_clipped_highlight_ratio"])
+        if brightness > 210:
+            clip_max = min(clip_max, 0.12)
+        if clipped > clip_max:
+            issues.append({
+                "type": "Specular Screen Glare",
+                "detail": (
+                    f"Saturated highlights {clipped * 100:.1f}% of face with display cues "
+                    f"(max {clip_max * 100:.0f}%)."
+                ),
+                "penalty": 0.18,
+            })
 
     return issues
 
 
-def reflection_should_hard_reject(spoof_detail: Dict[str, Any], cfg: Dict[str, Any]) -> Tuple[bool, str]:
+def reflection_should_hard_reject(
+    spoof_detail: Dict[str, Any],
+    cfg: Dict[str, Any],
+    *,
+    device_replay_score: float = 0.0,
+    devices_found: Optional[List[str]] = None,
+) -> Tuple[bool, str]:
     if not cfg["hard_reject_screen_reflection"]:
         return False, ""
 
     refl_label = str(spoof_detail.get("reflection_classification") or "")
     per_signal = spoof_detail.get("confidence_per_signal") or {}
     reflection_raw = float(per_signal.get("reflection_raw", 0.0))
-    triggered = set(spoof_detail.get("triggered_rules") or [])
+    triggered = list(spoof_detail.get("triggered_rules") or [])
+
+    display_corr = has_display_attack_corroboration(
+        per_signal,
+        triggered,
+        device_replay_score=device_replay_score,
+        devices_found=devices_found,
+    )
+    if not display_corr:
+        return False, ""
 
     if refl_label in SCREEN_REFLECTION_LABELS:
-        return True, f"Screen-like ambient reflection detected ({refl_label.replace('_', ' ')})"
+        return True, f"Screen-like reflection detected ({refl_label.replace('_', ' ')})"
 
     if reflection_raw > cfg["reflection_raw_max"]:
         return True, f"Strong screen reflection signal (score {reflection_raw:.2f})"
@@ -195,21 +253,71 @@ def reflection_should_hard_reject(spoof_detail: Dict[str, Any], cfg: Dict[str, A
     return False, ""
 
 
+def display_attack_should_hard_reject(
+    spoof_detail: Dict[str, Any],
+    *,
+    device_replay_score: float = 0.0,
+    devices_found: Optional[List[str]] = None,
+) -> Tuple[bool, str]:
+    """Hard reject when high-brightness screen replay cues co-occur (photo/video on phone)."""
+    per_signal = spoof_detail.get("confidence_per_signal") or {}
+    triggered = list(spoof_detail.get("triggered_rules") or [])
+
+    hi = float(per_signal.get("high_brightness_screen", 0.0))
+    moire = float(per_signal.get("moire", 0.0))
+    grid = float(per_signal.get("pixel_grid", 0.0))
+    tex = float(per_signal.get("texture_degraded", 0.0))
+    flat = float(per_signal.get("flat_plane", 0.0))
+
+    if devices_found and hi >= 0.22:
+        names = ", ".join(devices_found)
+        return True, f"Electronic device ({names}) with high-brightness display replay"
+
+    if hi >= 0.48 and (moire >= 0.32 or grid >= 0.34 or tex >= 0.38):
+        return True, "High-brightness screen replay detected (moiré/texture/grid fusion)"
+
+    if hi >= 0.58 and flat >= 0.42:
+        return True, "High-brightness flat emissive surface detected"
+
+    if count_display_imaging_signals(per_signal, threshold=0.40) >= 3:
+        return True, "Multiple display imaging signals (screen/photo attack)"
+
+    if device_replay_score >= 0.30 and is_display_imaging_triggered(triggered, per_signal):
+        return True, "Device near face with display imaging pattern"
+
+    return False, ""
+
+
+def is_display_imaging_triggered(
+    triggered: List[str],
+    per_signal: Dict[str, float],
+) -> bool:
+    imaging = {"moire", "high_brightness_screen", "pixel_grid", "texture_degraded", "screen_border"}
+    if any(t in imaging for t in triggered):
+        return True
+    return count_display_imaging_signals(per_signal, threshold=0.34) >= 2
+
+
 def run_post_selfie_security(
     img_raw: np.ndarray,
     face_landmarks_mp: Optional[List[Dict[str, Any]]],
     *,
     errcount: int,
     penalties_breakdown: List[Dict[str, Any]],
+    identity_assessment: Optional[Dict[str, Any]] = None,
+    stream_risk_ema: float = 0.0,
 ) -> Dict[str, Any]:
     """
-    Run YOLO, environment light, and PAD spoof on the final selfie.
-    Returns dict with optional 'error' for hard reject, updated errcount/penalties, spoof_detail.
+    Run YOLO, PAD spoof, multi-factor risk fusion (no single-condition reject).
+    Returns security_verdict: pass | pass_penalty | reject, composite_risk, risk_factors.
     """
+    identity_assessment = identity_assessment or {"skipped": True}
     cfg = load_post_selfie_config()
     from frame_processor import _get_yolo
 
     device_replay_score = 0.0
+    devices_found: List[str] = []
+    device_hard = False
     yolo = _get_yolo()
 
     face_bbox = (0, 0, img_raw.shape[1], img_raw.shape[0])
@@ -234,21 +342,6 @@ def run_post_selfie_security(
         device_replay_score = dr
         print(f"🔒 YOLO selfie scan: risk={dr:.3f}, hard_overlap={device_hard}, devices={devices_found}")
 
-        if device_hard:
-            names = ", ".join(devices_found) if devices_found else "electronic device"
-            return {
-                "error": (
-                    f"Security Alert: {names} detected overlapping your face. "
-                    "Take a direct selfie without holding a phone, tablet, or laptop in front of the camera."
-                ),
-                "security_penalty_breakdown": [{
-                    "type": "Electronic Device Blocking Face",
-                    "penalty": 1.0,
-                    "count": 1,
-                    "detail": f"YOLO overlap risk={dr:.2f}; detected: {names}",
-                }],
-            }
-
         if dr > cfg["device_near_face_dr"]:
             print(f"⚠️ Device near face: risk={dr:.3f}")
             errcount += cfg["errcount_device_near_face"]
@@ -269,10 +362,48 @@ def run_post_selfie_security(
                 "detail": f"Detected: {', '.join(devices_found)}",
             })
 
-    # Environment / ambient light on face ROI
-    light_issues = check_face_environment_light(img_raw, face_landmarks_mp, cfg)
+    bezel_score, frame_screen_border = analyze_match_frame_context(img_raw)
+    if bezel_score >= 0.35:
+        print(f"📱 Frame bezel score: {bezel_score:.3f}")
+    if frame_screen_border >= 0.35:
+        print(f"🖥️ Frame screen-border score: {frame_screen_border:.3f}")
+
+    extra_signals: Dict[str, float] = {}
+    if device_replay_score > 0.01:
+        extra_signals["device_replay"] = device_replay_score
+    if bezel_score > 0.05:
+        extra_signals["frame_bezel"] = bezel_score
+    if frame_screen_border > 0.05:
+        extra_signals["frame_screen_border"] = frame_screen_border
+
+    spoof_detail = analyze_passive_spoof_single_frame(
+        img_raw,
+        face_landmarks_mp,
+        strict=True,
+        extra_signals=extra_signals or None,
+        single_frame_mode=True,
+    )
+
+    reflection_label = str(spoof_detail.get("reflection_classification") or "")
+    per_signal = spoof_detail.get("confidence_per_signal") or {}
+    match_context = {
+        "match_selfie": True,
+        "frame_bezel": bezel_score,
+        "frame_screen_border": frame_screen_border,
+        "reflection_label": reflection_label,
+        "devices_found_list": list(devices_found),
+    }
+    light_issues = check_face_environment_light(
+        img_raw,
+        face_landmarks_mp,
+        cfg,
+        spoof_per_signal=per_signal,
+        devices_found=devices_found,
+        device_replay_score=device_replay_score,
+        match_context=match_context,
+    )
     for issue in light_issues:
-        print(f"💡 Lighting issue: {issue['type']} — {issue['detail']}")
+        print(f"💡 Lighting issue (display-corroborated): {issue['type']} — {issue['detail']}")
         errcount += cfg["errcount_bad_lighting"]
         penalties_breakdown.append({
             "type": issue["type"],
@@ -281,57 +412,72 @@ def run_post_selfie_security(
             "detail": issue["detail"],
         })
 
-    extra_signals = {"device_replay": device_replay_score} if device_replay_score > 0.01 else None
-    spoof_detail = analyze_passive_spoof_single_frame(
-        img_raw,
-        face_landmarks_mp,
-        strict=True,
-        extra_signals=extra_signals,
-        single_frame_mode=True,
+    triggered_rules = spoof_detail.get("triggered_rules", [])
+    live_reason = "OK" if spoof_detail.get("is_live") else (
+        "Weighted spoof: " + ", ".join(triggered_rules)[:220]
     )
 
-    refl_reject, refl_reason = reflection_should_hard_reject(spoof_detail, cfg)
-    if refl_reject:
-        print(f"🚨 HARD REJECT reflection: {refl_reason}")
+    security = evaluate_match_security(
+        spoof_detail=spoof_detail,
+        device_replay_score=device_replay_score,
+        devices_found=devices_found,
+        device_hard_overlap=bool(device_hard),
+        identity_assessment=identity_assessment,
+        errcount=errcount,
+        stream_risk_ema=stream_risk_ema,
+        match_context=match_context,
+        frame_bezel_score=bezel_score,
+    )
+
+    verdict = security["verdict"]
+    composite_risk = float(security["composite_risk"])
+    print(
+        f"🔒 Multi-factor security: verdict={verdict}, composite={composite_risk:.1f}, "
+        f"factors={security.get('risk_factors')}"
+    )
+
+    penalties_breakdown.append({
+        "type": "Security Risk Score",
+        "penalty": 0.0,
+        "count": 1,
+        "detail": f"Composite {composite_risk:.0f}/100 — {security.get('reason', '')}",
+    })
+
+    if verdict == "reject":
+        screen_replay = bool(security.get("screen_replay"))
+        digital_media = bool(security.get("digital_media", screen_replay))
+        if screen_replay or digital_media:
+            msg = (
+                "Security Alert: Digital screen or photo replay detected. "
+                "Do not use a photograph or digital screen."
+            )
+        else:
+            msg = security.get("user_message") or (
+                "Security Alert: Verification failed. Do not use a photograph or digital screen."
+            )
         return {
-            "error": (
-                "Ambient light / screen reflection detected. "
-                "Do not photograph your face from a phone, tablet, or laptop screen. "
-                f"({refl_reason})"
-            ),
+            "error": msg,
+            "user_message": msg,
             "spoof_detail": spoof_detail,
             "security_penalty_breakdown": penalties_breakdown,
+            "capture_live_ok": False,
+            "security_verdict": verdict,
+            "composite_risk": composite_risk,
+            "risk_factors": security.get("risk_factors"),
+            "screen_replay": screen_replay,
+            "digital_media": digital_media,
+            "user_mismatch": bool(security.get("user_mismatch")),
         }
 
-    live_ok = bool(spoof_detail["is_live"])
-    triggered_rules = spoof_detail.get("triggered_rules", [])
-    live_reason = "OK" if live_ok else ("Weighted spoof: " + ", ".join(triggered_rules)[:220])
-
-    print(
-        f"🔒 Spoof selfie: score={spoof_detail['total_spoof_score']:.1f}/"
-        f"{spoof_detail.get('reject_threshold', 68)}, live={live_ok}, rules={triggered_rules}"
-    )
-
-    if not live_ok:
-        if cfg["hard_reject_spoof"]:
-            return {
-                "error": (
-                    "Security Alert: Final capture failed live-face verification. "
-                    "Do not use a photo or screen; face the camera directly in good lighting. "
-                    + live_reason[:200]
-                ),
-                "spoof_detail": spoof_detail,
-                "security_penalty_breakdown": penalties_breakdown,
-            }
-        errcount += cfg["errcount_spoof_fail"]
+    live_ok = True
+    if verdict == "pass_penalty":
+        pen = float(security.get("confidence_penalty", 0.0))
+        errcount += max(5, int(pen * 1000))
         penalties_breakdown.append({
-            "type": "Digital Media / Screen Detected",
-            "penalty": round(cfg["errcount_spoof_fail"] * 0.01, 2),
+            "type": "Elevated Security Risk (penalty)",
+            "penalty": pen,
             "count": 1,
-            "detail": (
-                f"Spoof score {spoof_detail['total_spoof_score']:.0f}/"
-                f"{spoof_detail.get('reject_threshold', 68):.0f} — {live_reason[:400]}"
-            ),
+            "detail": security.get("reason", ""),
         })
 
     return {
@@ -342,4 +488,8 @@ def run_post_selfie_security(
         "live_ok": live_ok,
         "live_reason": live_reason,
         "light_issues": light_issues,
+        "security_verdict": verdict,
+        "composite_risk": composite_risk,
+        "risk_factors": security.get("risk_factors"),
+        "confidence_penalty": float(security.get("confidence_penalty", 0.0)),
     }

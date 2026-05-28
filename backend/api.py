@@ -28,8 +28,10 @@ import numpy as np
 import base64
 import uuid
 import secrets
-from fastapi import FastAPI, File, UploadFile, Form, Body, HTTPException
+from fastapi import FastAPI, File, UploadFile, Form, Body, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
 import uvicorn
 from datetime import datetime, timedelta
 from typing import Optional, List, Tuple, Any, Dict
@@ -45,7 +47,13 @@ from embedding_pipeline import (
     extract_face_embedding,
     load_match_thresholds,
 )
-from post_selfie_security import load_post_selfie_config, run_post_selfie_security
+from post_selfie_security import load_post_selfie_config, run_post_selfie_security, scan_yolo_devices
+from challenge_frame_verification import assess_challenge_continuity
+from frame_processor import _get_yolo
+from poc_logging import log_event, log_security_verdict
+from api_errors import user_error, safe_exception_message, USER_MESSAGES, public_dict
+from rate_limit import RateLimitMiddleware
+from poc_helpers import enrich_match_security_payload
 from spoof_scoring import analyze_passive_spoof_single_frame
 from liveness_checks import check_reaction_timing
 from database import (
@@ -99,6 +107,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.add_middleware(RateLimitMiddleware)
 
 SESSION_TTL_MINUTES = 15
 SESSION_ISSUE_MAX_ATTEMPTS = 50
@@ -189,6 +199,67 @@ async def _startup():
         f"torch={torch.__version__}, register_api=email-v2, liveness_fast_setup={LIVENESS_FAST_SETUP}"
     )
     asyncio.create_task(asyncio.to_thread(warmup_yolo))
+    from liveness_session import session_manager as _sm
+
+    redis_on = hasattr(_sm, "_redis_ok") and getattr(_sm, "_redis_ok", False)
+    log_event("api_startup", extra={"redis_sessions": redis_on, "device": DEVICE})
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    detail = exc.detail
+    if isinstance(detail, dict):
+        body = detail
+    else:
+        body = user_error("SERVER_ERROR", http_status=exc.status_code)
+        body["error"] = USER_MESSAGES.get("SERVER_ERROR") if exc.status_code >= 500 else str(detail)[:120]
+    status = int(body.pop("_http_status", exc.status_code)) if isinstance(body, dict) and "_http_status" in body else exc.status_code
+    if isinstance(body, dict) and "error_code" not in body:
+        body.setdefault("error_code", "HTTP_ERROR")
+        body.setdefault("user_message", body.get("error"))
+        body.setdefault("retry_allowed", exc.status_code in (429, 503))
+    return JSONResponse(status_code=status, content=body if isinstance(body, dict) else {"error": str(detail)})
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    log_event("unhandled_exception", level="error", extra={"path": request.url.path, "reason": str(exc)[:200]})
+    body = user_error("SERVER_ERROR", retry_allowed=True, http_status=500)
+    status = int(body.pop("_http_status", 500))
+    return JSONResponse(status_code=status, content=body)
+
+
+@app.get("/health/live")
+async def health_live():
+    return {"status": "ok"}
+
+
+@app.get("/health/ready")
+async def health_ready():
+    """Readiness: DB + face models loaded."""
+    from liveness_session import session_manager as _sm
+
+    db_ok = False
+    try:
+        from database import count_faces
+
+        await count_faces()
+        db_ok = True
+    except Exception as e:
+        log_event("health_db_failed", level="warning", extra={"reason": str(e)[:80]})
+    models_ok = mtcnn is not None and model is not None
+    redis_ok = getattr(_sm, "_redis_ok", False) if hasattr(_sm, "_redis_ok") else False
+    ready = db_ok and models_ok
+    return JSONResponse(
+        status_code=200 if ready else 503,
+        content={
+            "ready": ready,
+            "database": db_ok,
+            "models": models_ok,
+            "redis_sessions": redis_ok,
+            "fast_match": FAST_MATCH,
+        },
+    )
 
 
 @app.get("/health/match-config")
@@ -276,7 +347,7 @@ async def start_liveness_session(payload: Dict[str, Any] = Body(...)):
     try:
         device_id = (payload or {}).get("device_id")
         if not device_id or not isinstance(device_id, str) or len(device_id) > 128:
-            raise HTTPException(status_code=400, detail="Invalid device_id")
+            raise HTTPException(status_code=400, detail=user_error("DEVICE_INVALID"))
 
         agent_label = (payload or {}).get("agent_label")
         agent_emb = None
@@ -316,9 +387,11 @@ async def start_liveness_session(payload: Dict[str, Any] = Body(...)):
             "step": "calibration",
             "agent_label": agent_label
         }
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"❌ Error in start_liveness_session: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        log_event("liveness_start_failed", level="error", extra={"reason": str(e)[:200]})
+        raise HTTPException(status_code=500, detail=user_error("LIVENESS_START_FAILED", retry_allowed=True, http_status=500))
 
 
 @app.post("/liveness/frame")
@@ -329,15 +402,17 @@ async def liveness_frame(
     """Process a single frame through the backend liveness pipeline."""
     sess = session_manager.get(session_id)
     if sess is None:
-        raise HTTPException(status_code=400, detail="Invalid or expired session")
+        raise HTTPException(status_code=400, detail=user_error("SESSION_INVALID", retry_allowed=True))
 
     raw = await frame.read()
     if len(raw) == 0:
-        raise HTTPException(status_code=400, detail="Empty frame")
+        raise HTTPException(status_code=400, detail=user_error("EMPTY_FRAME", retry_allowed=True))
 
     result = await asyncio.to_thread(
         process_frame, sess, raw, verify_identity_callback
     )
+    if hasattr(session_manager, "touch"):
+        session_manager.touch(sess)
     return result
 
 
@@ -366,21 +441,13 @@ async def complete_liveness_session(payload: Dict[str, Any] = Body(...)):
 
     # Validate all checks passed
     if sess.step != "complete":
-        raise HTTPException(
-            status_code=400,
-            detail=f"Session not complete. Current step: {sess.step}",
-        )
+        raise HTTPException(status_code=400, detail=user_error("SESSION_INCOMPLETE", retry_allowed=True))
 
     if not sess.all_gestures_done:
-        raise HTTPException(
-            status_code=400,
-            detail="Liveness gestures incomplete. Please complete all head challenges.",
-        )
+        raise HTTPException(status_code=400, detail=user_error("SESSION_INCOMPLETE", retry_allowed=True))
+
     if not sess.depth_passed or not sess.light_passed or not sess.micro_passed:
-        raise HTTPException(
-            status_code=400,
-            detail="Liveness verification incomplete. Please restart and follow all steps.",
-        )
+        raise HTTPException(status_code=400, detail=user_error("SESSION_INCOMPLETE", retry_allowed=True))
 
     # Check reaction timing
     timing_ok, timing_reason = check_reaction_timing(sess.reaction_times)
@@ -420,9 +487,10 @@ async def complete_liveness_session(payload: Dict[str, Any] = Body(...)):
         },
     )
 
-    # Remove from in-memory store (keep in PostgreSQL)
-    # Don't remove yet — /match still needs to verify it
+    # Don't remove yet — /match still needs challenge snapshots
     sess.step = "verified"
+    if hasattr(session_manager, "touch"):
+        session_manager.touch(sess, force=True)
 
     return {"ok": True, "verified": True, "confidence": confidence}
 
@@ -518,12 +586,12 @@ async def match_face(
     try:
         # Strict liveness verification
         if not liveness_session_id or not device_id:
-            return {"error": "Liveness session is strictly required. Please start the camera flow again."}
+            return public_dict(user_error("MATCH_SESSION_REQUIRED", retry_allowed=False))
 
         now = datetime.utcnow()
         # Check in-memory session first (backend-driven)
         mem_sess = session_manager.get(liveness_session_id)
-        if mem_sess and mem_sess.step == "complete":
+        if mem_sess and mem_sess.step in ("complete", "verified"):
             pass  # Backend-driven session verified
         else:
             # Fallback to PostgreSQL (legacy or already-completed)
@@ -533,27 +601,60 @@ async def match_face(
                 now=now,
             )
             if not sess:
-                return {"error": "Invalid or expired liveness session. Please start the camera flow again."}
+                return public_dict(user_error("SESSION_INVALID", retry_allowed=False))
 
         # 1. READ ORIGINAL IMAGE
         img_raw = cv2.imread(temp_path)
         if img_raw is None:
-            return {"error": "Could not read image."}
+            return public_dict(user_error("IMAGE_READ_FAILED", retry_allowed=True))
 
         # 3. DETECT FACE (canonical pipeline — same max_side as build_db indexing)
         try:
             face_out = extract_face_embedding(img_raw, mtcnn, model, DEVICE)
         except Exception as e:
-            print(f"Face detection crash: {e}")
-            return {"error": f"Face detection engine error: {str(e)}"}
+            log_event("face_detection_crash", level="error", session_id=liveness_session_id, extra={"reason": str(e)[:200]})
+            return public_dict(user_error("SERVER_ERROR", retry_allowed=True, http_status=500))
 
         if not face_out["ok"]:
-            return {
-                "error": "No face detected in the uploaded image. Please ensure your face is clearly visible, well-lit, and facing the camera directly."
-            }
+            return public_dict(user_error("FACE_NOT_FOUND", retry_allowed=True))
 
         emb = face_out["embedding"]
         face_landmarks_mp = face_out["face_landmarks_mp"]
+
+        # Challenge frame continuity (in-memory only; fused into risk engine below)
+        mem_sess_verify = session_manager.get(liveness_session_id)
+        identity_assessment: Dict[str, Any] = {"skipped": True}
+        stream_risk_ema = float(getattr(mem_sess_verify, "stream_risk_ema", 0.0) if mem_sess_verify else 0.0)
+        selfie_devices: List[str] = []
+        if mem_sess_verify and mem_sess_verify.challenge_snapshots:
+            yolo = _get_yolo()
+            if yolo and face_landmarks_mp:
+                lm_xs = [p["x"] for p in face_landmarks_mp]
+                lm_ys = [p["y"] for p in face_landmarks_mp]
+                face_bbox_match = (
+                    int(min(lm_xs)),
+                    int(min(lm_ys)),
+                    int(max(lm_xs) - min(lm_xs)),
+                    int(max(lm_ys) - min(lm_ys)),
+                )
+                pad_cfg = load_post_selfie_config()
+                _, _, selfie_devices = scan_yolo_devices(
+                    img_raw,
+                    face_bbox_match,
+                    yolo,
+                    conf=pad_cfg["yolo_conf"],
+                    hard_iou=pad_cfg["device_hard_iou"],
+                )
+            identity_assessment = assess_challenge_continuity(
+                mem_sess_verify,
+                img_raw,
+                emb,
+                face_landmarks_mp,
+                mtcnn=mtcnn,
+                model=model,
+                device=DEVICE,
+                selfie_devices=selfie_devices,
+            )
 
         # FaceNet comparison with liveness reference photo if provided
         if liveness_ref_photo:
@@ -595,16 +696,42 @@ async def match_face(
             face_landmarks_mp,
             errcount=errcount,
             penalties_breakdown=penalties_breakdown,
+            identity_assessment=identity_assessment,
+            stream_risk_ema=stream_risk_ema,
         )
         if sec.get("error"):
-            out = {"error": sec["error"]}
+            out = {
+                "error": sec["error"],
+                "user_message": sec.get("user_message", sec["error"]),
+                "security_verdict": sec.get("security_verdict", "reject"),
+                "composite_risk": sec.get("composite_risk"),
+                "risk_factors": sec.get("risk_factors"),
+                "capture_live_ok": False,
+                "screen_replay": bool(sec.get("screen_replay")),
+                "digital_media": bool(sec.get("digital_media", sec.get("screen_replay"))),
+                "user_mismatch": bool(sec.get("user_mismatch")),
+            }
             if sec.get("security_penalty_breakdown"):
                 out["security_penalty_breakdown"] = sec["security_penalty_breakdown"]
             if sec.get("spoof_detail"):
                 sd = sec["spoof_detail"]
-                out["capture_live_ok"] = False
                 out["spoof_score"] = sd.get("total_spoof_score")
                 out["triggered_rules"] = sd.get("triggered_rules", [])
+            enrich_match_security_payload(
+                out,
+                identity_assessment=identity_assessment,
+                screen_replay=bool(sec.get("screen_replay")),
+            )
+            log_security_verdict(
+                phase="match",
+                verdict=out.get("security_verdict", "reject"),
+                session_id=liveness_session_id,
+                device_id=device_id,
+                composite_risk=out.get("composite_risk"),
+                reason=out.get("error"),
+                retry_allowed=out.get("retry_allowed", False),
+                risk_factors=out.get("risk_factors"),
+            )
             return out
 
         errcount = sec["errcount"]
@@ -612,6 +739,10 @@ async def match_face(
         spoof_detail = sec["spoof_detail"]
         live_ok = sec["live_ok"]
         live_reason = sec["live_reason"]
+        security_verdict = sec.get("security_verdict", "pass")
+        composite_risk = float(sec.get("composite_risk", 0.0))
+        risk_factors = sec.get("risk_factors")
+        risk_confidence_penalty = float(sec.get("confidence_penalty", 0.0))
         live_score = max(0.0, min(1.0, 1.0 - spoof_detail["total_spoof_score"] / 100.0))
 
         # 5. PREPARE PROCESSED IMAGE FOR UI (with background removal; FAST_MATCH uses a small RGB resize only)
@@ -790,17 +921,21 @@ async def match_face(
                 "detail": f"Raw similarity score: {int(round(base_conf * 100))}%"
             })
 
-            if errcount > 0:
-                print(f"⚠️ Applying security penalty: -{penalty:.3f} (from errcount={errcount})")
-                penalties_breakdown.append({
-                    "type": "Digital Media Detection",
-                    "penalty": round(penalty, 3),
-                    "count": errcount // 10,
-                    "detail": "Suspicious activity patterns detected during liveness flow."
-                })
-
+            total_penalty = penalty + risk_confidence_penalty
+            if total_penalty > 0:
+                print(
+                    f"⚠️ Applying security penalty: -{total_penalty:.3f} "
+                    f"(errcount={errcount}, risk_penalty={risk_confidence_penalty:.3f})"
+                )
+                if penalty > 0:
+                    penalties_breakdown.append({
+                        "type": "Liveness Session Risk",
+                        "penalty": round(penalty, 3),
+                        "count": errcount // 10,
+                        "detail": "Accumulated liveness stream signals.",
+                    })
                 for r in results:
-                    r["confidence"] = max(0.0, round(r["confidence"] - penalty, 3))
+                    r["confidence"] = max(0.0, round(r["confidence"] - total_penalty, 3))
             
             # Removed hard rejection as per user request to show penalty table instead
             # if errcount >= 20:
@@ -858,9 +993,6 @@ async def match_face(
                 status="consumed",
                 raw_updates={"consumed_at": datetime.utcnow()},
             )
-            # Clean up in-memory session
-            session_manager.remove(liveness_session_id)
-
         # Encode processed image to base64 for frontend display
         _, buffer = cv2.imencode(".jpg", cv2.cvtColor(img_processed, cv2.COLOR_RGB2BGR))
         processed_b64 = base64.b64encode(buffer).decode("utf-8")
@@ -868,6 +1000,17 @@ async def match_face(
         # Encode the ORIGINAL captured selfie (not background-removed) for comparison
         _, raw_buffer = cv2.imencode(".jpg", img_raw)
         captured_b64 = base64.b64encode(raw_buffer).decode("utf-8")
+
+        log_security_verdict(
+            phase="match",
+            verdict=security_verdict,
+            session_id=liveness_session_id,
+            device_id=device_id,
+            composite_risk=composite_risk,
+            reason="match_ok",
+            retry_allowed=False,
+            risk_factors=risk_factors if isinstance(risk_factors, dict) else None,
+        )
 
         return {
             "matches": results,
@@ -886,12 +1029,24 @@ async def match_face(
             "correlation_gate_notes": spoof_detail.get("correlation_gate_notes", []),
             "extra_signals_used": spoof_detail.get("extra_signals_used", {}),
             "match_diagnostics": match_diagnostics,
+            "security_verdict": security_verdict,
+            "composite_risk": composite_risk,
+            "risk_factors": risk_factors,
+            "challenge_frames_verified": len(
+                getattr(mem_sess, "challenge_snapshots", []) or []
+            )
+            if mem_sess
+            else 0,
+            "retry_allowed": False,
         }
 
     except Exception as e:
-        return {"error": f"Server error: {str(e)}"}
+        log_event("match_unhandled", level="error", session_id=liveness_session_id, extra={"reason": str(e)[:200]})
+        return public_dict(user_error("SERVER_ERROR", retry_allowed=True, http_status=500))
 
     finally:
+        if liveness_session_id:
+            session_manager.remove(liveness_session_id)
         if os.path.exists(temp_path):
             os.remove(temp_path)
 
