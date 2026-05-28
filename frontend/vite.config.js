@@ -30,6 +30,7 @@ export default defineConfig(({ mode }) => {
         '/match': { target: backendTarget, changeOrigin: true },
         '/register': registerProxy,
         '/agents': { target: backendTarget, changeOrigin: true },
+        '/auth': { target: backendTarget, changeOrigin: true },
       },
     },
   }

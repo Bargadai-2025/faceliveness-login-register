@@ -33,6 +33,7 @@ const DEVICE_KEY = "facematch_device_id";
 const FRAME_INTERVAL_MS = 80;
 const PROCESS_W = 640;
 const PROCESS_H = 480;
+const SHOW_FACE_MESH_OVERLAY = false;
 
 const CHALLENGE_UI = {
   turn_left: { label: "Turn your head LEFT", icon: ArrowLeft },
@@ -49,7 +50,7 @@ const CHALLENGE_UI = {
   // frown: { label: "FROWN (sad face)", icon: Smile },
   move_closer: { label: "Move Closer", icon: Maximize },
   move_farther: { label: "Move Away", icon: Maximize },
-  shake_head: { label: "Shake head NO", icon: Activity },
+  shake_head: { label: "Shake head left & right (NO)", icon: Activity },
   // blink_twice_fast: { label: "BLINK twice fast", icon: Eye },
   look_left_hold: { label: "Look LEFT & HOLD", icon: ArrowLeft },
   look_right_hold: { label: "Look RIGHT & HOLD", icon: ArrowRight },
@@ -90,7 +91,7 @@ function getOrCreateDeviceId() {
   return sessionDeviceId;
 }
 
-export default function FaceRegister({ userEmail, userAgentLabel, onLogout }) {
+export default function FaceRegister({ userEmail, userAgentLabel, onLogout, onRegistered }) {
   const [preview, setPreview] = useState(null);
   const [file, setFile] = useState(null);
   const [results, setResults] = useState([]);
@@ -126,6 +127,7 @@ export default function FaceRegister({ userEmail, userAgentLabel, onLogout }) {
   const [completedSteps, setCompletedSteps] = useState([]);
   const [registerMode, setRegisterMode] = useState(false);
   const [firstName, setFirstName] = useState("");
+  const [email, setEmail] = useState("");
   const [middleName, setMiddleName] = useState("");
   const [lastName, setLastName] = useState("");
   const [docType, setDocType] = useState("Selfie");
@@ -140,9 +142,11 @@ export default function FaceRegister({ userEmail, userAgentLabel, onLogout }) {
   const inputRef = useRef();
   const frameIntervalRef = useRef(null);
   const livenessSessionIdRef = useRef(null);
+  const registrationSessionIdRef = useRef(null);
   const livenessCompletedRef = useRef(false);
   const streamingRef = useRef(false);
   const profileMenuRef = useRef(null);
+  const [photoCaptured, setPhotoCaptured] = useState(false);
 
   // Click outside profile menu
   useEffect(() => {
@@ -189,66 +193,16 @@ export default function FaceRegister({ userEmail, userAgentLabel, onLogout }) {
   }, []);
 
   useEffect(() => {
-    if (!showCamera) return undefined;
+    if (!showCamera || SHOW_FACE_MESH_OVERLAY) return undefined;
     const canvas = overlayCanvasRef.current;
     if (!canvas) return undefined;
     let rafId = 0;
     const draw = () => {
-      const pts = overlayLandmarksRef.current;
-      const mesh = overlayMeshRef.current;
       const ctx = canvas.getContext("2d");
-      if (!ctx) {
-        rafId = requestAnimationFrame(draw);
-        return;
-      }
-      if (canvas.width !== PROCESS_W) canvas.width = PROCESS_W;
-      if (canvas.height !== PROCESS_H) canvas.height = PROCESS_H;
-      ctx.clearRect(0, 0, PROCESS_W, PROCESS_H);
-
-      if (mesh && mesh.length > 0) {
-        ctx.beginPath();
-        ctx.strokeStyle = "rgba(0, 255, 170, 0.12)";
-        ctx.lineWidth = 0.5;
-        for (let i = 0; i < mesh.length; i += 12) {
-          const p1 = mesh[i];
-          for (let j = i + 1; j < Math.min(i + 24, mesh.length); j += 8) {
-            const p2 = mesh[j];
-            const dist = Math.hypot(p1.x - p2.x, p1.y - p2.y);
-            if (dist < 28) {
-              ctx.moveTo(p1.x, p1.y);
-              ctx.lineTo(p2.x, p2.y);
-            }
-          }
-        }
-        ctx.stroke();
-        ctx.fillStyle = "rgba(0, 255, 170, 0.35)";
-        for (let i = 0; i < mesh.length; i += 3) {
-          const p = mesh[i];
-          ctx.fillRect(p.x, p.y, 1, 1);
-        }
-      }
-
-      if (pts && pts.length >= 68) {
-        ctx.strokeStyle = "rgba(0, 255, 170, 0.85)";
-        ctx.lineWidth = 1.5;
-        for (const [a, b] of FACE_CONNECTIONS) {
-          if (!pts[a] || !pts[b]) continue;
-          ctx.beginPath();
-          ctx.moveTo(pts[a].x, pts[a].y);
-          ctx.lineTo(pts[b].x, pts[b].y);
-          ctx.stroke();
-        }
-        for (let i = 0; i < pts.length; i++) {
-          const p = pts[i];
-          ctx.beginPath();
-          ctx.arc(p.x, p.y, 2, 0, Math.PI * 2);
-          ctx.fillStyle = "rgba(0, 255, 170, 1)";
-          ctx.fill();
-          ctx.beginPath();
-          ctx.arc(p.x, p.y, 0.9, 0, Math.PI * 2);
-          ctx.fillStyle = "#fff";
-          ctx.fill();
-        }
+      if (ctx) {
+        if (canvas.width !== PROCESS_W) canvas.width = PROCESS_W;
+        if (canvas.height !== PROCESS_H) canvas.height = PROCESS_H;
+        ctx.clearRect(0, 0, PROCESS_W, PROCESS_H);
       }
       rafId = requestAnimationFrame(draw);
     };
@@ -286,15 +240,17 @@ export default function FaceRegister({ userEmail, userAgentLabel, onLogout }) {
 
   async function handleBackendResponse(data) {
     if (!data) return;
-    if (Array.isArray(data.landmarks) && data.landmarks.length >= 68) {
-      overlayLandmarksRef.current = data.landmarks.map((p) => ({ x: p.x, y: p.y }));
-    } else if (data.mesh === null) {
-      overlayLandmarksRef.current = null;
-    }
-    if (Array.isArray(data.mesh) && data.mesh.length > 0) {
-      overlayMeshRef.current = data.mesh.map((p) => ({ x: p.x, y: p.y }));
-    } else if (data.mesh === null) {
-      overlayMeshRef.current = null;
+    if (SHOW_FACE_MESH_OVERLAY) {
+      if (Array.isArray(data.landmarks) && data.landmarks.length >= 68) {
+        overlayLandmarksRef.current = data.landmarks.map((p) => ({ x: p.x, y: p.y }));
+      } else if (data.mesh === null) {
+        overlayLandmarksRef.current = null;
+      }
+      if (Array.isArray(data.mesh) && data.mesh.length > 0) {
+        overlayMeshRef.current = data.mesh.map((p) => ({ x: p.x, y: p.y }));
+      } else if (data.mesh === null) {
+        overlayMeshRef.current = null;
+      }
     }
     if (data.step && data.step !== livenessStep) {
       const prevStep = livenessStep;
@@ -344,7 +300,7 @@ export default function FaceRegister({ userEmail, userAgentLabel, onLogout }) {
       // If we got a successful frame, check for critical "processing" warnings to show on overlay
       if (data.status === "processing") {
         const d = data.detail || "";
-        if (d.includes("blocked") || d.includes("too close") || d.includes("too far") || d.includes("No face")) {
+        if (d.includes("blocked") || d.includes("No face")) {
           setError(d);
         } else {
           setError(null);
@@ -390,10 +346,24 @@ export default function FaceRegister({ userEmail, userAgentLabel, onLogout }) {
     } catch { setError("Verification failed"); }
   }
 
+  function stopCameraStreamOnly() {
+    if (stream) stream.getTracks().forEach((t) => t.stop());
+    if (frameIntervalRef.current) {
+      clearInterval(frameIntervalRef.current);
+      frameIntervalRef.current = null;
+    }
+    setStream(null);
+    setShowCamera(false);
+    overlayLandmarksRef.current = null;
+    overlayMeshRef.current = null;
+  }
+
   async function startCamera() {
     setError(null);
     setFile(null);
     setPreview(null);
+    setPhotoCaptured(false);
+    registrationSessionIdRef.current = null;
     setResults([]);
     setGeoData(null);
     setGeoAddress(null);
@@ -402,11 +372,12 @@ export default function FaceRegister({ userEmail, userAgentLabel, onLogout }) {
     try {
       let sessData;
       try {
+        const registerLabel = email.trim().toLowerCase() || userAgentLabel;
         const sessRes = await fetch(`${API_URL}/liveness/session/start`, {
           method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             device_id: getOrCreateDeviceId(),
-            agent_label: userAgentLabel
+            agent_label: registerLabel,
           }),
         });
         if (!sessRes.ok) {
@@ -446,22 +417,16 @@ export default function FaceRegister({ userEmail, userAgentLabel, onLogout }) {
   }
 
   function stopCamera() {
-    if (stream) stream.getTracks().forEach(t => t.stop());
-    if (frameIntervalRef.current) {
-      clearInterval(frameIntervalRef.current);
-      frameIntervalRef.current = null;
-    }
-    setStream(null);
-    setShowCamera(false);
+    stopCameraStreamOnly();
     setLivenessLive(false);
+    setPhotoCaptured(false);
     livenessSessionIdRef.current = null;
+    registrationSessionIdRef.current = null;
     livenessCompletedRef.current = false;
-    overlayLandmarksRef.current = null;
-    overlayMeshRef.current = null;
     setChallengeMsg("");
     setLivenessStep("idle");
     setError(null);
-    // setRejectionError(null); // Keep rejection error visible until they close the modal
+    setCanMatch(false);
   }
 
   const takeSelfie = () => {
@@ -484,18 +449,13 @@ export default function FaceRegister({ userEmail, userAgentLabel, onLogout }) {
         setError("Capture failed: Could not process image.");
         return;
       }
-      console.log("✅ Blob created, triggering match...");
       const f = new File([blob], "selfie.jpg", { type: "image/jpeg" });
-      const currentSessionId = livenessSessionIdRef.current;
+      registrationSessionIdRef.current = livenessSessionIdRef.current;
 
       setFile(f);
       setPreview(URL.createObjectURL(f));
-
-      // 2. Stop camera and streaming immediately
-      stopCamera();
-
-      // 3. Trigger match with the saved session ID
-      handleMatch(f, currentSessionId);
+      setPhotoCaptured(true);
+      stopCameraStreamOnly();
     }, "image/jpeg", 0.95);
   };
 
@@ -589,45 +549,66 @@ export default function FaceRegister({ userEmail, userAgentLabel, onLogout }) {
   };
 
   const handleRegister = async () => {
-    if ((!file && !docFile) || !firstName || !lastName) {
-      setError("Please provide Names and either take a Selfie or upload a Document.");
+    if (!file) {
+      setError("Please complete liveness and capture your live photo first.");
+      return;
+    }
+    if (!email.trim() || !email.includes("@")) {
+      setError("Please enter a valid email address.");
       return;
     }
     setLoading(true);
     setError(null);
     setRegistrationSuccess(null);
 
+    const emailNorm = email.trim().toLowerCase();
     const fd = new FormData();
-    if (file) fd.append("file", file);
-    fd.append("firstName", firstName);
-    fd.append("middleName", middleName);
-    fd.append("lastName", lastName);
-    fd.append("docType", docType);
-    if (docFile) {
-      fd.append("document", docFile);
-    }
-    if (livenessSessionIdRef.current) {
-      fd.append("liveness_session_id", livenessSessionIdRef.current);
+    fd.append("file", file);
+    fd.append("email", emailNorm);
+    fd.append("docType", "Selfie");
+    const sessionId =
+      registrationSessionIdRef.current || livenessSessionIdRef.current;
+    if (sessionId) {
+      fd.append("liveness_session_id", sessionId);
     }
     fd.append("device_id", getOrCreateDeviceId());
 
     try {
       console.log(`📤 Sending registration request to ${API_URL}/register ...`);
       const res = await fetch(`${API_URL}/register`, { method: "POST", body: fd });
-      const data = await res.json();
-      if (data.error) {
-        setError(data.error);
-        toast.error(`Registration failed: ${data.error}`);
+      const data = await res.json().catch(() => ({}));
+      const failMsg =
+        res.status === 404 || data.detail === "Not Found"
+          ? "Register API not found. Restart the backend (uvicorn on port 8000) or check VITE_API_URL."
+          : data.error ||
+          (Array.isArray(data.detail)
+            ? data.detail.map((d) => d.msg || JSON.stringify(d)).join(", ")
+            : typeof data.detail === "string"
+              ? data.detail
+              : null);
+      if (!res.ok || failMsg) {
+        const msg = failMsg || "Registration failed.";
+        setError(msg);
+        toast.error(`Registration failed: ${msg}`);
       } else {
-        toast.success(`Successfully registered ${firstName} ${lastName}!`);
-        setRegistrationSuccess(`Successfully registered ${firstName} ${lastName}!`);
+        // toast.success(`Successfully registered ${firstName} ${lastName}!`);
+        const faceLabel = data.face_label || emailNorm;
+        toast.success(`Successfully registered ${emailNorm}!`);
+        setRegistrationSuccess(`Successfully registered ${emailNorm}!`);
+        if (onRegistered) {
+          onRegistered(emailNorm, faceLabel);
+        }
         setRegisterMode(false);
         setFirstName("");
         setMiddleName("");
         setLastName("");
-        setDocType("Aadhar");
-        setDocFile(null);
+        setEmail("");
+        setFile(null);
+        setPreview(null);
+        setPhotoCaptured(false);
+        registrationSessionIdRef.current = null;
         setCanMatch(false);
+        setLivenessLive(false);
         setLivenessStep("idle");
       }
     } catch (err) {
@@ -639,12 +620,27 @@ export default function FaceRegister({ userEmail, userAgentLabel, onLogout }) {
   };
 
 
-  const handleSubmit = () => {
-    if (!firstName || !lastName) {
-      setError("Please provide First and Last name.");
+  const handleStartRegistration = () => {
+    setError(null);
+    // if (!firstName.trim() || !lastName.trim()) {
+    //   setError("Please enter your first and last name.");
+    //   return;
+    // }
+    if (!email.trim() || !email.includes("@")) {
+      setError("Please enter a valid email address.");
       return;
     }
-    handleRegister();
+    startCamera();
+  };
+
+  const handleRetakePhoto = () => {
+    setFile(null);
+    setPreview(null);
+    setPhotoCaptured(false);
+    registrationSessionIdRef.current = null;
+    livenessCompletedRef.current = false;
+    setCanMatch(false);
+    startCamera();
   };
 
   return (
@@ -700,93 +696,66 @@ export default function FaceRegister({ userEmail, userAgentLabel, onLogout }) {
         )}
 
         <div className="fm-registration-simple-wrap">
-          <div className="fm-reg-main-container">
-            <div className="fm-reg-input-group">
-              <label>First Name</label>
-              <input
-                type="text"
-                placeholder="e.g. John"
-                value={firstName}
-                onChange={(e) => setFirstName(e.target.value)}
-                className="fm-reg-input"
-                disabled={loading || showCamera || livenessLive}
-              />
-            </div>
-            <div className="fm-reg-input-group">
-              <label>Middle Name</label>
-              <input
-                type="text"
-                placeholder="(optional)"
-                value={middleName}
-                onChange={(e) => setMiddleName(e.target.value)}
-                className="fm-reg-input"
-                disabled={loading || showCamera || livenessLive}
-              />
-            </div>
-            <div className="fm-reg-input-group">
-              <label>Last Name</label>
-              <input
-                type="text"
-                placeholder="e.g. Doe"
-                value={lastName}
-                onChange={(e) => setLastName(e.target.value)}
-                className="fm-reg-input"
-                disabled={loading || showCamera || livenessLive}
-              />
-            </div>
-          </div>
-          <div className="fm-reg-input-group">
-            <label>Document Type</label>
-            <select
-              name="docType"
-              id="docType"
-              style={{ width: "100%", textAlign: "left" }}
-              className="fm-reg-input"
-              value={docType}
-              onChange={(e) => setDocType(e.target.value)}
-              disabled={loading || showCamera || livenessLive}
-            >
-              <option value="Selfie">Selfie (No Document)</option>
-              <option value="Aadhar">Aadhar</option>
-              <option value="PAN">PAN</option>
-              <option value="Voter ID">Voter ID</option>
-              <option value="Passport">Passport</option>
-              <option value="Driving License">Driving License</option>
-            </select>
-          </div>
-
-          {!showCamera && !livenessLive && (
+          {!showCamera && !photoCaptured && (
             <>
-              <div className="fm-reg-input-group" style={{ marginTop: "15px" }}>
-                <label>Supporting Document (PDF, JPG, JPEG - max 1MB)</label>
+              {/* <div className="fm-reg-input-group">
+                <label>First name</label>
                 <input
-                  type="file"
-                  accept=".pdf,.jpg,.jpeg"
-                  onChange={(e) => {
-                    const f = e.target.files[0];
-                    if (f) {
-                      if (f.size > 1024 * 1024) {
-                        setError("File size must be under 1MB");
-                        e.target.value = null;
-                        return;
-                      }
-                      setDocFile(f);
-                      setError(null);
-                    }
-                  }}
+                  type="text"
+                  placeholder="First name"
+                  value={firstName}
+                  onChange={(e) => setFirstName(e.target.value)}
                   className="fm-reg-input"
-                  disabled={loading}
+                  disabled={loading || livenessSessionLoading}
+                  style={{ width: "100%", textAlign: "left" }}
+                />
+              </div> */}
+              {/* <div className="fm-reg-input-group">
+                <label>Last name</label>
+                <input
+                  type="text"
+                  placeholder="Last name"
+                  value={lastName}
+                  onChange={(e) => setLastName(e.target.value)}
+                  className="fm-reg-input"
+                  disabled={loading || livenessSessionLoading}
+                  style={{ width: "100%", textAlign: "left" }}
+                />
+              </div> */}
+              <div className="fm-reg-input-group">
+                <label>Email</label>
+                <input
+                  type="email"
+                  placeholder="you@example.com"
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  className="fm-reg-input"
+                  disabled={loading || livenessSessionLoading}
+                  style={{ width: "100%", textAlign: "left" }}
                 />
               </div>
 
+              {error && !showCamera && (
+                <div className="lp-error" style={{ marginTop: 12 }}>
+                  {error}
+                </div>
+              )}
+
               <button
                 className="fm-btn"
-                // onClick={startCamera}
-                onClick={handleSubmit}
-                disabled={!firstName || !lastName || loading}
+                onClick={handleStartRegistration}
+                disabled={
+                  // !firstName.trim() ||
+                  // !lastName.trim() ||
+                  !email.trim() ||
+                  loading ||
+                  livenessSessionLoading
+                }
                 style={{ width: "100%", marginTop: "10px" }}
               >
-                Submit data
+                {livenessSessionLoading
+                  ? "Starting camera..."
+                  : "Start liveness & capture"}
               </button>
             </>
           )}
@@ -807,7 +776,7 @@ export default function FaceRegister({ userEmail, userAgentLabel, onLogout }) {
 
                   {error && <div className="fm-camera-error-overlay">{error}</div>}
 
-                  {challengeMsg && !livenessLive && (
+                  {/* {challengeMsg && !livenessLive && (
                     <div className="fm-challenge-overlay-simple">
                       {livenessStep === "gesture" && sessionChallenges[challengeIndex] ? (
                         <div className="fm-gesture-instruction">
@@ -818,14 +787,14 @@ export default function FaceRegister({ userEmail, userAgentLabel, onLogout }) {
                         <span>{challengeMsg}</span>
                       )}
                     </div>
-                  )}
+                  )} */}
 
                   <div className="fm-camera-actions">
-                    {livenessLive && !multiPersonError && !file && (
+                    {/* {livenessLive && !multiPersonError && !photoCaptured && ( */}
                       <button className="fm-capture-btn" onClick={takeSelfie}>
                         <Camera size={18} /> Take Registration Photo
                       </button>
-                    )}
+                    {/* )} */}
                   </div>
                 </div>
               </div>
@@ -835,17 +804,28 @@ export default function FaceRegister({ userEmail, userAgentLabel, onLogout }) {
             </div>
           )}
 
-          {livenessLive && file && (
+          {photoCaptured && file && (
             <div className="fm-registration-final-step">
               <div className="fm-preview-circle">
                 <img src={preview} alt="Profile Preview" />
               </div>
-              <p className="fm-reg-confirm-text">Verified: <strong>{firstName} {lastName}</strong></p>
+              <p className="fm-reg-confirm-text">
+                Liveness verified — <strong>{email}</strong>
+              </p>
+              {error && (
+                <div className="lp-error" style={{ marginBottom: 12 }}>
+                  {error}
+                </div>
+              )}
               <div className="fm-reg-actions-row">
                 <button className="fm-btn" onClick={handleRegister} disabled={loading}>
                   {loading ? "Registering..." : "Complete Registration"}
                 </button>
-                <button className="fm-btn secondary" onClick={() => { setFile(null); setPreview(null); setLivenessLive(false); startCamera(); }}>
+                <button
+                  className="fm-btn secondary"
+                  onClick={handleRetakePhoto}
+                  disabled={loading}
+                >
                   Retake Photo
                 </button>
               </div>

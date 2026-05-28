@@ -53,18 +53,31 @@ from database import (
     complete_liveness_session_if_valid,
     create_liveness_session,
     ensure_indexes,
+    fetchrow,
     get_face_embedding_by_label,
     get_liveness_session,
     get_valid_completed_liveness_session,
     init_db_pool,
     insert_auth_log,
+    insert_app_user,
     insert_face,
+    email_exists,
+    is_registered_email,
+    resolve_registered_face_label,
     list_face_labels,
     list_faces_for_matching,
+    list_faces_for_matching_by_label,
     update_liveness_session_status,
 )
 
 app = FastAPI()
+
+REGISTER_REQUIRE_LIVENESS = os.getenv("REGISTER_REQUIRE_LIVENESS", "0").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 
 # CORS: browsers require Access-Control-Allow-Origin on cross-origin fetch.
 # Explicit list + regex covers facematch / any *.bargad.ai HTTPS (Railway + Vercel + local).
@@ -166,12 +179,14 @@ async def _startup():
     except Exception:
         face_rows = "unavailable"
     pad = load_post_selfie_config()
+    from frame_processor import LIVENESS_FAST_SETUP
+
     print(
         f"🧬 Match config: device={DEVICE}, detect_max_side={FACE_DETECT_MAX_SIDE}, "
         f"FAST_MATCH={FAST_MATCH}, bargad>={MIN_CONFIDENCE_BARGAD}, lfw>={MIN_CONFIDENCE_LFW}, "
         f"top2_margin>={MATCH_MIN_TOP2_MARGIN}, yolo_conf={pad['yolo_conf']}, "
         f"hard_reject_spoof={pad['hard_reject_spoof']}, db_host={host_hint}, faces_512={face_rows}, "
-        f"torch={torch.__version__}"
+        f"torch={torch.__version__}, register_api=email-v2, liveness_fast_setup={LIVENESS_FAST_SETUP}"
     )
     asyncio.create_task(asyncio.to_thread(warmup_yolo))
 
@@ -202,6 +217,7 @@ async def health_match_config():
         "db_host": host_hint,
         "face_counts": counts,
         "post_selfie_security": load_post_selfie_config(),
+        "liveness_fast_setup": __import__("frame_processor").LIVENESS_FAST_SETUP,
     }
 
 
@@ -228,6 +244,26 @@ async def list_agents():
     except Exception as e:
         print(f"❌ Error fetching agent list: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/auth/check-email")
+async def check_email_registered(email: str):
+    """
+    Verify email is registered before allowing FaceMatch login.
+    face_label is the value stored in faces.label (typically the email).
+    """
+    email_clean = (email or "").strip().lower()
+    if not email_clean or "@" not in email_clean or len(email_clean) < 5:
+        return {"ok": False, "error": "Please provide a valid email address."}
+
+    face_label = await resolve_registered_face_label(email_clean)
+    if not face_label:
+        return {
+            "ok": False,
+            "error": "This email is not registered. Please register first.",
+        }
+
+    return {"ok": True, "email": email_clean, "face_label": face_label}
 
 
 # ════════════════════════════════════════════════════════════
@@ -335,6 +371,16 @@ async def complete_liveness_session(payload: Dict[str, Any] = Body(...)):
             detail=f"Session not complete. Current step: {sess.step}",
         )
 
+    if not sess.all_gestures_done:
+        raise HTTPException(
+            status_code=400,
+            detail="Liveness gestures incomplete. Please complete all head challenges.",
+        )
+    if not sess.depth_passed or not sess.light_passed or not sess.micro_passed:
+        raise HTTPException(
+            status_code=400,
+            detail="Liveness verification incomplete. Please restart and follow all steps.",
+        )
 
     # Check reaction timing
     timing_ok, timing_reason = check_reaction_timing(sess.reaction_times)
@@ -585,8 +631,26 @@ async def match_face(
                 scale = 800 / max(img_processed.shape[:2])
                 img_processed = cv2.resize(img_processed, (int(img_processed.shape[1] * scale), int(img_processed.shape[0] * scale)))
 
-        all_docs = await list_faces_for_matching()
-        print(f"📦 Loaded {len(all_docs)} faces from PostgreSQL")
+        scoped_label = None
+        if expected_label and str(expected_label).strip():
+            scoped_label = " ".join(str(expected_label).split()).strip()
+
+        if scoped_label:
+            all_docs = await list_faces_for_matching_by_label(scoped_label)
+            print(
+                f"🔐 Scoped 1:1 match for logged-in user '{scoped_label}': "
+                f"{len(all_docs)} registered embedding(s)"
+            )
+            if not all_docs:
+                return {
+                    "error": (
+                        f"No registered face found for {scoped_label}. "
+                        "Please complete registration first."
+                    ),
+                }
+        else:
+            all_docs = await list_faces_for_matching()
+            print(f"📦 Loaded {len(all_docs)} faces from PostgreSQL (open search)")
 
         valid_rows = []
         for doc in all_docs:
@@ -623,6 +687,8 @@ async def match_face(
         match_diagnostics = {
             "detect_max_side": FACE_DETECT_MAX_SIDE,
             "fast_match": FAST_MATCH,
+            "scoped_match": bool(scoped_label),
+            "scoped_label": scoped_label,
             "top_raw_label": raw_results[0]["label"] if raw_results else None,
             "top_raw_score": raw_results[0]["score"] if raw_results else None,
             "second_raw_label": raw_results[1]["label"] if len(raw_results) > 1 else None,
@@ -660,7 +726,7 @@ async def match_face(
             else:
                 if r["image_url"] not in seen[key]["images"]:
                     seen[key]["images"].append(r["image_url"])
-                
+                 
                 # Merging Logic:
                 # 1. Update overall confidence/image if this match is stronger
                 if score > seen[key]["confidence"]:
@@ -677,22 +743,38 @@ async def match_face(
         results = list(seen.values())
         results.sort(key=lambda x: x["confidence"], reverse=True)
 
-        # Ambiguous top-2: reject when best and runner-up identities are too close in score
-        if len(raw_results) >= 2:
+        # Ambiguous top-2: only for open search (not logged-in 1:1 scoped match).
+        if not scoped_label and len(raw_results) >= 2:
             top_raw = raw_results[0]
             second_raw = raw_results[1]
             top_key = " ".join(str(top_raw["label"]).split()).lower()
             second_key = " ".join(str(second_raw["label"]).split()).lower()
             margin = match_diagnostics["top2_margin"]
             if top_key != second_key and margin is not None and margin < MATCH_MIN_TOP2_MARGIN:
-                print(
-                    f"⚠️ Ambiguous match: {top_raw['label']}={top_raw['score']:.3f} vs "
-                    f"{second_raw['label']}={second_raw['score']:.3f} (margin {margin:.3f} < {MATCH_MIN_TOP2_MARGIN})"
-                )
-                return {
-                    "error": "Match ambiguous — multiple identities scored too closely. Please retake the selfie with even lighting and face centered.",
-                    "match_diagnostics": match_diagnostics,
-                }
+                skip_ambiguous = False
+                if expected_label:
+                    target_key = " ".join(str(expected_label).split()).lower()
+                    top_threshold = (
+                        MIN_CONFIDENCE_BARGAD
+                        if top_raw.get("source") in ("bargad", "frontend_reg")
+                        else MIN_CONFIDENCE_LFW
+                    )
+                    if top_key == target_key and float(top_raw["score"]) >= top_threshold:
+                        skip_ambiguous = True
+                        print(
+                            f"✓ Ambiguous check skipped: logged-in user '{expected_label}' "
+                            f"is top match ({top_raw['score']:.3f})"
+                        )
+                if not skip_ambiguous:
+                    print(
+                        f"⚠️ Ambiguous match: {top_raw['label']}={top_raw['score']:.3f} vs "
+                        f"{second_raw['label']}={second_raw['score']:.3f} "
+                        f"(margin {margin:.3f} < {MATCH_MIN_TOP2_MARGIN})"
+                    )
+                    return {
+                        "error": "Match ambiguous — multiple identities scored too closely. Please retake the selfie with even lighting and face centered.",
+                        "match_diagnostics": match_diagnostics,
+                    }
 
         # Apply security penalty from errcount (each point reduces confidence by 1%)
         if errcount > 0 or True: # Always show breakdown if results exist
@@ -740,24 +822,35 @@ async def match_face(
             print(f"📍 Geo logged: {geo_lat}, {geo_long}")
 
         if not results:
+            if scoped_label:
+                return {
+                    "error": (
+                        "Your selfie does not match your registered face. "
+                        "Please retake with even lighting and your face centered."
+                    ),
+                    "match_diagnostics": match_diagnostics,
+                }
             return {
                 "error": "No confident match found in the dataset.",
                 "match_diagnostics": match_diagnostics,
             }
 
-        # Identity Verification Check (Disabled as per user request to allow anyone to match)
-        # if expected_label and results:
-        #     top_label = results[0]["label"].lower().strip()
-        #     target_label = expected_label.lower().strip()
-        #     # Handle underscores/spaces mismatch
-        #     top_label = top_label.replace("_", " ")
-        #     target_label = target_label.replace("_", " ")
-        #     
-        #     if top_label != target_label:
-        #         print(f"❌ Identity Mismatch: Expected '{target_label}', but matched '{top_label}' ({results[0]['confidence']*100:.0f}%)")
-        #         return {
-        #             "error": f"Identity mismatch. You are matched as {results[0]['label']} ({results[0]['confidence']*100:.0f}%), but you are logged in as {expected_label}. Please use the correct account."
-        #         }
+        if expected_label and results and not scoped_label:
+            top_label = " ".join(str(results[0]["label"]).split()).lower()
+            target_label = " ".join(str(expected_label).split()).lower()
+            if top_label != target_label:
+                print(
+                    f"❌ Identity Mismatch: Expected '{target_label}', "
+                    f"but matched '{top_label}' ({results[0]['confidence'] * 100:.0f}%)"
+                )
+                return {
+                    "error": (
+                        f"Identity mismatch: face matched as {results[0]['label']} "
+                        f"({results[0]['confidence'] * 100:.0f}%), but you are logged in as "
+                        f"{expected_label}. Only your registered account may verify."
+                    ),
+                    "match_diagnostics": match_diagnostics,
+                }
 
         if liveness_session_id:
             await update_liveness_session_status(
@@ -803,22 +896,31 @@ async def match_face(
             os.remove(temp_path)
 
 
-@app.post("/register")
 async def register_user(
     file: Optional[UploadFile] = File(None),
-    firstName: str = Form(...),
-    middleName: Optional[str] = Form(None),
-    lastName: str = Form(...),
-    docType: str = Form("Aadhar"),
-    document: Optional[UploadFile] = File(None),
-    liveness_session_id: Optional[str] = Form(None),
-    device_id: str = Form(...)
+    email: str = Form(...),
+    device_id: str = Form(...),
+    docType: str = Form(default="Selfie"),
+    document: Optional[UploadFile] = File(default=None),
+    liveness_session_id: Optional[str] = Form(default=None),
 ):
-    """Register a new user. Crops face from image for a cleaner database profile."""
+    """Register a new user (email stored in faces.label). Selfie + liveness required."""
     
     primary_file = file or document
     if not primary_file:
-        return {"error": "No image source provided (Selfie or Document required)"}
+        return {"error": "Please complete liveness and capture a live selfie to register."}
+
+    email_clean = email.strip().lower()
+    if "@" not in email_clean or len(email_clean) < 5:
+        return {"error": "Please provide a valid email address."}
+    if await email_exists(email_clean):
+        return {"error": "This email is already registered. Please use a different email."}
+    existing_face = await fetchrow(
+        "SELECT 1 FROM faces WHERE LOWER(label) = LOWER($1) LIMIT 1",
+        email_clean,
+    )
+    if existing_face:
+        return {"error": "This email is already registered. Please use a different email."}
 
     temp_path = f"temp_reg_{primary_file.filename}"
     with open(temp_path, "wb") as f:
@@ -833,10 +935,12 @@ async def register_user(
     crop_path = f"temp_crop_{primary_file.filename}.jpg"
 
     try:
-        if file and liveness_session_id:
+        if file and REGISTER_REQUIRE_LIVENESS:
+            if not liveness_session_id:
+                return {"error": "Security check required for selfie registration. Complete the liveness flow first."}
             mem_sess = session_manager.get(liveness_session_id)
-            if not mem_sess or mem_sess.step != "verified":
-                return {"error": "Security check required for selfie registration."}
+            if not mem_sess or mem_sess.step not in ("verified", "complete", "capture"):
+                return {"error": "Security check required for selfie registration. Complete the liveness flow first."}
 
         img_raw = cv2.imread(temp_path)
         if img_raw is None:
@@ -889,9 +993,9 @@ async def register_user(
             emb = model(face_tensor).cpu().numpy()[0].astype("float32")
         emb = emb / np.linalg.norm(emb)
 
-        # 4. UPLOAD TO CLOUDINARY
-        full_name = f"{firstName}_{middleName}_{lastName}" if middleName else f"{firstName}_{lastName}"
-        clean_name = full_name.replace(' ', '_')
+        # 4. UPLOAD TO CLOUDINARY — faces.label stores email; folder name must be path-safe
+        clean_label = email_clean
+        clean_name = email_clean.replace("@", "_at_").replace(".", "_")
         
         # Upload the CROPPED face as the main profile image
         upload = cloudinary.uploader.upload(
@@ -918,15 +1022,19 @@ async def register_user(
             )
             document_url = doc_upload["secure_url"]
 
-        # 5. SAVE TO POSTGRESQL
-        # Normalize label to avoid whitespace issues (Senior Dev Best Practice)
-        clean_label = " ".join(f"{firstName} {lastName}".split())
-        
+        # 5. SAVE TO POSTGRESQL — label column = email
         await insert_face(
             label=clean_label,
             source="frontend_reg",
             image_url=image_url,
             embedding=emb.tolist(),
+        )
+
+        await insert_app_user(
+            email=email_clean,
+            full_name=clean_label,
+            face_label=clean_label,
+            image_url=image_url,
         )
 
         # 6. CONSUME SESSION (ONLY IF PROVIDED)
@@ -938,9 +1046,7 @@ async def register_user(
                 raw_updates={
                     "consumed_at": datetime.utcnow(),
                     "registration": {
-                        "first_name": firstName.strip(),
-                        "middle_name": middleName.strip() if middleName else None,
-                        "last_name": lastName.strip(),
+                        "email": email_clean,
                         "doc_type": str(docType or "Selfie"),
                         "document_url": document_url,
                     },
@@ -949,9 +1055,11 @@ async def register_user(
 
         return {
             "success": True,
-            "message": f"Successfully registered {firstName} {lastName}!",
+            "message": f"Successfully registered {email_clean}!",
             "image_url": image_url,
-            "document_url": document_url
+            "document_url": document_url,
+            "email": email_clean,
+            "face_label": clean_label,
         }
 
     except Exception as e:
@@ -965,6 +1073,44 @@ async def register_user(
             os.remove(doc_path)
         if 'crop_path' in locals() and os.path.exists(crop_path):
             os.remove(crop_path)
+
+
+@app.post("/register")
+async def register_user_route(
+    file: Optional[UploadFile] = File(None),
+    email: str = Form(...),
+    device_id: str = Form(...),
+    docType: str = Form(default="Selfie"),
+    document: Optional[UploadFile] = File(default=None),
+    liveness_session_id: Optional[str] = Form(default=None),
+):
+    return await register_user(
+        file=file,
+        email=email,
+        device_id=device_id,
+        docType=docType,
+        document=document,
+        liveness_session_id=liveness_session_id,
+    )
+
+
+@app.post("/auth/register")
+async def auth_register_route(
+    file: Optional[UploadFile] = File(None),
+    email: str = Form(...),
+    device_id: str = Form(...),
+    docType: str = Form(default="Selfie"),
+    document: Optional[UploadFile] = File(default=None),
+    liveness_session_id: Optional[str] = Form(default=None),
+):
+    return await register_user(
+        file=file,
+        email=email,
+        device_id=device_id,
+        docType=docType,
+        document=document,
+        liveness_session_id=liveness_session_id,
+    )
 
 
 # ── Passive liveness endpoint ──

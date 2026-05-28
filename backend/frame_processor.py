@@ -9,7 +9,13 @@ import cv2
 import numpy as np
 from typing import Dict, Any, Optional, Tuple, List
 
-from liveness_session import LivenessSession, CALIBRATION_FRAMES, LIGHT_CHALLENGES, GESTURE_COOLDOWN
+from liveness_session import (
+    LivenessSession,
+    CALIBRATION_FRAMES,
+    LIGHT_CHALLENGES,
+    GESTURE_COOLDOWN,
+    GESTURE_INSTRUCTION_SEC,
+)
 from face_detection import (
     decode_frame, detect_faces, compute_ear, compute_head_pose,
     compute_eye_tilt_rad, compute_brow_heights, estimate_expression,
@@ -19,6 +25,7 @@ from face_detection import (
 from liveness_checks import (
     analyze_true_3d_deformation, check_micro_expressions,
     analyze_active_spectral_reflectance, evaluate_gesture, SUSTAINED_FRAMES,
+    build_pose_snapshot,
     parallax_replay_risk,
     biological_motion_replay_risk,
     challenge_consistency_replay_risk,
@@ -39,10 +46,18 @@ _yolo_warmup_done = False
 YOLO_WEIGHTS = os.getenv("YOLO_WEIGHTS", "yolov8n.pt")
 LIVENESS_YOLO_CONF = float(os.getenv("LIVENESS_YOLO_CONF", "0.28"))
 DEVICE_NEAR_FACE_DR = float(os.getenv("LIVENESS_DEVICE_NEAR_DR", "0.12"))
+LIVENESS_FAST_SETUP = os.getenv("LIVENESS_FAST_SETUP", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 DEPTH_FRAMES_REQUIRED = int(os.getenv("LIVENESS_DEPTH_FRAMES", "2"))
 LIGHT_PRE_FRAMES = int(os.getenv("LIVENESS_LIGHT_PRE_FRAMES", "2"))
 LIGHT_POST_FRAMES = int(os.getenv("LIVENESS_LIGHT_POST_FRAMES", "2"))
 MICRO_FRAMES_REQUIRED = int(os.getenv("LIVENESS_MICRO_FRAMES", "2"))
+NO_FACE_GRACE_FRAMES = int(os.getenv("LIVENESS_NO_FACE_GRACE_FRAMES", "3"))
+MULTI_FACE_GRACE_FRAMES = int(os.getenv("LIVENESS_MULTI_FACE_GRACE_FRAMES", "2"))
 
 DEVICE_CLASSES = {
     "cell phone": "Mobile Phone",
@@ -50,6 +65,33 @@ DEVICE_CLASSES = {
     "tv": "Television/Screen",
     "monitor": "Television/Screen",
 }
+
+
+def _begin_gesture_phase(session: LivenessSession, pts_68, pts_478) -> Dict[str, Any]:
+    """Enter gesture challenges (marks hidden setup steps done for session/complete)."""
+    session.depth_passed = True
+    session.light_passed = True
+    session.micro_passed = True
+    session.step = "gesture"
+    session.gesture_instruction_time = time.time()
+    session.is_transitioning = True
+    session.gesture_challenge_baseline = None
+    session.gesture_sustain_count = 0
+    session.shake_history = []
+    session.shake_completed = False
+    session.hold_start_time = None
+    gesture = session.current_gesture or ""
+    return {
+        "status": "processing",
+        "step": "gesture",
+        "gesture": session.current_gesture,
+        "gesture_idx": session.current_gesture_idx,
+        "detail": f"CHALLENGE: {gesture.replace('_', ' ').upper()}" if gesture else "Starting challenges…",
+        "progress": session.progress_pct,
+        "landmarks": landmarks_to_serializable(pts_68),
+        "mesh": landmarks_to_serializable(pts_478),
+        "gesture_prep": True,
+    }
 
 
 def _get_yolo():
@@ -213,25 +255,50 @@ def process_frame(session: LivenessSession, frame_bytes: bytes, identity_callbac
     faces = detect_faces(img)
 
     if len(faces) == 0:
+        session.no_face_streak += 1
+        session.multi_face_streak = 0
+        if session.no_face_streak >= NO_FACE_GRACE_FRAMES:
+            return {
+                "status": "processing",
+                "step": session.step,
+                "detail": "No face detected — center your face",
+                "progress": session.progress_pct,
+                "mesh": None
+            }
         return {
             "status": "processing",
             "step": session.step,
-            "detail": "No face detected — center your face",
+            "detail": "Hold steady — tracking face...",
             "progress": session.progress_pct,
-            "mesh": None
+            "mesh": None,
         }
 
     if len(faces) > 1:
+        session.multi_face_streak += 1
+        session.no_face_streak = 0
+        if session.multi_face_streak >= MULTI_FACE_GRACE_FRAMES:
+            return {
+                "status": "processing",
+                "error": True,
+                "multi_person": True,
+                "detail": "Multiple people detected — please ensure only one person is in view",
+                "step": session.step,
+                "progress": session.progress_pct,
+                "mesh": None,
+                "landmarks": None,
+            }
         return {
             "status": "processing",
-            "error": True,
-            "multi_person": True,
-            "detail": "Multiple people detected — please ensure only one person is in view",
             "step": session.step,
+            "detail": "Hold steady — stabilizing face tracking...",
             "progress": session.progress_pct,
             "mesh": None,
             "landmarks": None,
+            "multi_person": False,
         }
+
+    session.no_face_streak = 0
+    session.multi_face_streak = 0
 
     face = faces[0]
     pts_68 = face["pts_68"]
@@ -398,16 +465,6 @@ def process_frame(session: LivenessSession, frame_bytes: bytes, identity_callbac
             "mesh": landmarks_to_serializable(pts_478),
         }
 
-    if face_width > w * 0.85:
-        return {
-            "status": "processing",
-            "detail": "Face too close — move back",
-            "step": session.step,
-            "landmarks": landmarks_to_serializable(pts_68),
-            "mesh": landmarks_to_serializable(pts_478),
-            "progress": session.progress_pct,
-        }
-
     # ── CALIBRATION PHASE ──
     if session.step == "calibration":
         session.calibration_count += 1
@@ -446,6 +503,8 @@ def process_frame(session: LivenessSession, frame_bytes: bytes, identity_callbac
                 "left_brow_y": (last_pts[19]["y"] + last_pts[21]["y"]) / 2,
                 "right_brow_y": (last_pts[24]["y"] + last_pts[26]["y"]) / 2,
             }
+            if LIVENESS_FAST_SETUP:
+                return _begin_gesture_phase(session, pts_68, pts_478)
             session.step = "depth"
             session.gesture_instruction_time = time.time()
             return {
@@ -469,7 +528,10 @@ def process_frame(session: LivenessSession, frame_bytes: bytes, identity_callbac
     # ── DEPTH ESTIMATION PHASE ──
     if session.step == "depth":
         is_3d, depth_score = analyze_true_3d_deformation(session.landmark_history)
-        session.depth_scores.append(depth_score)
+        if is_3d:
+            session.depth_scores.append(depth_score)
+        else:
+            session.depth_scores = []
 
         if len(session.depth_scores) >= DEPTH_FRAMES_REQUIRED:
             avg_depth = sum(session.depth_scores) / len(session.depth_scores)
@@ -478,7 +540,7 @@ def process_frame(session: LivenessSession, frame_bytes: bytes, identity_callbac
                 return {
                     "status": "processing",
                     "step": "depth",
-                    "detail": "Depth check failed — move head slightly",
+                    "detail": "Depth check failed — move head slightly in all directions",
                     "landmarks": landmarks_to_serializable(pts_68),
                     "mesh": landmarks_to_serializable(pts_478),
                     "progress": session.progress_pct,
@@ -526,12 +588,23 @@ def process_frame(session: LivenessSession, frame_bytes: bytes, identity_callbac
                 session.light_pre_frames, session.light_post_frames,
                 session.light_challenge_color
             )
-            session.light_passed = True
-            session.step = "micro"
+            if passed:
+                session.light_passed = True
+                session.step = "micro"
+                return {
+                    "status": "processing",
+                    "step": "micro",
+                    "detail": "Light check done — analyzing micro expressions",
+                    "progress": session.progress_pct,
+                    "landmarks": landmarks_to_serializable(pts_68),
+                    "mesh": landmarks_to_serializable(pts_478),
+                }
+            session.light_post_frames = []
             return {
                 "status": "processing",
-                "step": "micro",
-                "detail": "Light check done — analyzing micro expressions",
+                "step": "light_challenge",
+                "detail": "Light challenge failed — face the screen and allow camera lighting change",
+                "instruction": session.light_challenge_color,
                 "progress": session.progress_pct,
                 "landmarks": landmarks_to_serializable(pts_68),
                 "mesh": landmarks_to_serializable(pts_478),
@@ -550,33 +623,22 @@ def process_frame(session: LivenessSession, frame_bytes: bytes, identity_callbac
     # ── MICRO EXPRESSION PHASE ──
     if session.step == "micro":
         has_micro, micro_score = check_micro_expressions(session.landmark_history)
-        session.micro_variance_scores.append(micro_score)
+        if has_micro:
+            session.micro_variance_scores.append(micro_score)
         if len(session.micro_variance_scores) >= MICRO_FRAMES_REQUIRED:
             avg = sum(session.micro_variance_scores) / len(session.micro_variance_scores)
-            if avg < 0.1:
+            if avg < 0.1 or not has_micro:
                 session.micro_variance_scores = []
                 return {
                     "status": "processing",
                     "step": "micro",
-                    "detail": "Micro expression check failed — keep moving naturally",
+                    "detail": "Micro expression check failed — blink or move naturally, do not hold perfectly still",
                     "landmarks": landmarks_to_serializable(pts_68),
                     "mesh": landmarks_to_serializable(pts_478),
                     "progress": session.progress_pct,
                 }
             session.micro_passed = True
-            session.step = "gesture"
-            session.gesture_instruction_time = time.time()
-            return {
-                "status": "processing",
-                "step": "gesture",
-                "gesture": session.current_gesture,
-                "gesture_idx": session.current_gesture_idx,
-                "detail": f"CHALLENGE: {session.current_gesture.replace('_', ' ').upper()}",
-                "progress": session.progress_pct,
-                "landmarks": landmarks_to_serializable(pts_68),
-                "mesh": landmarks_to_serializable(pts_478),
-                "gesture_prep": True,
-            }
+            return _begin_gesture_phase(session, pts_68, pts_478)
 
         return {
             "status": "processing",
@@ -600,19 +662,30 @@ def process_frame(session: LivenessSession, frame_bytes: bytes, identity_callbac
             }
         elif session.is_transitioning:
             elapsed = time.time() - session.gesture_instruction_time
-            # No cooldown before the first gesture challenge
-            cooldown = 0.0 if session.current_gesture_idx == 0 else GESTURE_COOLDOWN
-            if elapsed < cooldown:
+            extra_cooldown = GESTURE_COOLDOWN if session.current_gesture_idx > 0 else 0.0
+            wait_sec = GESTURE_INSTRUCTION_SEC + extra_cooldown
+            if elapsed < wait_sec:
+                gesture = session.current_gesture or ""
                 return {
                     "status": "processing",
                     "step": "gesture",
                     "gesture": session.current_gesture,
                     "gesture_idx": session.current_gesture_idx,
-                    "detail": "Waiting for gesture...",
+                    "detail": (
+                        f"CHALLENGE: {gesture.replace('_', ' ').upper()}"
+                        if gesture
+                        else "Get ready…"
+                    ),
                     "progress": session.progress_pct,
                     "landmarks": landmarks_to_serializable(pts_68),
                     "mesh": landmarks_to_serializable(pts_478),
+                    "gesture_prep": True,
                 }
+            if session.gesture_challenge_baseline is None and session.baseline:
+                session.gesture_challenge_baseline = build_pose_snapshot(
+                    pts_68, session.baseline
+                )
+                session.gesture_sustain_count = 0
             session.is_transitioning = False
 
         gesture = session.current_gesture

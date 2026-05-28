@@ -1307,9 +1307,9 @@ import {
 } from "./matchUiUtils";
 import {
   ERROR_LABELS,
-  formatSecurityError,
   isDigitalMediaMessage,
   resolveSecurityDisplayError,
+  resolveSecurityErrorLabel,
 } from "./securityErrorMessages";
 import "./FaceMatch.css";
 import bargadLogo from "./bargad-logo.png";
@@ -1350,16 +1350,22 @@ L.Icon.Default.mergeOptions({
 
 const API_URL = getApiBase();
 const DEVICE_KEY = "facematch_device_id";
-const FRAME_INTERVAL_MS = 80;
+const FRAME_INTERVAL_MS = 16;
 /** Short countdown; probe frames run security checks before main stream. */
 const INIT_COUNTDOWN_SEC = 1;
-const CHALLENGE_PREP_DELAY_MS = 1200;
+const CHALLENGE_PREP_DELAY_MS = 250;
 const PROBE_FRAME_INTERVAL_MS = 350;
 const DEVICE_TOAST_INTERVAL_MS = 1200;
-const OVERLAY_LERP = 0.42;
+const OVERLAY_LERP = 1.0;
+const OVERLAY_STALE_MS = 1200;
+const STREAM_JPEG_QUALITY = 0.72;
 /** Must match JPEG sent to /liveness/frame (same crop as object-fit: cover in a 4:3 box). */
 const PROCESS_W = 640;
 const PROCESS_H = 480;
+/** Face mesh / landmark skeleton during liveness (off for cleaner UX). */
+const SHOW_FACE_MESH_OVERLAY = false;
+/** Draw only an outer face border (no inner skeleton). */
+const SHOW_FACE_OUTLINE_OVERLAY = true;
 function lerpPoints(prev, next, t) {
   if (!next?.length) return null;
   if (!prev?.length || prev.length !== next.length) return next.map((p) => ({ ...p }));
@@ -1378,7 +1384,7 @@ const CHALLENGE_UI = {
   mouth_open: { label: "Open your mouth wide", icon: Smile },
   move_closer: { label: "Move Closer", icon: Maximize },
   move_farther: { label: "Move Away", icon: Maximize },
-  shake_head: { label: "Shake head No", icon: Activity },
+  shake_head: { label: "Shake head left & right (NO)", icon: Activity },
   look_left_hold: { label: "Look Left & Hold", icon: ArrowLeft },
   look_right_hold: { label: "Look Right & Hold", icon: ArrowRight },
   look_up_hold: { label: "Look Up & Hold", icon: ArrowUp },
@@ -1451,6 +1457,10 @@ const FACE_CONNECTIONS = [
   [65, 66],
   [66, 67],
   [67, 60],
+];
+const FACE_OUTLINE_LOOP = [
+  0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+  26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 0,
 ];
 
 let sessionDeviceId = null;
@@ -1555,10 +1565,42 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
     }, 3500);
   }, []);
 
-  /** Only one of the 23 official security errors is stored; otherwise null (no alert). */
+  /** Maps to one of the 23 official security error labels (always visible in alert card). */
   const applySecurityError = useCallback((message, hints = {}) => {
-    setError(formatSecurityError(message, hints));
+    setError(resolveSecurityErrorLabel(message, hints));
   }, []);
+
+  const resetAfterMatchFailure = useCallback(() => {
+    setFaceMatchCompleted(false);
+    setPreview(null);
+    setFile(null);
+    setCapturedImage(null);
+    setProcessedPreview(null);
+    setResults([]);
+    setPenaltyDetails([]);
+    setProgress(0);
+    setClick(false);
+    setCanMatch(false);
+    setLivenessLive(false);
+    livenessSessionIdRef.current = null;
+    livenessCompletedRef.current = false;
+    setLivenessStep("idle");
+    sessionStorage.removeItem("liveness_ref_photo");
+  }, []);
+
+  const handleMatchFailure = useCallback(
+    (message, hints = {}) => {
+      const label = resolveSecurityErrorLabel(message, hints);
+      setError(label);
+      const toastText =
+        label === ERROR_LABELS.USER_MISMATCH
+          ? "This face does not match the logged-in account."
+          : message || label;
+      addToast(toastText, "error");
+      resetAfterMatchFailure();
+    },
+    [addToast, resetAfterMatchFailure],
+  );
 
   const videoRef = useRef();
   const canvasRef = useRef();
@@ -1567,6 +1609,9 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
   const overlayMeshRef = useRef(null);
   const overlayDisplayLandmarksRef = useRef(null);
   const overlayDisplayMeshRef = useRef(null);
+  const overlayLandmarksUpdatedAtRef = useRef(0);
+  const overlayMeshUpdatedAtRef = useRef(0);
+  const streamCanvasRef = useRef(null);
   const inputRef = useRef();
   const frameIntervalRef = useRef(null);
   const livenessSessionIdRef = useRef(null);
@@ -1677,7 +1722,8 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
     if (showCamera && !livenessLive) {
       timer = setTimeout(() => {
         addToast(
-          "Verification taking longer than usual. Please ensure you are a registered user.",
+          // "Verification taking longer than usual. Please ensure you are a registered user.",
+          "Verification taking longer than usual.",
           "warning",
         );
       }, 20000);
@@ -1729,16 +1775,18 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
     }
   }, []);
 
-  // Face mesh overlay — rAF (no React state per frame) + lighter drawing
+  // Optional overlay: when mesh is off, show only a white outer face outline.
   useEffect(() => {
-    if (!showCamera) return undefined;
+    if (!showCamera || SHOW_FACE_MESH_OVERLAY) return undefined;
     const canvas = overlayCanvasRef.current;
     if (!canvas) return undefined;
     let rafId = 0;
     const draw = () => {
+      const nowMs = performance.now();
+      const landmarksFresh =
+        nowMs - (overlayLandmarksUpdatedAtRef.current || 0) <= OVERLAY_STALE_MS;
       const targetPts = overlayLandmarksRef.current;
-      const targetMesh = overlayMeshRef.current;
-      if (targetPts) {
+      if (landmarksFresh && targetPts?.length) {
         overlayDisplayLandmarksRef.current = lerpPoints(
           overlayDisplayLandmarksRef.current,
           targetPts,
@@ -1747,7 +1795,58 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
       } else {
         overlayDisplayLandmarksRef.current = null;
       }
-      if (targetMesh?.length) {
+      const pts = overlayDisplayLandmarksRef.current;
+      const ctx = canvas.getContext("2d");
+      if (ctx) {
+        if (canvas.width !== PROCESS_W) canvas.width = PROCESS_W;
+        if (canvas.height !== PROCESS_H) canvas.height = PROCESS_H;
+        ctx.clearRect(0, 0, PROCESS_W, PROCESS_H);
+        if (SHOW_FACE_OUTLINE_OVERLAY && pts?.length >= 27) {
+          ctx.beginPath();
+          const first = pts[FACE_OUTLINE_LOOP[0]];
+          if (first) {
+            ctx.moveTo(first.x, first.y);
+            for (let i = 1; i < FACE_OUTLINE_LOOP.length; i += 1) {
+              const p = pts[FACE_OUTLINE_LOOP[i]];
+              if (p) ctx.lineTo(p.x, p.y);
+            }
+            ctx.closePath();
+            ctx.lineWidth = 2.4;
+            ctx.strokeStyle = "#24aa4d";
+            ctx.shadowColor = "transparent";
+            ctx.shadowBlur = 0;
+            ctx.stroke();
+          }
+        }
+      }
+      rafId = requestAnimationFrame(draw);
+    };
+    rafId = requestAnimationFrame(draw);
+    return () => cancelAnimationFrame(rafId);
+  }, [showCamera]);
+
+  useEffect(() => {
+    if (!showCamera || !SHOW_FACE_MESH_OVERLAY) return undefined;
+    const canvas = overlayCanvasRef.current;
+    if (!canvas) return undefined;
+    let rafId = 0;
+    const draw = () => {
+      const nowMs = performance.now();
+      const landmarksFresh =
+        nowMs - (overlayLandmarksUpdatedAtRef.current || 0) <= OVERLAY_STALE_MS;
+      const meshFresh = nowMs - (overlayMeshUpdatedAtRef.current || 0) <= OVERLAY_STALE_MS;
+      const targetPts = overlayLandmarksRef.current;
+      const targetMesh = overlayMeshRef.current;
+      if (landmarksFresh && targetPts) {
+        overlayDisplayLandmarksRef.current = lerpPoints(
+          overlayDisplayLandmarksRef.current,
+          targetPts,
+          OVERLAY_LERP,
+        );
+      } else {
+        overlayDisplayLandmarksRef.current = null;
+      }
+      if (meshFresh && targetMesh?.length) {
         overlayDisplayMeshRef.current = lerpPoints(
           overlayDisplayMeshRef.current,
           targetMesh,
@@ -1876,9 +1975,10 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
 
   function startGesturePrepPause() {
     if (gesturePrepDoneRef.current) return;
+    gesturePrepDoneRef.current = true;
     setGesturePrepActive(true);
 
-    // Capture liveness reference photo after a short delay to ensure camera is stable and user is looking straight
+    // Brief UI only — keep streaming frames so gestures are not delayed
     setTimeout(() => {
       try {
         const video = videoRef.current;
@@ -1891,47 +1991,37 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
             ctx.drawImage(video, 0, 0);
             const dataUrl = tempCanvas.toDataURL("image/jpeg", 0.95);
             sessionStorage.setItem("liveness_ref_photo", dataUrl);
-            console.log("📸 Liveness reference photo captured and saved in sessionStorage.");
           }
         }
       } catch (e) {
         console.warn("Failed to capture liveness reference photo:", e);
       }
-    }, 500);
+    }, 200);
 
-    if (frameIntervalRef.current) {
-      clearInterval(frameIntervalRef.current);
-      frameIntervalRef.current = null;
-    }
     if (gesturePrepTimeoutRef.current) clearTimeout(gesturePrepTimeoutRef.current);
     gesturePrepTimeoutRef.current = setTimeout(() => {
-      gesturePrepDoneRef.current = true;
       setGesturePrepActive(false);
       gesturePrepTimeoutRef.current = null;
-      if (livenessSessionIdRef.current) {
-        frameIntervalRef.current = setInterval(
-          streamFrameToBackend,
-          FRAME_INTERVAL_MS,
-        );
-      }
     }, CHALLENGE_PREP_DELAY_MS);
   }
 
   async function handleBackendResponse(data) {
     if (!data) return;
+    const nowMs = performance.now();
 
     if (Array.isArray(data.landmarks) && data.landmarks.length >= 68) {
       overlayLandmarksRef.current = data.landmarks.map((p) => ({
         x: p.x,
         y: p.y,
       }));
-    } else if (data.mesh === null) {
-      overlayLandmarksRef.current = null;
+      overlayLandmarksUpdatedAtRef.current = nowMs;
     }
-    if (Array.isArray(data.mesh) && data.mesh.length > 0) {
-      overlayMeshRef.current = data.mesh.map((p) => ({ x: p.x, y: p.y }));
-    } else if (data.mesh === null) {
-      overlayMeshRef.current = null;
+
+    if (SHOW_FACE_MESH_OVERLAY) {
+      if (Array.isArray(data.mesh) && data.mesh.length > 0) {
+        overlayMeshRef.current = data.mesh.map((p) => ({ x: p.x, y: p.y }));
+        overlayMeshUpdatedAtRef.current = nowMs;
+      }
     }
 
     // Multi-person: show hard error while detected; clear when only one person remains.
@@ -2064,12 +2154,7 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
         });
       }
 
-      if (
-        d.includes("blocked") ||
-        d.includes("too close") ||
-        d.includes("too far") ||
-        d.includes("No face")
-      ) {
+      if (d.includes("blocked") || d.includes("No face")) {
         applySecurityError(d);
       } else if (!data.is_suspicious) {
         setError(null);
@@ -2088,9 +2173,10 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
     streamingRef.current = true;
     try {
       const video = videoRef.current;
-      const c = document.createElement("canvas");
-      c.width = PROCESS_W;
-      c.height = PROCESS_H;
+      const c = streamCanvasRef.current || document.createElement("canvas");
+      streamCanvasRef.current = c;
+      if (c.width !== PROCESS_W) c.width = PROCESS_W;
+      if (c.height !== PROCESS_H) c.height = PROCESS_H;
       const ctx2 = c.getContext("2d");
       if (!ctx2) {
         streamingRef.current = false;
@@ -2105,7 +2191,9 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
         PROCESS_H,
       );
       ctx2.drawImage(video, sx, sy, sw, sh, 0, 0, PROCESS_W, PROCESS_H);
-      const blob = await new Promise((r) => c.toBlob(r, "image/jpeg", 0.9));
+      const blob = await new Promise((r) =>
+        c.toBlob(r, "image/jpeg", STREAM_JPEG_QUALITY),
+      );
       if (!blob) {
         streamingRef.current = false;
         return;
@@ -2137,6 +2225,13 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
         setCanMatch(true);
         setLivenessLive(true);
         setLivenessStep("capture");
+      } else {
+        const msg =
+          data.detail ||
+          "Liveness verification incomplete. Please restart and complete all challenges.";
+        applySecurityError(msg);
+        addToast(msg, "error");
+        livenessCompletedRef.current = false;
       }
     } catch {
       applySecurityError("Verification failed");
@@ -2206,6 +2301,12 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
       setStream(mediaStream);
       setShowCamera(true);
       setLivenessStep("camera");
+      setChallengeIndex(0);
+      setCompletedChallenges([]);
+      setLivenessLive(false);
+      setCanMatch(false);
+      livenessCompletedRef.current = false;
+      setFaceMatchCompleted(false);
       setChallengeMsg("Waiting for gesture...");
     } catch (e) {
       applySecurityError(`Unexpected error: ${e.message}`);
@@ -2242,7 +2343,6 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
     lastSoundChallengeRef.current = -1;
     setMultiPersonError(false);
     setChallengeMsg("");
-    setError(null);
   }
 
   const takeSelfie = () => {
@@ -2366,7 +2466,7 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
     if (errcount > 0) {
       fd.append("errcount", errcount);
     }
-    if (userAgentLabel && isDirectCapture) {
+    if (userAgentLabel) {
       fd.append("expected_label", userAgentLabel);
     }
     const livenessRefPhoto = sessionStorage.getItem("liveness_ref_photo");
@@ -2387,29 +2487,29 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
 
       if (data.error) {
         console.error("❌ Match error from backend:", data.error);
-        applySecurityError(data.error);
+        const userMismatch =
+          /registered|logged in|identity mismatch|does not match your/i.test(
+            String(data.error),
+          );
+        handleMatchFailure(data.error, { userMismatch });
         setCaptureLiveFailure(null);
         setProgress(0);
       } else if (data.capture_live_ok === false) {
         console.error("❌ Capture live failed:", data.capture_live_reason);
-        applySecurityError(
+        handleMatchFailure(
           data.capture_live_reason ||
             "Security Alert: High risk of digital spoofing detected. Matching blocked.",
           { digitalMedia: true },
         );
         setCaptureLiveFailure(null);
-        setResults([]);
-        setPenaltyDetails([]);
         setProgress(0);
       } else if (errcount > 0) {
         console.error("❌ Liveness errors detected during session.");
-        applySecurityError(
+        handleMatchFailure(
           "Security Alert: Suspicious activity or device detected during liveness session. Matching blocked.",
           { digitalMedia: true },
         );
         setCaptureLiveFailure(null);
-        setResults([]);
-        setPenaltyDetails([]);
         setProgress(0);
       } else {
         console.log("✅ Match successful", data.matches?.length, "results");
@@ -2426,7 +2526,7 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
       }
     } catch (err) {
       console.error("❌ Match request failed:", err);
-      applySecurityError(matchFetchErrorMessage(err));
+      handleMatchFailure(matchFetchErrorMessage(err));
       setProgress(0);
       clearInterval(pInterval);
       clearTimeout(matchTimeoutId);
@@ -2484,8 +2584,20 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
 
   const isSecureScanPhase =
     showCamera &&
-    (["calibration", "depth", "light_challenge", "micro"].includes(livenessStep) ||
-      gesturePrepActive);
+    ["calibration", "depth", "light_challenge", "micro"].includes(livenessStep);
+
+  const setupStatusLabel =
+    livenessStep === "calibration"
+      ? "Calibrating face…"
+      : livenessStep === "depth"
+        ? "Checking depth — move head slightly"
+        : livenessStep === "light_challenge"
+          ? "Light check…"
+          : livenessStep === "micro"
+            ? "Almost ready…"
+            : gesturePrepActive
+              ? "Starting challenges…"
+              : "We're setting up";
 
   return (
     <div className="fm-page">
@@ -2597,10 +2709,10 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
 
                     {showCamera && (
                       <div className="fm-liveness-overlay">
-                        {isSecureScanPhase && (
+                        {(isSecureScanPhase || gesturePrepActive) && (
                           <div className="fm-setup-status" role="status" aria-live="polite">
                             <Loader2 size={22} className="fm-setup-status-spinner" aria-hidden="true" />
-                            <p className="fm-setup-status-title">We&apos;re setting up</p>
+                            <p className="fm-setup-status-title">{setupStatusLabel}</p>
                           </div>
                         )}
 
@@ -2615,7 +2727,8 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
                                 })()}
                               </div>
                               <span className="fm-gesture-text">
-                                {CHALLENGE_UI[sessionChallenges[challengeIndex]]?.label}
+                                {CHALLENGE_UI[sessionChallenges[challengeIndex]]?.label ||
+                                  challengeMsg}
                               </span>
                             </div>
                           </div>
@@ -2651,7 +2764,8 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
                   const isCompleted =
                     !isSecureScanPhase &&
                     !multiPersonError &&
-                    (challengeIndex >= num || livenessLive);
+                    challengeIndex >= num &&
+                    ["gesture", "complete", "capture"].includes(livenessStep);
                   return (
                     <div
                       key={num}

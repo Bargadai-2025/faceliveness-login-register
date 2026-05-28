@@ -27,7 +27,8 @@ SESSION_TTL = 300  # 5 minutes max
 CALIBRATION_FRAMES = int(os.getenv("LIVENESS_CALIBRATION_FRAMES", "3"))
 GESTURE_COUNT_MIN = 3
 GESTURE_COUNT_MAX = 3
-GESTURE_COOLDOWN = float(os.getenv("LIVENESS_GESTURE_COOLDOWN_SEC", "1.5"))
+GESTURE_COOLDOWN = float(os.getenv("LIVENESS_GESTURE_COOLDOWN_SEC", "0.10"))
+GESTURE_INSTRUCTION_SEC = float(os.getenv("LIVENESS_GESTURE_INSTRUCTION_SEC", "0.45"))
 
 
 @dataclass
@@ -68,6 +69,7 @@ class LivenessSession:
     gesture_sustain_count: int = 0
     gesture_instruction_time: Optional[float] = None
     is_transitioning: bool = False
+    gesture_challenge_baseline: Optional[Dict[str, Any]] = None
 
     # Timing
     reaction_times: List[float] = field(default_factory=list)
@@ -78,6 +80,8 @@ class LivenessSession:
 
     # Black screen
     black_screen_count: int = 0
+    no_face_streak: int = 0
+    multi_face_streak: int = 0
 
     # Shake head tracking
     shake_history: List[float] = field(default_factory=list)
@@ -169,6 +173,7 @@ class LivenessSession:
         self.blink_count = 0
         self.was_blink_closed = False
         self.hold_start_time = None
+        self.gesture_challenge_baseline = None
         self.gesture_instruction_time = time.time()
         self.is_transitioning = True  # Mark as transitioning
         if self.all_gestures_done:

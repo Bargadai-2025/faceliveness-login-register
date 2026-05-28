@@ -21,10 +21,10 @@ try:
         options = vision.FaceLandmarkerOptions(
             base_options=BaseOptions(model_asset_path=_model_path),
             running_mode=vision.RunningMode.IMAGE,
-            num_faces=5,
-            min_face_detection_confidence=0.1, # Lowered to strictly catch secondary faces on phones
-            min_face_presence_confidence=0.1,
-            min_tracking_confidence=0.1,
+            num_faces=2,
+            min_face_detection_confidence=0.3, # Reduce duplicate detections during fast movement
+            min_face_presence_confidence=0.3,
+            min_tracking_confidence=0.3,
             output_face_blendshapes=False,
             output_facial_transformation_matrixes=False,
         )

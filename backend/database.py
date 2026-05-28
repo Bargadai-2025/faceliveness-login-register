@@ -116,7 +116,248 @@ async def fetchrow(query: str, *args: Any) -> Optional[asyncpg.Record]:
     return await pool.fetchrow(query, *args)
 
 
+async def ensure_app_users_table() -> None:
+    await execute(
+        """
+        CREATE TABLE IF NOT EXISTS app_users (
+            id TEXT PRIMARY KEY,
+            email TEXT UNIQUE NOT NULL,
+            full_name TEXT NOT NULL,
+            face_label TEXT NOT NULL,
+            image_url TEXT,
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        )
+        """
+    )
+    await execute(
+        "CREATE INDEX IF NOT EXISTS idx_app_users_email ON app_users (email)"
+    )
+
+
+async def ensure_face_register_users_table() -> None:
+    """
+    Separate table for frontend registered users with 512-d embedding.
+    Kept in sync from `faces` so existing insert/match logic remains unchanged.
+    """
+    await execute(
+        """
+        CREATE TABLE IF NOT EXISTS face_register_users (
+            id TEXT PRIMARY KEY,
+            email TEXT UNIQUE NOT NULL,
+            face_label TEXT NOT NULL,
+            image_url TEXT,
+            embedding JSONB NOT NULL,
+            source TEXT NOT NULL DEFAULT 'frontend_reg',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CONSTRAINT face_register_users_embedding_is_array
+                CHECK (jsonb_typeof(embedding) = 'array'),
+            CONSTRAINT face_register_users_embedding_len_512
+                CHECK (jsonb_array_length(embedding) = 512)
+        )
+        """
+    )
+    await execute(
+        "CREATE INDEX IF NOT EXISTS idx_face_register_users_email_lower ON face_register_users (LOWER(email))"
+    )
+    await execute(
+        "CREATE INDEX IF NOT EXISTS idx_face_register_users_face_label_lower ON face_register_users (LOWER(face_label))"
+    )
+    await execute(
+        """
+        INSERT INTO face_register_users (id, email, face_label, image_url, embedding, source, created_at, updated_at)
+        SELECT
+            f.id,
+            LOWER(TRIM(f.label)) AS email,
+            f.label AS face_label,
+            f.image_url,
+            f.embedding,
+            COALESCE(f.source, 'frontend_reg') AS source,
+            NOW(),
+            NOW()
+        FROM faces f
+        WHERE f.embedding IS NOT NULL
+          AND jsonb_typeof(f.embedding) = 'array'
+          AND jsonb_array_length(f.embedding) = 512
+          AND LOWER(TRIM(COALESCE(f.source, ''))) = 'frontend_reg'
+          AND POSITION('@' IN COALESCE(f.label, '')) > 0
+        ON CONFLICT (email) DO UPDATE
+        SET
+            id = EXCLUDED.id,
+            face_label = EXCLUDED.face_label,
+            image_url = EXCLUDED.image_url,
+            embedding = EXCLUDED.embedding,
+            source = EXCLUDED.source,
+            updated_at = NOW()
+        """
+    )
+    await execute(
+        """
+        CREATE OR REPLACE FUNCTION sync_face_register_users_from_faces()
+        RETURNS TRIGGER AS $$
+        BEGIN
+            IF TG_OP = 'DELETE' THEN
+                IF LOWER(TRIM(COALESCE(OLD.source, ''))) = 'frontend_reg'
+                   AND POSITION('@' IN COALESCE(OLD.label, '')) > 0 THEN
+                    DELETE FROM face_register_users
+                    WHERE email = LOWER(TRIM(OLD.label));
+                END IF;
+                RETURN OLD;
+            END IF;
+
+            IF LOWER(TRIM(COALESCE(NEW.source, ''))) = 'frontend_reg'
+               AND POSITION('@' IN COALESCE(NEW.label, '')) > 0
+               AND NEW.embedding IS NOT NULL
+               AND jsonb_typeof(NEW.embedding) = 'array'
+               AND jsonb_array_length(NEW.embedding) = 512 THEN
+
+                INSERT INTO face_register_users (
+                    id, email, face_label, image_url, embedding, source, created_at, updated_at
+                )
+                VALUES (
+                    NEW.id,
+                    LOWER(TRIM(NEW.label)),
+                    NEW.label,
+                    NEW.image_url,
+                    NEW.embedding,
+                    COALESCE(NEW.source, 'frontend_reg'),
+                    NOW(),
+                    NOW()
+                )
+                ON CONFLICT (email) DO UPDATE
+                SET
+                    id = EXCLUDED.id,
+                    face_label = EXCLUDED.face_label,
+                    image_url = EXCLUDED.image_url,
+                    embedding = EXCLUDED.embedding,
+                    source = EXCLUDED.source,
+                    updated_at = NOW();
+            END IF;
+
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql
+        """
+    )
+    await execute(
+        "DROP TRIGGER IF EXISTS trg_sync_face_register_users_from_faces ON faces"
+    )
+    await execute(
+        """
+        CREATE TRIGGER trg_sync_face_register_users_from_faces
+        AFTER INSERT OR UPDATE OR DELETE ON faces
+        FOR EACH ROW
+        EXECUTE FUNCTION sync_face_register_users_from_faces()
+        """
+    )
+
+
+async def email_exists(email: str) -> bool:
+    clean = email.strip().lower()
+    if not clean:
+        return False
+
+    # New dedicated table for frontend-registered users (primary source).
+    row = await fetchrow(
+        "SELECT 1 FROM face_register_users WHERE LOWER(email) = LOWER($1) LIMIT 1",
+        clean,
+    )
+    if row is not None:
+        return True
+
+    # Backward compatibility with existing tables.
+    row = await fetchrow(
+        "SELECT 1 FROM app_users WHERE LOWER(email) = LOWER($1) LIMIT 1",
+        clean,
+    )
+    if row is not None:
+        return True
+
+    row = await fetchrow(
+        """
+        SELECT 1
+        FROM faces
+        WHERE LOWER(label) = LOWER($1) AND embedding IS NOT NULL
+        LIMIT 1
+        """,
+        clean,
+    )
+    return row is not None
+
+
+async def resolve_registered_face_label(email: str) -> Optional[str]:
+    """
+    Return registered face_label for login/liveness/match.
+    Checks face_register_users first, then app_users, then faces.label fallback.
+    """
+    e = email.strip().lower()
+    if not e or "@" not in e:
+        return None
+
+    fru_row = await fetchrow(
+        """
+        SELECT face_label FROM face_register_users
+        WHERE LOWER(email) = LOWER($1)
+        LIMIT 1
+        """,
+        e,
+    )
+    if fru_row and fru_row.get("face_label"):
+        return str(fru_row["face_label"]).strip()
+
+    user_row = await fetchrow(
+        """
+        SELECT face_label FROM app_users
+        WHERE LOWER(email) = LOWER($1)
+        LIMIT 1
+        """,
+        e,
+    )
+    if user_row and user_row.get("face_label"):
+        return str(user_row["face_label"]).strip()
+
+    face_row = await fetchrow(
+        """
+        SELECT label FROM faces
+        WHERE LOWER(label) = LOWER($1) AND embedding IS NOT NULL
+        ORDER BY id
+        LIMIT 1
+        """,
+        e,
+    )
+    if face_row and face_row.get("label"):
+        return str(face_row["label"]).strip()
+
+    return None
+
+
+async def is_registered_email(email: str) -> bool:
+    return await resolve_registered_face_label(email) is not None
+
+
+async def insert_app_user(
+    *,
+    email: str,
+    full_name: str,
+    face_label: str,
+    image_url: Optional[str] = None,
+) -> None:
+    await execute(
+        """
+        INSERT INTO app_users (id, email, full_name, face_label, image_url)
+        VALUES ($1, $2, $3, $4, $5)
+        """,
+        str(uuid.uuid4()),
+        email.strip().lower(),
+        full_name.strip(),
+        face_label,
+        image_url,
+    )
+
+
 async def ensure_indexes() -> None:
+    await ensure_app_users_table()
+    await ensure_face_register_users_table()
     statements = [
         "CREATE INDEX IF NOT EXISTS idx_faces_label ON faces (label)",
         "CREATE INDEX IF NOT EXISTS idx_faces_source ON faces (source)",
@@ -180,6 +421,23 @@ async def list_faces_for_matching() -> List[Dict[str, Any]]:
         FROM faces
         WHERE embedding IS NOT NULL
         """
+    )
+    return [dict(row) for row in rows]
+
+
+async def list_faces_for_matching_by_label(label: str) -> List[Dict[str, Any]]:
+    """Embeddings for one identity only (logged-in 1:1 verification)."""
+    clean = (label or "").strip()
+    if not clean:
+        return []
+    rows = await fetch(
+        """
+        SELECT label, source, image_url, embedding
+        FROM faces
+        WHERE embedding IS NOT NULL
+          AND LOWER(TRIM(label)) = LOWER(TRIM($1))
+        """,
+        clean,
     )
     return [dict(row) for row in rows]
 

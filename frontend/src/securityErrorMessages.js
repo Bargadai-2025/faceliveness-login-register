@@ -86,7 +86,7 @@ const RULES = [
   [/camera blocked|blocked.*camera|uncover camera/, ERROR_LABELS.CAMERA_BLOCKED],
   [/multiple (user|people|person)/, ERROR_LABELS.MULTI_PERSON],
   [/no face/, ERROR_LABELS.NO_FACE],
-  [/too close/, ERROR_LABELS.FACE_TOO_CLOSE],
+  [/\bface too close\b/, ERROR_LABELS.FACE_TOO_CLOSE],
   [/too far/, ERROR_LABELS.MOVE_BACK],
   [/move back/, ERROR_LABELS.MOVE_BACK],
   [/move slightly closer|move closer/, ERROR_LABELS.MOVE_CLOSER],
@@ -104,6 +104,11 @@ const RULES = [
   [/registration failed/, ERROR_LABELS.REGISTRATION_FAILED],
   [/no confident match|no match found/, ERROR_LABELS.NO_MATCH],
   [/ambiguous/, ERROR_LABELS.MATCH_AMBIGUOUS],
+  [
+    /does not match your registered|not your registered face|only your registered account|logged in as|wrong account|face does not match/i,
+    ERROR_LABELS.USER_MISMATCH,
+  ],
+  [/no registered face found|please complete registration first|register first/i, ERROR_LABELS.VERIFICATION_FAILED],
   [/identity mismatch|totally different|different\./, ERROR_LABELS.USER_MISMATCH],
   [/could not read|could not decode|invalid image/, ERROR_LABELS.INVALID_IMAGE],
   [/server error/, ERROR_LABELS.SERVER_ERROR],
@@ -132,6 +137,16 @@ export function formatSecurityError(message, hints = {}) {
   return null;
 }
 
+/**
+ * Always returns one of the 23 official labels (never null).
+ */
+export function resolveSecurityErrorLabel(message, hints = {}) {
+  const mapped = formatSecurityError(message, hints);
+  if (mapped) return mapped;
+  if (hints.userMismatch) return ERROR_LABELS.USER_MISMATCH;
+  return ERROR_LABELS.VERIFICATION_FAILED;
+}
+
 /** True only for the official 23 messages. */
 export function isAllowedSecurityError(value) {
   return Boolean(value && ALLOWED_SET.has(value));
@@ -145,5 +160,6 @@ export function resolveSecurityDisplayError(error, { multiPerson = false } = {})
   if (!error) return null;
   if (isAllowedSecurityError(error)) return error;
   const mapped = formatSecurityError(error);
-  return isAllowedSecurityError(mapped) ? mapped : null;
+  if (isAllowedSecurityError(mapped)) return mapped;
+  return resolveSecurityErrorLabel(error);
 }

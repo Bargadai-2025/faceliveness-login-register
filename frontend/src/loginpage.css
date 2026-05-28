@@ -76,10 +76,10 @@
 .lp-title {
   color: #fff;
   text-align: center;
-  font-weight: 700;
-  letter-spacing: 0.12em;
-  font-size: 0.95rem;
-  margin-bottom: 28px;
+  font-weight: 800;
+  letter-spacing: 0.14em;
+  font-size: 1.05rem;
+  margin: 0 0 28px;
   text-transform: uppercase;
 }
 
@@ -116,6 +116,12 @@
 
 .lp-input:focus {
   border-color: #24aa4d;
+}
+
+.lp-input-otp {
+  letter-spacing: 0.35em;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
 }
 
 .lp-password-wrap {
@@ -156,6 +162,26 @@
   align-items: center;
   gap: 8px;
   cursor: pointer;
+  text-transform: lowercase;
+}
+
+.lp-remember input {
+  accent-color: #24aa4d;
+  width: 14px;
+  height: 14px;
+  cursor: pointer;
+}
+
+.lp-forgot {
+  color: #9ca3af;
+  text-transform: lowercase;
+  cursor: default;
+  user-select: none;
+}
+
+.lp-btn-login:disabled {
+  opacity: 0.65;
+  cursor: not-allowed;
 }
 
 .lp-btn-login {
@@ -187,6 +213,22 @@
   margin-top: 16px;
   font-size: 9px;
   color: #6b7280;
+  line-height: 1.5;
+  padding: 0 8px;
+}
+
+.lp-help-register {
+  margin-top: 8px;
+}
+
+.lp-link {
+  color: #24aa4d;
+  text-decoration: none;
+  font-weight: 700;
+}
+
+.lp-link:hover {
+  text-decoration: underline;
 }
 
 .lp-error {
