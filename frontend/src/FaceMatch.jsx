@@ -1554,10 +1554,6 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
   const [captureLiveFailure, setCaptureLiveFailure] = useState(null);
   /** Track if face match has been completed to remove start button */
   const [faceMatchCompleted, setFaceMatchCompleted] = useState(false);
-  /** Block matching if any digital device was detected during liveness stream. */
-  const [deviceDetectedInLiveness, setDeviceDetectedInLiveness] = useState(false);
-  /** Exact message requested for right-side security alert card. */
-  const [securityAlertOverride, setSecurityAlertOverride] = useState(null);
 
   const [click, setClick] = useState(false);
 
@@ -2064,7 +2060,6 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
         deviceDetail.includes("electronic"));
 
     if (isDeviceAlert) {
-      setDeviceDetectedInLiveness(true);
       applySecurityError(data.detail, { digitalMedia: true });
       setErrcount((prev) => prev + 10);
     }
@@ -2254,8 +2249,6 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
     setResults([]);
     setPenaltyDetails([]);
     setCaptureLiveFailure(null);
-    setSecurityAlertOverride(null);
-    setDeviceDetectedInLiveness(false);
     setLivenessLive(false);
     setCanMatch(false);
     setGeoData(null);
@@ -2451,13 +2444,6 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
       });
     }
 
-    if (deviceDetectedInLiveness) {
-      setSecurityAlertOverride("Mobile phone identified");
-      handleMatchFailure("Mobile phone identified", { digitalMedia: true });
-      setLoading(false);
-      return;
-    }
-
     const matchAbort = new AbortController();
     const matchTimeoutId = setTimeout(
       () => matchAbort.abort(),
@@ -2592,11 +2578,9 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
     window.location.reload();
   };
 
-  const securityAlertMessage =
-    securityAlertOverride ||
-    resolveSecurityDisplayError(error, {
-      multiPerson: multiPersonError,
-    });
+  const securityAlertMessage = resolveSecurityDisplayError(error, {
+    multiPerson: multiPersonError,
+  });
 
   const isSecureScanPhase =
     showCamera &&
