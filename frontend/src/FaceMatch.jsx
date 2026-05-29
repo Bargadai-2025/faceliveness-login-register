@@ -2072,17 +2072,38 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
       }
     }
 
-    // Multi-person: show hard error while detected; clear when only one person remains.
+    // Multi-person during liveness — show restart message and reset challenge pills.
     if (data.multi_person) {
       multiPersonErrorRef.current = true;
       setMultiPersonError(true);
+      const restartMsg =
+        data.detail ||
+        "Multiple people detected during liveness. Gestures are restarting from Challenge 1 — only one person may complete the challenges.";
       setError(ERROR_LABELS.MULTI_PERSON);
-      setChallengeMsg("Multiple user detected in video");
+      setChallengeMsg(restartMsg);
+      applySecurityError(restartMsg, { multiPerson: true });
+      if (data.gesture_reset && data.gesture_idx !== undefined) {
+        prevGestureIdxRef.current = data.gesture_idx;
+        setChallengeIndex(data.gesture_idx);
+        setCompletedChallenges([]);
+        lastSoundChallengeRef.current = -1;
+      }
+      setErrcount((prev) => prev + 5);
       return;
     }
 
     if (data.identity_mismatch) {
-      applySecurityError(data.detail || "Different person detected — restart liveness", {});
+      const restartMsg =
+        data.detail ||
+        "Different person detected during liveness. Gestures are restarting from Challenge 1 — only the original user may complete the challenges.";
+      applySecurityError(restartMsg, { userMismatch: true });
+      setChallengeMsg(restartMsg);
+      if (data.gesture_reset && data.gesture_idx !== undefined) {
+        prevGestureIdxRef.current = data.gesture_idx;
+        setChallengeIndex(data.gesture_idx);
+        setCompletedChallenges([]);
+        lastSoundChallengeRef.current = -1;
+      }
       setErrcount((prev) => prev + 5);
       return;
     }

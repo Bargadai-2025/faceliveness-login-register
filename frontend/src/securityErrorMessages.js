@@ -109,6 +109,8 @@ const RULES = [
     ERROR_LABELS.USER_MISMATCH,
   ],
   [/no registered face found|please complete registration first|register first/i, ERROR_LABELS.VERIFICATION_FAILED],
+  [/multiple people detected during liveness|gestures are restarting|only one person may complete/i, ERROR_LABELS.MULTI_PERSON],
+  [/different person detected during liveness|only the original user may complete/i, ERROR_LABELS.USER_MISMATCH],
   [/identity mismatch|totally different|different\./, ERROR_LABELS.USER_MISMATCH],
   [/could not read|could not decode|invalid image/, ERROR_LABELS.INVALID_IMAGE],
   [/server error/, ERROR_LABELS.SERVER_ERROR],

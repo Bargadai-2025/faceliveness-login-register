@@ -17,7 +17,7 @@ from spoof_scoring import (
     count_display_imaging_signals,
     has_display_attack_corroboration,
 )
-from device_filter import filter_devices_for_attack, is_phone_tablet_name
+from device_filter import filter_devices_for_attack, is_phone_tablet_name, phones_in_devices
 from screen_replay_analysis import has_physical_fullframe_signals, has_structural_fullframe_signals
 
 
@@ -95,9 +95,12 @@ def compute_device_risk(
         if device_replay_score >= 0.22:
             risk = max(risk, 68.0)
         notes.append("match_device_in_frame_boost")
-    if match_selfie and frame_bezel_score >= 0.40 and risk < 48.0:
-        risk = max(risk, 48.0)
+    if match_selfie and frame_bezel_score >= 0.25 and risk < 55.0:
+        risk = max(risk, 55.0)
         notes.append(f"match_bezel_boost={frame_bezel_score:.2f}")
+    if match_selfie and phones_in_devices(devices_found) and risk < 62.0:
+        risk = max(risk, 62.0)
+        notes.append("match_phone_tablet_boost")
     return risk, notes
 
 
@@ -273,10 +276,15 @@ def compute_fullframe_replay_risk(match_context: Optional[Dict[str, Any]]) -> Tu
     has_struct = has_structural_fullframe_signals(signals)
     bezel = float(mc.get("frame_bezel", 0.0))
     border = float(mc.get("frame_screen_border", 0.0))
-    has_physical = has_physical or bezel >= 0.45 or border >= 0.42
+    has_physical = has_physical or bezel >= 0.25 or border >= 0.22
 
     if liveness_ok and not has_physical:
-        return min(22.0, score * 28.0), ["fullframe_artifact_only_liveness_ok"]
+        if bezel >= 0.25 or border >= 0.22:
+            has_physical = True
+        elif bezel >= 0.18 and float(mc.get("global_moire", 0.0)) >= 0.22:
+            has_physical = True
+        else:
+            return min(22.0, score * 28.0), ["fullframe_artifact_only_liveness_ok"]
 
     if liveness_ok and not has_struct:
         return min(28.0, score * 40.0), ["fullframe_soft_only_liveness_ok"]
@@ -318,7 +326,7 @@ def _is_match_screen_replay(
     has_struct_ff = has_structural_fullframe_signals(ff_signals)
     bezel_ff = float(mc.get("frame_bezel", frame_bezel_score))
     border_ff = float(mc.get("frame_screen_border", 0.0))
-    has_physical_ff = has_physical_ff or bezel_ff >= 0.45 or border_ff >= 0.42
+    has_physical_ff = has_physical_ff or bezel_ff >= 0.25 or border_ff >= 0.22
 
     if factors.hard_device_overlap and replay_devices:
         return True
@@ -326,7 +334,12 @@ def _is_match_screen_replay(
     if liveness_ok and not factors.hard_device_overlap:
         if mc.get("fullframe_replay_flag") and has_physical_ff:
             return True
-        if bezel_ff >= 0.45 or border_ff >= 0.42 or frame_bezel_score >= 0.45:
+        if bezel_ff >= 0.25 or border_ff >= 0.22 or frame_bezel_score >= 0.25:
+            return True
+        global_moire = float(mc.get("global_moire", 0.0))
+        if bezel_ff >= 0.18 and global_moire >= 0.22:
+            return True
+        if "phone_bezel" in ff_signals and float(mc.get("fullframe_replay_score", 0.0)) >= 0.38:
             return True
         return False
 

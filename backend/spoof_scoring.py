@@ -12,6 +12,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
+from device_filter import phones_in_devices, screen_physical_replay_cues
+
 # Import image heuristics from face_detection after its module init (no cycle if face_detection
 # only imports this lazily from compute_passive_liveness).
 from face_detection import (
@@ -125,7 +127,8 @@ def has_display_attack_corroboration(
 ) -> bool:
     """True when multiple independent cues indicate a digital display, not ambient room light."""
     mc = match_context or {}
-    if mc.get("laptop_capture_context"):
+    raw_device_list = list(mc.get("devices_found_list") or devices_found or [])
+    if mc.get("laptop_capture_context") and not phones_in_devices(raw_device_list):
         devices_found = None
         device_replay_score = min(float(device_replay_score), 0.10)
 
@@ -159,11 +162,22 @@ def has_display_attack_corroboration(
         if mc.get("fullframe_replay_flag") and has_physical_ff:
             return True
         if liveness_ok:
-            if devices_found:
+            if devices_found or phones_in_devices(raw_device_list):
                 return True
-            if device_replay_score >= 0.22:
+            if device_replay_score >= 0.12:
                 return True
-            if has_physical_ff and ff_score >= 0.52:
+            if bezel_ff >= 0.25 or border_ff >= 0.22:
+                return True
+            if screen_physical_replay_cues(
+                bezel_score=bezel_ff,
+                screen_border_score=border_ff,
+                moire=float(mc.get("global_moire", moire)),
+                pixel_grid=grid,
+                fullframe_signals=ff_signals,
+                replay_likelihood=ff_score,
+            ):
+                return True
+            if has_physical_ff and ff_score >= 0.45:
                 return True
             # Do not unlock display path from moiré/artifact-only on verified liveness webcam
         elif ff_score >= 0.55 and has_physical_ff:

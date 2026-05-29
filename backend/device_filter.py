@@ -81,6 +81,43 @@ def is_laptop_only_devices(devices_found: Optional[List[str]]) -> bool:
     return all(is_laptop_display_name(d) for d in devices_found)
 
 
+def phones_in_devices(devices_found: Optional[List[str]]) -> List[str]:
+    return [d for d in (devices_found or []) if is_phone_tablet_name(d)]
+
+
+def screen_physical_replay_cues(
+    *,
+    bezel_score: float = 0.0,
+    screen_border_score: float = 0.0,
+    moire: float = 0.0,
+    pixel_grid: float = 0.0,
+    fullframe_signals: Optional[List[str]] = None,
+    replay_likelihood: float = 0.0,
+) -> bool:
+    """
+    Physical phone/monitor frame or strong display combo — not ambient room light alone.
+    Used at match and during liveness gestures when YOLO misses the phone class.
+    """
+    signals = set(fullframe_signals or [])
+    if "phone_bezel" in signals or "screen_border" in signals:
+        return True
+    if float(bezel_score) >= 0.25 or float(screen_border_score) >= 0.22:
+        return True
+    if float(bezel_score) >= 0.18 and (
+        float(moire) >= 0.22 or float(screen_border_score) >= 0.15
+    ):
+        return True
+    if float(moire) >= 0.30 and float(pixel_grid) >= 0.22 and float(bezel_score) >= 0.12:
+        return True
+    if float(replay_likelihood) >= 0.48 and (
+        "phone_bezel" in signals
+        or "blur_plus_moire" in signals
+        or float(bezel_score) >= 0.20
+    ):
+        return True
+    return False
+
+
 def filter_devices_for_attack(
     devices_found: Optional[List[str]],
     *,
@@ -124,8 +161,10 @@ def adjust_device_replay_score(
     *,
     hard_overlap: bool = False,
 ) -> float:
-    """Dampen device_replay when YOLO only saw the user's laptop or ambient background TV."""
+    """Dampen device_replay for laptop-only / ambient TV — never dampen phone/tablet."""
     if hard_overlap:
+        return float(device_replay_score)
+    if phones_in_devices(devices_found):
         return float(device_replay_score)
     if is_laptop_only_devices(devices_found):
         return min(float(device_replay_score), 0.08)
@@ -157,7 +196,7 @@ def should_raise_liveness_device_alert(
         return False, []
     dr = adjust_device_replay_score(device_replay_score, devices_found, hard_overlap=False)
     phone_tablet = [d for d in attack_devices if is_phone_tablet_name(d)]
-    if phone_tablet and (device_visible or dr >= 0.06):
+    if phone_tablet and (device_visible or dr >= 0.04):
         return True, phone_tablet
     if dr >= near_face_threshold:
         return True, attack_devices
@@ -173,41 +212,50 @@ def hard_reject_phone_tablet_in_selfie(
     device_replay_score: float = 0.0,
     bezel_score: float = 0.0,
     screen_border_score: float = 0.0,
+    moire: float = 0.0,
+    pixel_grid: float = 0.0,
+    fullframe_signals: Optional[List[str]] = None,
+    replay_likelihood: float = 0.0,
 ) -> Tuple[bool, str]:
     """
-    Hard reject POST /match when a phone/tablet is visible or a physical screen frame is detected.
-    Does not apply laptop-only ambient context.
+    Hard reject POST /match when a phone/tablet is visible or physical screen frame detected.
+    Laptop-only ambient context is ignored; phone/tablet is never dampened.
     """
+    _msg = (
+        "Security Alert: Digital screen or photo replay detected. "
+        "Do not use a photograph or digital screen."
+    )
     attack = filter_devices_for_attack(
         devices_found,
         hard_overlap=device_hard,
         device_replay_score=device_replay_score,
     )
-    phones = [d for d in attack if is_phone_tablet_name(d)]
+    phones = phones_in_devices(devices_found) or [d for d in attack if is_phone_tablet_name(d)]
     if phones:
         names = ", ".join(phones)
         return (
             True,
-            "Security Alert: Digital screen or photo replay detected. "
-            f"Electronic device in view ({names}). Remove the phone or tablet and take a direct selfie.",
+            f"{_msg} Electronic device in view ({names}). "
+            "Remove the phone or tablet and take a direct selfie.",
         )
     if device_hard and attack and not is_laptop_only_devices(attack):
         names = ", ".join(attack)
         return (
             True,
-            "Security Alert: Digital screen or photo replay detected. "
-            f"Electronic device blocking the face ({names}).",
+            f"{_msg} Electronic device blocking the face ({names}).",
         )
-    if bezel_score >= 0.30 and screen_border_score >= 0.22:
+    if not is_laptop_only_devices(devices_found) and screen_physical_replay_cues(
+        bezel_score=bezel_score,
+        screen_border_score=screen_border_score,
+        moire=moire,
+        pixel_grid=pixel_grid,
+        fullframe_signals=fullframe_signals,
+        replay_likelihood=replay_likelihood,
+    ):
         return (
             True,
-            "Security Alert: Digital screen or photo replay detected. "
-            "Phone or monitor frame visible — take a direct selfie without a screen.",
+            f"{_msg} Phone or monitor frame detected — take a direct selfie without a screen.",
         )
     if bezel_score >= 0.36 or screen_border_score >= 0.34:
-        return (
-            True,
-            "Security Alert: Digital screen or photo replay detected. "
-            "Do not use a photograph or digital screen.",
-        )
+        return True, _msg
     return False, ""

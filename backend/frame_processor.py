@@ -55,6 +55,8 @@ from device_filter import (
     filter_devices_for_attack,
     should_raise_liveness_device_alert,
     is_phone_tablet_name,
+    phones_in_devices,
+    screen_physical_replay_cues,
 )
 
 # ── YOLO device detection ──
@@ -148,9 +150,19 @@ def _verify_liveness_identity(session: LivenessSession, img, identity_embedder) 
     if sim < SESSION_IDENTITY_MIN_SIM:
         return (
             False,
-            "Different person detected — only the original user may complete the challenges",
+            GESTURE_RESET_IDENTITY_MSG,
         )
     return True, "ok"
+
+
+GESTURE_RESET_MULTI_PERSON_MSG = (
+    "Multiple people detected during liveness. "
+    "Gestures are restarting from Challenge 1 — only one person may complete the challenges."
+)
+GESTURE_RESET_IDENTITY_MSG = (
+    "Different person detected during liveness. "
+    "Gestures are restarting from Challenge 1 — only the original user may complete the challenges."
+)
 
 
 def _identity_violation_response(
@@ -172,6 +184,7 @@ def _identity_violation_response(
         "progress": session.progress_pct,
         "identity_mismatch": True,
         "multi_person": multi_person,
+        "gesture_reset": True,
         "face_out_of_frame": not multi_person,
         "landmarks": landmarks_to_serializable(pts_68) if pts_68 else None,
         "mesh": landmarks_to_serializable(pts_478) if pts_478 else None,
@@ -326,6 +339,14 @@ def _yolo_device_replay_risk(
                 iou_face = inter_area / face_area
                 if iou_face > 0.32:
                     hard_overlap = True
+                if cls_name == "cell phone":
+                    if area_pct >= 0.025:
+                        device_visible_in_frame = True
+                    part = min(1.0, iou_face * 2.1 + min(0.55, area_pct * 4.0))
+                    if area_pct >= 0.04:
+                        part = max(part, 0.44)
+                    max_risk = max(max_risk, part)
+                    continue
                 part = min(1.0, iou_face * 2.1 + min(0.40, area_pct * 3.0))
                 max_risk = max(max_risk, part)
     except Exception as e:
@@ -446,7 +467,7 @@ def process_frame(
         if session.step == "gesture":
             _reset_gesture_attempt(session)
         if session.multi_face_streak >= grace:
-            detail = "Multiple people detected — only one person may complete the challenges"
+            detail = GESTURE_RESET_MULTI_PERSON_MSG
             if session.step == "gesture":
                 return _identity_violation_response(
                     session, None, None, detail, multi_person=True
@@ -611,6 +632,28 @@ def process_frame(
                 )
             devices_found = filter_devices_for_attack(devices_found, hard_overlap=device_hard)
 
+            if session.step == "gesture" and not phones_in_devices(devices_found):
+                from screen_frame_detection import analyze_match_frame_context
+
+                stream_bezel, stream_border = analyze_match_frame_context(img)
+                if screen_physical_replay_cues(
+                    bezel_score=stream_bezel,
+                    screen_border_score=stream_border,
+                ):
+                    session.replay_device_detected = True
+                    session.device_detected = True
+                    session.device_class = "Phone screen frame"
+                    _reset_all_gesture_progress(session)
+                    return _device_alert_response(
+                        session,
+                        pts_68,
+                        pts_478,
+                        "Security Alert: Phone or screen frame detected — "
+                        "remove the device and show your live face directly to the camera",
+                        ["Phone screen frame"],
+                        max(dr, stream_bezel),
+                    )
+
         if _should_run_full_spoof_pipeline(session):
             env_auth = check_background_parallax(
                 session.last_gray_small, curr_gray_small, session.landmark_centroid_history
@@ -660,6 +703,8 @@ def process_frame(
 
             cooldown_threshold = float(th_all.get("cooldown_decay_threshold", 40.0))
             temporal_hits_required = int(th_all.get("temporal_hits_required", 4))
+            if phones_in_devices(devices_found) or dr >= 0.12:
+                temporal_hits_required = min(temporal_hits_required, 2)
 
             if should_flag:
                 session.spoof_temporal_hits += 1
@@ -690,7 +735,8 @@ def process_frame(
                     and (
                         imaging_count >= 2
                         or float(per_sig.get("high_brightness_screen", 0.0)) >= 0.52
-                        or dr >= 0.28
+                        or dr >= 0.20
+                        or phones_in_devices(devices_found)
                     )
                 )
 

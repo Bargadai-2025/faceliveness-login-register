@@ -272,9 +272,9 @@ def analyze_fullframe_screen_replay(
         signals.append("multi_region_moire")
     if global_banding >= 0.36 or float(best.get("banding_max", 0)) >= 0.40:
         signals.append("scanline_banding")
-    if bezel >= 0.30:
+    if bezel >= 0.26:
         signals.append("phone_bezel")
-    if border >= 0.28:
+    if border >= 0.24:
         signals.append("screen_border")
     if global_blur >= 0.45 and global_moire >= 0.28:
         signals.append("blur_plus_moire")
@@ -330,11 +330,16 @@ def is_fullframe_screen_replay(
     signals = set(report.get("signals") or [])
     bezel = float(report.get("bezel_score", 0.0))
     border = float(report.get("screen_border_score", 0.0))
-    has_physical = has_physical_fullframe_signals(signals) or bezel >= 0.45 or border >= 0.42
+    has_physical = has_physical_fullframe_signals(signals) or bezel >= 0.25 or border >= 0.22
     has_struct = has_structural_fullframe_signals(signals)
 
     if liveness_verified and not has_physical:
-        return False
+        if ("phone_bezel" in signals or "screen_border" in signals) and score >= 0.40:
+            has_physical = True
+        elif bezel >= 0.20 and ("moire" in signals or "blur_plus_moire" in signals):
+            has_physical = True
+        else:
+            return False
     if not has_struct:
         return False
 

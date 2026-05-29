@@ -267,19 +267,34 @@ export default function FaceRegister({ userEmail, userAgentLabel, onLogout, onRe
         }
       }
     }
-    if (data.detail) setChallengeMsg(data.detail);
-
-    // Multi-person detection handling
+    // Multi-person during liveness — show restart message and reset challenge pills.
     if (data.multi_person) {
       setMultiPersonError(true);
-    } else {
-      setMultiPersonError(false);
+      const restartMsg =
+        data.detail ||
+        "Multiple people detected during liveness. Gestures are restarting from Challenge 1 — only one person may complete the challenges.";
+      setRejectionError(restartMsg);
+      setError(ERROR_LABELS.MULTI_PERSON);
+      setChallengeMsg(restartMsg);
+      if (data.gesture_reset && data.gesture_idx !== undefined) {
+        setChallengeIndex(data.gesture_idx);
+        setCompletedChallenges([]);
+      }
+      return;
     }
 
     if (data.identity_mismatch) {
       setMultiPersonError(false);
-      setRejectionError(data.detail || "Different person detected — only the original user may complete the challenges");
+      const restartMsg =
+        data.detail ||
+        "Different person detected during liveness. Gestures are restarting from Challenge 1 — only the original user may complete the challenges.";
+      setRejectionError(restartMsg);
       setError(ERROR_LABELS.USER_MISMATCH);
+      setChallengeMsg(restartMsg);
+      if (data.gesture_reset && data.gesture_idx !== undefined) {
+        setChallengeIndex(data.gesture_idx);
+        setCompletedChallenges([]);
+      }
       return;
     }
 
@@ -300,6 +315,8 @@ export default function FaceRegister({ userEmail, userAgentLabel, onLogout, onRe
       );
       return;
     }
+
+    if (data.detail) setChallengeMsg(data.detail);
 
     if (data.step === "gesture" && data.gesture_idx !== undefined) {
       setChallengeIndex(data.gesture_idx);

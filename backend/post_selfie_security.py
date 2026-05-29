@@ -29,6 +29,7 @@ from device_filter import (
     filter_devices_for_attack,
     hard_reject_phone_tablet_in_selfie,
     is_laptop_only_devices,
+    screen_physical_replay_cues,
 )
 
 # Screen-like reflection labels from spoof_scoring.classify_reflection
@@ -417,6 +418,10 @@ def run_post_selfie_security(
         device_replay_score=device_replay_score,
         bezel_score=bezel_score,
         screen_border_score=frame_screen_border,
+        moire=float(fullframe_report.get("global_moire", 0.0)),
+        pixel_grid=float(fullframe_report.get("region_moire_max", 0.0)),
+        fullframe_signals=list(fullframe_report.get("signals") or []),
+        replay_likelihood=fullframe_replay_score,
     )
     if hard_reject:
         print(f"🚫 Hard reject — phone/screen in capture: {hard_msg[:120]}")
@@ -527,9 +532,15 @@ def run_post_selfie_security(
     })
 
     if (
-        fullframe_replay
+        (fullframe_replay or screen_physical_replay_cues(
+            bezel_score=bezel_score,
+            screen_border_score=frame_screen_border,
+            moire=float(fullframe_report.get("global_moire", 0.0)),
+            pixel_grid=float(fullframe_report.get("region_moire_max", 0.0)),
+            fullframe_signals=list(fullframe_report.get("signals") or []),
+            replay_likelihood=fullframe_replay_score,
+        ))
         and verdict != "reject"
-        and has_physical_fullframe_signals(fullframe_report.get("signals"))
     ):
         verdict = "reject"
         security = dict(security)
