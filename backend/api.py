@@ -25,7 +25,6 @@ load_dotenv(os.path.join(_backend_dir, ".env"))
 import cv2
 import torch
 import numpy as np
-import base64
 import uuid
 import secrets
 from fastapi import FastAPI, File, UploadFile, Form, Body, HTTPException, Request
@@ -40,20 +39,18 @@ import cloudinary.uploader
 
 from liveness_session import session_manager, ALL_GESTURE_IDS, LIGHT_CHALLENGES
 from frame_processor import process_frame, warmup_yolo
-from face_detection import remove_background
 from embedding_pipeline import (
     FACE_DETECT_MAX_SIDE,
     create_face_models,
-    extract_face_embedding,
     load_match_thresholds,
 )
-from post_selfie_security import load_post_selfie_config, run_post_selfie_security, scan_yolo_devices
-from challenge_frame_verification import assess_challenge_continuity
-from frame_processor import _get_yolo
+from post_selfie_security import load_post_selfie_config
 from poc_logging import log_event, log_security_verdict
 from api_errors import user_error, safe_exception_message, USER_MESSAGES, public_dict
 from rate_limit import RateLimitMiddleware
-from poc_helpers import enrich_match_security_payload
+from inference_runtime import max_concurrent_inference, run_inference_limited
+from embedding_cache import embedding_cache
+from match_pipeline import MatchPipelineInput, MatchRuntimeConfig, run_full_match_pipeline
 from spoof_scoring import analyze_passive_spoof_single_frame
 from liveness_checks import check_reaction_timing
 from database import (
@@ -73,8 +70,6 @@ from database import (
     is_registered_email,
     resolve_registered_face_label,
     list_face_labels,
-    list_faces_for_matching,
-    list_faces_for_matching_by_label,
     update_liveness_session_status,
 )
 
@@ -199,10 +194,23 @@ async def _startup():
         f"torch={torch.__version__}, register_api=email-v2, liveness_fast_setup={LIVENESS_FAST_SETUP}"
     )
     asyncio.create_task(asyncio.to_thread(warmup_yolo))
+    try:
+        n_cached = await embedding_cache.reload_from_db()
+        print(f"📦 Embedding cache loaded: {n_cached} face(s)")
+    except Exception as e:
+        log_event("embedding_cache_load_failed", level="warning", extra={"reason": str(e)[:120]})
     from liveness_session import session_manager as _sm
 
     redis_on = hasattr(_sm, "_redis_ok") and getattr(_sm, "_redis_ok", False)
-    log_event("api_startup", extra={"redis_sessions": redis_on, "device": DEVICE})
+    log_event(
+        "api_startup",
+        extra={
+            "redis_sessions": redis_on,
+            "device": DEVICE,
+            "embedding_cache_faces": embedding_cache.face_count,
+            "max_concurrent_inference": max_concurrent_inference(),
+        },
+    )
 
 
 @app.exception_handler(HTTPException)
@@ -258,6 +266,8 @@ async def health_ready():
             "models": models_ok,
             "redis_sessions": redis_ok,
             "fast_match": FAST_MATCH,
+            "embedding_cache_faces": embedding_cache.face_count,
+            "max_concurrent_inference": max_concurrent_inference(),
         },
     )
 
@@ -287,6 +297,8 @@ async def health_match_config():
         "min_top2_margin": MATCH_MIN_TOP2_MARGIN,
         "db_host": host_hint,
         "face_counts": counts,
+        "embedding_cache_faces": embedding_cache.face_count,
+        "max_concurrent_inference": max_concurrent_inference(),
         "post_selfie_security": load_post_selfie_config(),
         "liveness_fast_setup": __import__("frame_processor").LIVENESS_FAST_SETUP,
     }
@@ -408,7 +420,7 @@ async def liveness_frame(
     if len(raw) == 0:
         raise HTTPException(status_code=400, detail=user_error("EMPTY_FRAME", retry_allowed=True))
 
-    result = await asyncio.to_thread(
+    result = await run_inference_limited(
         process_frame, sess, raw, verify_identity_callback
     )
     if hasattr(session_manager, "touch"):
@@ -578,23 +590,19 @@ async def match_face(
     liveness_ref_photo: Optional[str] = Form(None),
 ):
     print("errcount : ", errcount)
-    penalties_breakdown = []
     temp_path = f"temp_{file.filename}"
     with open(temp_path, "wb") as f:
         f.write(await file.read())
 
     try:
-        # Strict liveness verification
         if not liveness_session_id or not device_id:
             return public_dict(user_error("MATCH_SESSION_REQUIRED", retry_allowed=False))
 
         now = datetime.utcnow()
-        # Check in-memory session first (backend-driven)
         mem_sess = session_manager.get(liveness_session_id)
         if mem_sess and mem_sess.step in ("complete", "verified"):
-            pass  # Backend-driven session verified
+            pass
         else:
-            # Fallback to PostgreSQL (legacy or already-completed)
             sess = await get_valid_completed_liveness_session(
                 session_id=liveness_session_id,
                 device_id=device_id,
@@ -603,447 +611,62 @@ async def match_face(
             if not sess:
                 return public_dict(user_error("SESSION_INVALID", retry_allowed=False))
 
-        # 1. READ ORIGINAL IMAGE
-        img_raw = cv2.imread(temp_path)
-        if img_raw is None:
-            return public_dict(user_error("IMAGE_READ_FAILED", retry_allowed=True))
-
-        # 3. DETECT FACE (canonical pipeline — same max_side as build_db indexing)
-        try:
-            face_out = extract_face_embedding(img_raw, mtcnn, model, DEVICE)
-        except Exception as e:
-            log_event("face_detection_crash", level="error", session_id=liveness_session_id, extra={"reason": str(e)[:200]})
-            return public_dict(user_error("SERVER_ERROR", retry_allowed=True, http_status=500))
-
-        if not face_out["ok"]:
-            return public_dict(user_error("FACE_NOT_FOUND", retry_allowed=True))
-
-        emb = face_out["embedding"]
-        face_landmarks_mp = face_out["face_landmarks_mp"]
-
-        # Challenge frame continuity (in-memory only; fused into risk engine below)
-        mem_sess_verify = session_manager.get(liveness_session_id)
-        identity_assessment: Dict[str, Any] = {"skipped": True}
-        stream_risk_ema = float(getattr(mem_sess_verify, "stream_risk_ema", 0.0) if mem_sess_verify else 0.0)
-        selfie_devices: List[str] = []
-        if mem_sess_verify and mem_sess_verify.challenge_snapshots:
-            yolo = _get_yolo()
-            if yolo and face_landmarks_mp:
-                lm_xs = [p["x"] for p in face_landmarks_mp]
-                lm_ys = [p["y"] for p in face_landmarks_mp]
-                face_bbox_match = (
-                    int(min(lm_xs)),
-                    int(min(lm_ys)),
-                    int(max(lm_xs) - min(lm_xs)),
-                    int(max(lm_ys) - min(lm_ys)),
-                )
-                pad_cfg = load_post_selfie_config()
-                _, _, selfie_devices = scan_yolo_devices(
-                    img_raw,
-                    face_bbox_match,
-                    yolo,
-                    conf=pad_cfg["yolo_conf"],
-                    hard_iou=pad_cfg["device_hard_iou"],
-                )
-            identity_assessment = assess_challenge_continuity(
-                mem_sess_verify,
-                img_raw,
-                emb,
-                face_landmarks_mp,
-                mtcnn=mtcnn,
-                model=model,
-                device=DEVICE,
-                selfie_devices=selfie_devices,
-            )
-
-        # FaceNet comparison with liveness reference photo if provided
-        if liveness_ref_photo:
+        if not embedding_cache.loaded:
             try:
-                # Remove data URL header if present
-                if "," in liveness_ref_photo:
-                    _, base64_data = liveness_ref_photo.split(",", 1)
-                else:
-                    base64_data = liveness_ref_photo
-                img_data = base64.b64decode(base64_data)
-                nparr = np.frombuffer(img_data, np.uint8)
-                ref_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                if ref_img is None:
-                    return {"error": "Failed to decode the liveness reference photo."}
-
-                ref_face_out = extract_face_embedding(ref_img, mtcnn, model, DEVICE)
-                if not ref_face_out["ok"]:
-                    return {
-                        "error": "No face detected in the liveness reference photo. Please keep your face clearly visible and still during the preparation phase."
-                    }
-                ref_emb = ref_face_out["embedding"]
-
-                similarity_score = float(np.dot(ref_emb, emb))
-                print(f"🔄 FaceNet comparison score between liveness photo and capture image: {similarity_score:.4f}")
-
-                # Set threshold for liveness vs capture (0.70 is standard and safe)
-                LIVENESS_COMPARE_THRESHOLD = float(os.getenv("LIVENESS_COMPARE_THRESHOLD", "0.70"))
-                if similarity_score < LIVENESS_COMPARE_THRESHOLD:
-                    return {
-                        "error": "Liveness process user and captured image user are totally different."
-                    }
+                await embedding_cache.reload_from_db()
             except Exception as e:
-                print(f"Error during liveness reference comparison: {e}")
-                return {"error": f"Liveness reference verification error: {str(e)}"}
-
-        # 4. POST-SELFIE SECURITY (YOLO devices, ambient light, PAD spoof) — always runs
-        sec = run_post_selfie_security(
-            img_raw,
-            face_landmarks_mp,
-            errcount=errcount,
-            penalties_breakdown=penalties_breakdown,
-            identity_assessment=identity_assessment,
-            stream_risk_ema=stream_risk_ema,
-            liveness_session_verified=bool(
-                mem_sess_verify
-                and getattr(mem_sess_verify, "all_gestures_done", False)
-                and getattr(mem_sess_verify, "step", "") in ("complete", "capture", "verified")
-            ),
-        )
-        if sec.get("error"):
-            out = {
-                "error": sec["error"],
-                "user_message": sec.get("user_message", sec["error"]),
-                "security_verdict": sec.get("security_verdict", "reject"),
-                "composite_risk": sec.get("composite_risk"),
-                "risk_factors": sec.get("risk_factors"),
-                "capture_live_ok": False,
-                "screen_replay": bool(sec.get("screen_replay")),
-                "digital_media": bool(sec.get("digital_media", sec.get("screen_replay"))),
-                "user_mismatch": bool(sec.get("user_mismatch")),
-            }
-            if sec.get("security_penalty_breakdown"):
-                out["security_penalty_breakdown"] = sec["security_penalty_breakdown"]
-            if sec.get("spoof_detail"):
-                sd = sec["spoof_detail"]
-                out["spoof_score"] = sd.get("total_spoof_score")
-                out["triggered_rules"] = sd.get("triggered_rules", [])
-            enrich_match_security_payload(
-                out,
-                identity_assessment=identity_assessment,
-                screen_replay=bool(sec.get("screen_replay")),
-            )
-            log_security_verdict(
-                phase="match",
-                verdict=out.get("security_verdict", "reject"),
-                session_id=liveness_session_id,
-                device_id=device_id,
-                composite_risk=out.get("composite_risk"),
-                reason=out.get("error"),
-                retry_allowed=out.get("retry_allowed", False),
-                risk_factors=out.get("risk_factors"),
-            )
-            return out
-
-        errcount = sec["errcount"]
-        penalties_breakdown = sec["penalties_breakdown"]
-        spoof_detail = sec["spoof_detail"]
-        live_ok = sec["live_ok"]
-        live_reason = sec["live_reason"]
-        security_verdict = sec.get("security_verdict", "pass")
-        composite_risk = float(sec.get("composite_risk", 0.0))
-        risk_factors = sec.get("risk_factors")
-        risk_confidence_penalty = float(sec.get("confidence_penalty", 0.0))
-        live_score = max(0.0, min(1.0, 1.0 - spoof_detail["total_spoof_score"] / 100.0))
-
-        # 5. PREPARE PROCESSED IMAGE FOR UI (with background removal; FAST_MATCH uses a small RGB resize only)
-        if FAST_MATCH:
-            print("⚡ FAST_MATCH: skipping remove_background on /match")
-            h0, w0 = img_raw.shape[:2]
-            mx = 640
-            if max(h0, w0) > mx:
-                s = mx / max(h0, w0)
-                small_bgr = cv2.resize(img_raw, (int(w0 * s), int(h0 * s)))
-            else:
-                small_bgr = img_raw.copy()
-            img_processed = cv2.cvtColor(small_bgr, cv2.COLOR_BGR2RGB)
-        else:
-            img_processed = remove_background(img_raw)
-            if max(img_processed.shape[:2]) > 800:
-                scale = 800 / max(img_processed.shape[:2])
-                img_processed = cv2.resize(img_processed, (int(img_processed.shape[1] * scale), int(img_processed.shape[0] * scale)))
-
-        scoped_label = None
-        if expected_label and str(expected_label).strip():
-            scoped_label = " ".join(str(expected_label).split()).strip()
-
-        if scoped_label:
-            all_docs = await list_faces_for_matching_by_label(scoped_label)
-            print(
-                f"🔐 Scoped 1:1 match for logged-in user '{scoped_label}': "
-                f"{len(all_docs)} registered embedding(s)"
-            )
-            if not all_docs:
-                return {
-                    "error": (
-                        f"No registered face found for {scoped_label}. "
-                        "Please complete registration first."
-                    ),
-                }
-        else:
-            all_docs = await list_faces_for_matching()
-            print(f"📦 Loaded {len(all_docs)} faces from PostgreSQL (open search)")
-
-        valid_rows = []
-        for doc in all_docs:
-            if not doc.get("embedding") or len(doc["embedding"]) != 512:
-                continue
-            db_emb = np.array(doc["embedding"], dtype="float32")
-            norm = np.linalg.norm(db_emb)
-            if norm == 0:
-                continue
-            valid_rows.append((doc, db_emb / norm))
-
-        raw_results = []
-        if valid_rows:
-            matrix = np.stack([r[1] for r in valid_rows], axis=0)
-            scores_vec = matrix @ emb
-            for i, (doc, _) in enumerate(valid_rows):
-                score = float(scores_vec[i])
-                d_type = doc.get("doc_type") or "Selfie"
-                raw_results.append({
-                    "label": doc["label"],
-                    "source": doc["source"],
-                    "image_url": doc["image_url"],
-                    "doc_type": d_type,
-                    "score": round(score, 3),
-                })
-
-        raw_results.sort(key=lambda x: x["score"], reverse=True)
-        raw_results = raw_results[:TOP_K]
-
-        print("\n🔍 Top 5 raw matches:")
-        for r in raw_results[:5]:
-            print(f"  {r['label']} ({r['source']}) → {r['score']:.3f} [Type: {r.get('doc_type')}]")
-
-        match_diagnostics = {
-            "detect_max_side": FACE_DETECT_MAX_SIDE,
-            "fast_match": FAST_MATCH,
-            "scoped_match": bool(scoped_label),
-            "scoped_label": scoped_label,
-            "top_raw_label": raw_results[0]["label"] if raw_results else None,
-            "top_raw_score": raw_results[0]["score"] if raw_results else None,
-            "second_raw_label": raw_results[1]["label"] if len(raw_results) > 1 else None,
-            "second_raw_score": raw_results[1]["score"] if len(raw_results) > 1 else None,
-            "top2_margin": (
-                round(float(raw_results[0]["score"]) - float(raw_results[1]["score"]), 4)
-                if len(raw_results) > 1
-                else None
-            ),
-        }
-
-        print(f"\n🔍 Matching against {len(raw_results)} candidates...")
-        seen = {}
-        for r in raw_results:
-            # Senior Debug Tip: Normalize labels AND merge across sources for consistent identity tracking
-            normalized_label = " ".join(str(r["label"]).split())
-            key = normalized_label.lower() 
-            
-            score = round(float(r["score"]), 3)
-            print(f"  - Checking {key}: Score {score}, Type in raw: {r.get('doc_type')}")
-            
-            threshold = MIN_CONFIDENCE_BARGAD if r["source"] in ["bargad", "frontend_reg"] else MIN_CONFIDENCE_LFW
-            if score < threshold:
-                continue
-            if key not in seen:
-                seen[key] = {
-                    "label": r["label"],
-                    "source": r["source"],
-                    "registered_doc_type": r.get("doc_type") or "Selfie",
-                    "verification_type": "Selfie",
-                    "confidence": score,
-                    "matched_image": r["image_url"],
-                    "images": [r["image_url"]]
-                }
-            else:
-                if r["image_url"] not in seen[key]["images"]:
-                    seen[key]["images"].append(r["image_url"])
-                 
-                # Merging Logic:
-                # 1. Update overall confidence/image if this match is stronger
-                if score > seen[key]["confidence"]:
-                    seen[key]["confidence"] = score
-                    seen[key]["matched_image"] = r["image_url"]
-                
-                # 2. Update registered_doc_type only if the new record has a specific ID (not Selfie/None)
-                new_type = r.get("doc_type")
-                if new_type and str(new_type).lower() != "selfie":
-                    seen[key]["registered_doc_type"] = new_type
-                elif not seen[key].get("registered_doc_type"):
-                    seen[key]["registered_doc_type"] = "Selfie"
-
-        results = list(seen.values())
-        results.sort(key=lambda x: x["confidence"], reverse=True)
-
-        # Ambiguous top-2: only for open search (not logged-in 1:1 scoped match).
-        if not scoped_label and len(raw_results) >= 2:
-            top_raw = raw_results[0]
-            second_raw = raw_results[1]
-            top_key = " ".join(str(top_raw["label"]).split()).lower()
-            second_key = " ".join(str(second_raw["label"]).split()).lower()
-            margin = match_diagnostics["top2_margin"]
-            if top_key != second_key and margin is not None and margin < MATCH_MIN_TOP2_MARGIN:
-                skip_ambiguous = False
-                if expected_label:
-                    target_key = " ".join(str(expected_label).split()).lower()
-                    top_threshold = (
-                        MIN_CONFIDENCE_BARGAD
-                        if top_raw.get("source") in ("bargad", "frontend_reg")
-                        else MIN_CONFIDENCE_LFW
-                    )
-                    if top_key == target_key and float(top_raw["score"]) >= top_threshold:
-                        skip_ambiguous = True
-                        print(
-                            f"✓ Ambiguous check skipped: logged-in user '{expected_label}' "
-                            f"is top match ({top_raw['score']:.3f})"
-                        )
-                if not skip_ambiguous:
-                    print(
-                        f"⚠️ Ambiguous match: {top_raw['label']}={top_raw['score']:.3f} vs "
-                        f"{second_raw['label']}={second_raw['score']:.3f} "
-                        f"(margin {margin:.3f} < {MATCH_MIN_TOP2_MARGIN})"
-                    )
-                    return {
-                        "error": "Match ambiguous — multiple identities scored too closely. Please retake the selfie with even lighting and face centered.",
-                        "match_diagnostics": match_diagnostics,
-                    }
-
-        # Apply security penalty from errcount (each point reduces confidence by 1%)
-        if errcount > 0 or True: # Always show breakdown if results exist
-            base_conf = results[0]["confidence"] if results else 0.0
-            # Increase penalty: each errcount point now reduces confidence by 3% (instead of 1%)
-            penalty = float(errcount) * 0.03
-            
-            # Always add base similarity as the first entry
-            penalties_breakdown.insert(0, {
-                "type": "Base Face Similarity",
-                "penalty": 0.0,
-                "count": 1,
-                "detail": f"Raw similarity score: {int(round(base_conf * 100))}%"
-            })
-
-            total_penalty = penalty + risk_confidence_penalty
-            if total_penalty > 0:
-                print(
-                    f"⚠️ Applying security penalty: -{total_penalty:.3f} "
-                    f"(errcount={errcount}, risk_penalty={risk_confidence_penalty:.3f})"
+                log_event(
+                    "embedding_cache_reload_failed",
+                    level="error",
+                    session_id=liveness_session_id,
+                    extra={"reason": str(e)[:120]},
                 )
-                if penalty > 0:
-                    penalties_breakdown.append({
-                        "type": "Liveness Session Risk",
-                        "penalty": round(penalty, 3),
-                        "count": errcount // 10,
-                        "detail": "Accumulated liveness stream signals.",
-                    })
-                for r in results:
-                    r["confidence"] = max(0.0, round(r["confidence"] - total_penalty, 3))
-            
-            # Removed hard rejection as per user request to show penalty table instead
-            # if errcount >= 20:
-            #     return {"error": "Security Alert: High risk of digital spoofing detected during session. Matching blocked."}
-            
-            # Re-sort results
-            results.sort(key=lambda x: x["confidence"], reverse=True)
+                return public_dict(user_error("SERVER_ERROR", retry_allowed=True, http_status=503))
 
-        # Log geo data
-        if geo_lat and geo_long:
-            await insert_auth_log(
-                timestamp=geo_timestamp or datetime.utcnow(),
+        pipeline_out = await run_inference_limited(
+            run_full_match_pipeline,
+            MatchPipelineInput(
+                temp_path=temp_path,
+                liveness_session_id=liveness_session_id,
+                device_id=device_id,
+                errcount=int(errcount or 0),
+                expected_label=expected_label,
+                liveness_ref_photo=liveness_ref_photo,
                 geo_lat=geo_lat,
                 geo_long=geo_long,
-                top_match=results[0]["label"] if results else "no_match",
-                match_count=len(results),
-                raw_data={"geo_timestamp": geo_timestamp} if geo_timestamp else {},
+                geo_timestamp=geo_timestamp,
+                mtcnn=mtcnn,
+                model=model,
+                runtime=MatchRuntimeConfig(
+                    device=DEVICE,
+                    fast_match=FAST_MATCH,
+                    min_confidence_bargad=MIN_CONFIDENCE_BARGAD,
+                    min_confidence_lfw=MIN_CONFIDENCE_LFW,
+                    min_top2_margin=MATCH_MIN_TOP2_MARGIN,
+                    top_k=TOP_K,
+                ),
+            ),
+        )
+
+        if pipeline_out.auth_log:
+            al = pipeline_out.auth_log
+            await insert_auth_log(
+                timestamp=al["timestamp"],
+                geo_lat=al["geo_lat"],
+                geo_long=al["geo_long"],
+                top_match=al["top_match"],
+                match_count=al["match_count"],
+                raw_data=al.get("raw_data") or {},
             )
-            print(f"📍 Geo logged: {geo_lat}, {geo_long}")
 
-        if not results:
-            if scoped_label:
-                return {
-                    "error": (
-                        "Your selfie does not match your registered face. "
-                        "Please retake with even lighting and your face centered."
-                    ),
-                    "match_diagnostics": match_diagnostics,
-                }
-            return {
-                "error": "No confident match found in the dataset.",
-                "match_diagnostics": match_diagnostics,
-            }
-
-        if expected_label and results and not scoped_label:
-            top_label = " ".join(str(results[0]["label"]).split()).lower()
-            target_label = " ".join(str(expected_label).split()).lower()
-            if top_label != target_label:
-                print(
-                    f"❌ Identity Mismatch: Expected '{target_label}', "
-                    f"but matched '{top_label}' ({results[0]['confidence'] * 100:.0f}%)"
-                )
-                return {
-                    "error": (
-                        f"Identity mismatch: face matched as {results[0]['label']} "
-                        f"({results[0]['confidence'] * 100:.0f}%), but you are logged in as "
-                        f"{expected_label}. Only your registered account may verify."
-                    ),
-                    "match_diagnostics": match_diagnostics,
-                }
-
-        if liveness_session_id:
+        if pipeline_out.consume_session and pipeline_out.response.get("matches"):
             await update_liveness_session_status(
                 session_id=liveness_session_id,
                 status="consumed",
                 raw_updates={"consumed_at": datetime.utcnow()},
             )
-        # Encode processed image to base64 for frontend display
-        _, buffer = cv2.imencode(".jpg", cv2.cvtColor(img_processed, cv2.COLOR_RGB2BGR))
-        processed_b64 = base64.b64encode(buffer).decode("utf-8")
 
-        # Encode the ORIGINAL captured selfie (not background-removed) for comparison
-        _, raw_buffer = cv2.imencode(".jpg", img_raw)
-        captured_b64 = base64.b64encode(raw_buffer).decode("utf-8")
-
-        log_security_verdict(
-            phase="match",
-            verdict=security_verdict,
-            session_id=liveness_session_id,
-            device_id=device_id,
-            composite_risk=composite_risk,
-            reason="match_ok",
-            retry_allowed=False,
-            risk_factors=risk_factors if isinstance(risk_factors, dict) else None,
-        )
-
-        return {
-            "matches": results,
-            "processed_image": f"data:image/jpeg;base64,{processed_b64}",
-            "captured_image": f"data:image/jpeg;base64,{captured_b64}",
-            "security_penalty_breakdown": penalties_breakdown,
-            "capture_live_ok": bool(live_ok),
-            "capture_live_score": round(float(live_score), 4),
-            "capture_live_reason": live_reason,
-            "spoof_score": spoof_detail["total_spoof_score"],
-            "spoof_reject_threshold": spoof_detail.get("reject_threshold"),
-            "triggered_rules": spoof_detail.get("triggered_rules", []),
-            "confidence_per_signal": spoof_detail.get("confidence_per_signal", {}),
-            "reflection_classification": spoof_detail.get("reflection_classification"),
-            "final_replay_risk": spoof_detail["total_spoof_score"],
-            "correlation_gate_notes": spoof_detail.get("correlation_gate_notes", []),
-            "extra_signals_used": spoof_detail.get("extra_signals_used", {}),
-            "match_diagnostics": match_diagnostics,
-            "security_verdict": security_verdict,
-            "composite_risk": composite_risk,
-            "risk_factors": risk_factors,
-            "challenge_frames_verified": len(
-                getattr(mem_sess, "challenge_snapshots", []) or []
-            )
-            if mem_sess
-            else 0,
-            "retry_allowed": False,
-        }
+        return pipeline_out.response
 
     except Exception as e:
         log_event("match_unhandled", level="error", session_id=liveness_session_id, extra={"reason": str(e)[:200]})
@@ -1188,6 +811,13 @@ async def register_user(
             source="frontend_reg",
             image_url=image_url,
             embedding=emb.tolist(),
+        )
+        embedding_cache.add_face(
+            label=clean_label,
+            source="frontend_reg",
+            image_url=image_url,
+            embedding=emb.tolist(),
+            doc_type=str(docType or "Selfie"),
         )
 
         await insert_app_user(

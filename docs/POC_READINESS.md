@@ -14,6 +14,7 @@
 | Area | Implementation |
 |------|----------------|
 | Sessions | `session_store.py` — memory + Redis pickle sync |
+| Concurrency | `inference_runtime.py` — bounded ML thread pool; `embedding_cache.py` — in-memory vector search |
 | Logging | `poc_logging.py` — JSON security pass/reject events |
 | API errors | `api_errors.py` — no raw exceptions to clients |
 | Rate limits | `rate_limit.py` — per-IP on frame/match/start |
