@@ -225,11 +225,8 @@ def compute_identity_continuity_risk(assessment: Dict[str, Any]) -> Tuple[float,
             notes.append(f"ratio_drift={drift:.3f}")
 
     if assessment.get("device_only_at_capture") and not assessment.get("laptop_capture_context"):
-        if not assessment.get("liveness_session_verified"):
-            risk_parts.append(75.0)
-            notes.append("device_only_at_capture")
-        else:
-            notes.append("device_only_at_capture_ignored_liveness_ok")
+        risk_parts.append(75.0)
+        notes.append("device_only_at_capture")
 
     if assessment.get("no_face_in_challenge_crop"):
         risk_parts.append(90.0)
@@ -312,6 +309,10 @@ def _is_match_screen_replay(
     replay_devices = filter_devices_for_attack(
         devices_found, hard_overlap=factors.hard_device_overlap
     )
+    phone_devices = [d for d in (replay_devices or []) if is_phone_tablet_name(d)]
+    if phone_devices:
+        return True
+
     ff_signals = mc.get("fullframe_signals") or []
     has_physical_ff = has_physical_fullframe_signals(ff_signals)
     has_struct_ff = has_structural_fullframe_signals(ff_signals)
@@ -326,9 +327,6 @@ def _is_match_screen_replay(
         if mc.get("fullframe_replay_flag") and has_physical_ff:
             return True
         if bezel_ff >= 0.45 or border_ff >= 0.42 or frame_bezel_score >= 0.45:
-            return True
-        phone_devices = [d for d in (replay_devices or []) if is_phone_tablet_name(d)]
-        if phone_devices and factors.device_risk >= 62.0:
             return True
         return False
 

@@ -4,6 +4,8 @@ import { getCoverSourceRect } from "./cameraDrawUtils";
 import {
   MATCH_REQUEST_TIMEOUT_MS,
   REGISTER_REQUEST_TIMEOUT_MS,
+  LIVENESS_FRAME_INTERVAL_MS,
+  createLivenessFrameLimiter,
   isReplayDeviceAlert,
   matchFetchErrorMessage,
   registerFetchErrorMessage,
@@ -39,7 +41,7 @@ L.Icon.Default.mergeOptions({
 
 const API_URL = getApiBase();
 const DEVICE_KEY = "facematch_device_id";
-const FRAME_INTERVAL_MS = 80;
+const FRAME_INTERVAL_MS = LIVENESS_FRAME_INTERVAL_MS;
 const PROCESS_W = 640;
 const PROCESS_H = 480;
 const SHOW_FACE_MESH_OVERLAY = false;
@@ -144,6 +146,7 @@ export default function FaceRegister({ userEmail, userAgentLabel, onLogout, onRe
   const registerAbortRef = useRef(null);
   const livenessCompletedRef = useRef(false);
   const streamingRef = useRef(false);
+  const frameLimiterRef = useRef(createLivenessFrameLimiter());
   const profileMenuRef = useRef(null);
   const [photoCaptured, setPhotoCaptured] = useState(false);
 
@@ -273,6 +276,31 @@ export default function FaceRegister({ userEmail, userAgentLabel, onLogout, onRe
       setMultiPersonError(false);
     }
 
+    if (data.identity_mismatch) {
+      setMultiPersonError(false);
+      setRejectionError(data.detail || "Different person detected — only the original user may complete the challenges");
+      setError(ERROR_LABELS.USER_MISMATCH);
+      return;
+    }
+
+    if (isReplayDeviceAlert(data)) {
+      setRejectionError(data.detail || ERROR_LABELS.DIGITAL_MEDIA);
+      setError(ERROR_LABELS.DIGITAL_MEDIA);
+      setChallengeMsg(data.detail || ERROR_LABELS.DIGITAL_MEDIA);
+      stopCamera();
+      return;
+    }
+
+    if (data.face_out_of_frame) {
+      setMultiPersonError(false);
+      setRejectionError(null);
+      setError(ERROR_LABELS.NO_FACE);
+      setChallengeMsg(
+        data.detail || "Keep your face fully inside the frame during the challenge",
+      );
+      return;
+    }
+
     if (data.step === "gesture" && data.gesture_idx !== undefined) {
       setChallengeIndex(data.gesture_idx);
       const completed = [];
@@ -285,12 +313,6 @@ export default function FaceRegister({ userEmail, userAgentLabel, onLogout, onRe
         livenessCompletedRef.current = true;
         await completeSession();
       }
-    }
-
-    if (isReplayDeviceAlert(data)) {
-      setRejectionError(ERROR_LABELS.DIGITAL_MEDIA);
-      stopCamera();
-      return;
     }
 
     if (data.status === "rejected" || data.status === "failed") {
@@ -320,7 +342,15 @@ export default function FaceRegister({ userEmail, userAgentLabel, onLogout, onRe
   }
 
   async function streamFrameToBackend() {
-    if (streamingRef.current || !videoRef.current || videoRef.current.readyState < 2 || !livenessSessionIdRef.current) return;
+    if (
+      streamingRef.current ||
+      frameLimiterRef.current.shouldSkip() ||
+      !videoRef.current ||
+      videoRef.current.readyState < 2 ||
+      !livenessSessionIdRef.current
+    ) {
+      return;
+    }
     streamingRef.current = true;
     try {
       const video = videoRef.current;
@@ -328,20 +358,36 @@ export default function FaceRegister({ userEmail, userAgentLabel, onLogout, onRe
       c.width = PROCESS_W;
       c.height = PROCESS_H;
       const ctx2 = c.getContext("2d");
-      if (!ctx2) { streamingRef.current = false; return; }
+      if (!ctx2) {
+        streamingRef.current = false;
+        return;
+      }
       const vw = video.videoWidth;
       const vh = video.videoHeight;
       const { sx, sy, sw, sh } = getCoverSourceRect(vw, vh, PROCESS_W, PROCESS_H);
       ctx2.drawImage(video, sx, sy, sw, sh, 0, 0, PROCESS_W, PROCESS_H);
       const blob = await new Promise((r) => c.toBlob(r, "image/jpeg", 0.9));
-      if (!blob) { streamingRef.current = false; return; }
+      if (!blob) {
+        streamingRef.current = false;
+        return;
+      }
       const fd = new FormData();
       fd.append("session_id", livenessSessionIdRef.current);
       fd.append("frame", blob, "frame.jpg");
       const res = await fetch(`${API_URL}/liveness/frame`, { method: "POST", body: fd });
-      const data = await res.json();
+      const data = await parseJsonResponse(res);
+      if (!res.ok) {
+        if (res.status === 429 || data.retry_allowed) {
+          const pauseMs = frameLimiterRef.current.onRateLimited();
+          console.warn(`Liveness frame rate limited — pausing ${pauseMs}ms`);
+        }
+        return;
+      }
+      frameLimiterRef.current.onSuccess();
       await handleBackendResponse(data);
-    } catch (e) { console.warn("Stream error:", e); }
+    } catch (e) {
+      console.warn("Stream error:", e);
+    }
     streamingRef.current = false;
   }
 
@@ -369,6 +415,7 @@ export default function FaceRegister({ userEmail, userAgentLabel, onLogout, onRe
   }
 
   async function startCamera() {
+    frameLimiterRef.current.reset();
     setError(null);
     setFile(null);
     setPreview(null);
@@ -428,6 +475,7 @@ export default function FaceRegister({ userEmail, userAgentLabel, onLogout, onRe
 
   function stopCamera() {
     stopCameraStreamOnly();
+    frameLimiterRef.current.reset();
     setLivenessLive(false);
     setPhotoCaptured(false);
     livenessSessionIdRef.current = null;

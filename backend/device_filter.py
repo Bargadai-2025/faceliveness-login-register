@@ -149,15 +149,65 @@ def should_raise_liveness_device_alert(
 ) -> Tuple[bool, List[str]]:
     """
     Whether to return an in-stream device security alert to the frontend.
-  """
+    """
     if hard_overlap:
         return True, list(devices_found or [])
     attack_devices = filter_devices_for_attack(devices_found, hard_overlap=False)
     if not attack_devices:
         return False, []
     dr = adjust_device_replay_score(device_replay_score, devices_found, hard_overlap=False)
+    phone_tablet = [d for d in attack_devices if is_phone_tablet_name(d)]
+    if phone_tablet and (device_visible or dr >= 0.06):
+        return True, phone_tablet
     if dr >= near_face_threshold:
         return True, attack_devices
     if device_visible and not is_laptop_only_devices(devices_found):
         return True, attack_devices
     return False, attack_devices
+
+
+def hard_reject_phone_tablet_in_selfie(
+    devices_found: Optional[List[str]],
+    *,
+    device_hard: bool = False,
+    device_replay_score: float = 0.0,
+    bezel_score: float = 0.0,
+    screen_border_score: float = 0.0,
+) -> Tuple[bool, str]:
+    """
+    Hard reject POST /match when a phone/tablet is visible or a physical screen frame is detected.
+    Does not apply laptop-only ambient context.
+    """
+    attack = filter_devices_for_attack(
+        devices_found,
+        hard_overlap=device_hard,
+        device_replay_score=device_replay_score,
+    )
+    phones = [d for d in attack if is_phone_tablet_name(d)]
+    if phones:
+        names = ", ".join(phones)
+        return (
+            True,
+            "Security Alert: Digital screen or photo replay detected. "
+            f"Electronic device in view ({names}). Remove the phone or tablet and take a direct selfie.",
+        )
+    if device_hard and attack and not is_laptop_only_devices(attack):
+        names = ", ".join(attack)
+        return (
+            True,
+            "Security Alert: Digital screen or photo replay detected. "
+            f"Electronic device blocking the face ({names}).",
+        )
+    if bezel_score >= 0.30 and screen_border_score >= 0.22:
+        return (
+            True,
+            "Security Alert: Digital screen or photo replay detected. "
+            "Phone or monitor frame visible — take a direct selfie without a screen.",
+        )
+    if bezel_score >= 0.36 or screen_border_score >= 0.34:
+        return (
+            True,
+            "Security Alert: Digital screen or photo replay detected. "
+            "Do not use a photograph or digital screen.",
+        )
+    return False, ""

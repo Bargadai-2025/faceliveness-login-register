@@ -1302,6 +1302,9 @@ import { getApiBase } from "./apiBase";
 import { getCoverSourceRect } from "./cameraDrawUtils";
 import {
   MATCH_REQUEST_TIMEOUT_MS,
+  LIVENESS_FRAME_INTERVAL_MS,
+  LIVENESS_PROBE_FRAME_INTERVAL_MS,
+  createLivenessFrameLimiter,
   isReplayDeviceAlert,
   matchFetchErrorMessage,
   startIndeterminateMatchProgress,
@@ -1359,13 +1362,13 @@ const API_URL = getApiBase();
 const DEVICE_KEY = "facematch_device_id";
 /** Only block match when liveness accumulated substantial display-attack penalties. */
 const MATCH_ERRCOUNT_BLOCK_THRESHOLD = 30;
-const FRAME_INTERVAL_MS = 16;
+const FRAME_INTERVAL_MS = LIVENESS_FRAME_INTERVAL_MS;
 /** Selfie retries before full flow reset (banking PoC). */
 const MATCH_MAX_SELFIE_RETRIES = 2;
 /** Short countdown; probe frames run security checks before main stream. */
 const INIT_COUNTDOWN_SEC = 1;
 const CHALLENGE_PREP_DELAY_MS = 250;
-const PROBE_FRAME_INTERVAL_MS = 350;
+const PROBE_FRAME_INTERVAL_MS = LIVENESS_PROBE_FRAME_INTERVAL_MS;
 const DEVICE_TOAST_INTERVAL_MS = 1200;
 const OVERLAY_LERP = 1.0;
 const OVERLAY_STALE_MS = 1200;
@@ -1671,6 +1674,8 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
   const gesturePrepDoneRef = useRef(false);
   const initCountdownIntervalRef = useRef(null);
   const multiPersonErrorRef = useRef(false);
+  const faceOutOfFrameRef = useRef(false);
+  const frameLimiterRef = useRef(createLivenessFrameLimiter());
 
   const clearCameraTimers = useCallback(() => {
     if (initCountdownIntervalRef.current) {
@@ -2076,6 +2081,29 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
       return;
     }
 
+    if (data.identity_mismatch) {
+      applySecurityError(data.detail || "Different person detected — restart liveness", {});
+      setErrcount((prev) => prev + 5);
+      return;
+    }
+
+    if (data.face_out_of_frame) {
+      faceOutOfFrameRef.current = true;
+      setError(ERROR_LABELS.NO_FACE);
+      setChallengeMsg(
+        data.detail || "Keep your face fully inside the frame during the challenge",
+      );
+      setErrcount((prev) => prev + 2);
+      return;
+    }
+
+    if (faceOutOfFrameRef.current) {
+      faceOutOfFrameRef.current = false;
+      setError((prev) =>
+        prev === ERROR_LABELS.NO_FACE ? null : prev,
+      );
+    }
+
     if (multiPersonErrorRef.current) {
       multiPersonErrorRef.current = false;
       setMultiPersonError(false);
@@ -2094,6 +2122,14 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
     if (isDeviceAlert) {
       applySecurityError(data.detail, { digitalMedia: true });
       setErrcount((prev) => prev + 10);
+      if (data.step === "gesture" && data.gesture_idx !== undefined) {
+        prevGestureIdxRef.current = data.gesture_idx;
+        setChallengeIndex(data.gesture_idx);
+        const completed = [];
+        for (let i = 0; i < data.gesture_idx; i++) completed.push(true);
+        setCompletedChallenges(completed);
+      }
+      return;
     }
 
     if (data.gesture_prep && !gesturePrepDoneRef.current) {
@@ -2131,7 +2167,7 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
       if (data.gesture_idx > prevIdx) {
         playSoundsForChallengeComplete(prevIdx);
       } else if (
-        data.detail &&
+        data.detail && 
         (data.detail.includes("Good! Next gesture") || data.detail.includes("Good! Next"))
       ) {
         const completedIdx = Math.max(0, (data.gesture_idx ?? 1) - 1);
@@ -2201,6 +2237,7 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
   async function streamFrameToBackend() {
     if (
       streamingRef.current ||
+      frameLimiterRef.current.shouldSkip() ||
       !videoRef.current ||
       videoRef.current.readyState < 2 ||
       !livenessSessionIdRef.current
@@ -2245,12 +2282,17 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
       if (!res.ok && data.error) {
         const msg = parseApiDetail(data, ERROR_LABELS.LIVENESS_FAILED);
         if (res.status === 429 || data.retry_allowed) {
-          console.warn("Liveness frame rate limited / retry:", msg);
+          const pauseMs = frameLimiterRef.current.onRateLimited();
+          console.warn(
+            `Liveness frame rate limited — pausing ${pauseMs}ms:`,
+            msg,
+          );
         } else if (res.status === 400) {
           applySecurityError(msg);
         }
         return;
       }
+      frameLimiterRef.current.onSuccess();
       await handleBackendResponse(data);
     } catch (e) {
       console.warn("Stream error:", e);
@@ -2287,6 +2329,7 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
   async function startCamera() {
     stopCamera();
     unlockAudio();
+    frameLimiterRef.current.reset();
     prevGestureIdxRef.current = 0;
     lastSoundChallengeRef.current = -1;
     setError(null);
@@ -2389,8 +2432,10 @@ export default function FaceMatch({ userEmail, userAgentLabel, onLogout }) {
     gesturePrepDoneRef.current = false;
     setGesturePrepActive(false);
     multiPersonErrorRef.current = false;
+    faceOutOfFrameRef.current = false;
     prevGestureIdxRef.current = 0;
     lastSoundChallengeRef.current = -1;
+    frameLimiterRef.current.reset();
     setMultiPersonError(false);
     setChallengeMsg("");
   }

@@ -45,6 +45,43 @@ export function isReplayDeviceAlert(data) {
   return false;
 }
 
+/**
+ * Liveness frame stream — keep aligned with backend RATE_LIMIT_FRAME_MAX (~2–6 fps processed).
+ * 16 ms (~60 fps) overwhelms the API and triggers 429, stalling gesture sustain counts.
+ */
+export const LIVENESS_FRAME_INTERVAL_MS = 150;
+export const LIVENESS_PROBE_FRAME_INTERVAL_MS = 350;
+export const LIVENESS_FRAME_BACKOFF_BASE_MS = 400;
+export const LIVENESS_FRAME_BACKOFF_MAX_MS = 2500;
+
+/** Tracks 429 backoff so dropped frames don't stall gesture sustain counting forever. */
+export function createLivenessFrameLimiter() {
+  let backoffUntil = 0;
+  let consecutive429 = 0;
+
+  return {
+    shouldSkip() {
+      return Date.now() < backoffUntil;
+    },
+    onRateLimited() {
+      consecutive429 += 1;
+      const pause = Math.min(
+        LIVENESS_FRAME_BACKOFF_MAX_MS,
+        LIVENESS_FRAME_BACKOFF_BASE_MS * consecutive429,
+      );
+      backoffUntil = Date.now() + pause;
+      return pause;
+    },
+    onSuccess() {
+      consecutive429 = 0;
+    },
+    reset() {
+      backoffUntil = 0;
+      consecutive429 = 0;
+    },
+  };
+}
+
 /** Max wait for POST /match before abort (slow CPU / large DB / dead API). */
 export const MATCH_REQUEST_TIMEOUT_MS = 180000;
 

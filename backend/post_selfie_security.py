@@ -27,6 +27,7 @@ from screen_replay_analysis import (
 from device_filter import (
     adjust_device_replay_score,
     filter_devices_for_attack,
+    hard_reject_phone_tablet_in_selfie,
     is_laptop_only_devices,
 )
 
@@ -409,6 +410,29 @@ def run_post_selfie_security(
     devices_for_security = filter_devices_for_attack(
         devices_found, hard_overlap=bool(device_hard), device_replay_score=device_replay_score
     )
+
+    hard_reject, hard_msg = hard_reject_phone_tablet_in_selfie(
+        devices_found,
+        device_hard=device_hard,
+        device_replay_score=device_replay_score,
+        bezel_score=bezel_score,
+        screen_border_score=frame_screen_border,
+    )
+    if hard_reject:
+        print(f"🚫 Hard reject — phone/screen in capture: {hard_msg[:120]}")
+        return {
+            "error": hard_msg,
+            "user_message": hard_msg,
+            "spoof_detail": {"total_spoof_score": 100.0, "triggered_rules": ["phone_tablet_in_capture"]},
+            "security_penalty_breakdown": penalties_breakdown,
+            "capture_live_ok": False,
+            "security_verdict": "reject",
+            "composite_risk": 100.0,
+            "risk_factors": {"device_risk": 100.0},
+            "screen_replay": True,
+            "digital_media": True,
+            "user_mismatch": False,
+        }
 
     extra_signals: Dict[str, float] = {}
     if device_replay_score > 0.01:

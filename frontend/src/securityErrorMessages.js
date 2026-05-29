@@ -85,6 +85,7 @@ const RULES = [
   [/camera blocked|blocked.*camera|uncover camera/, ERROR_LABELS.CAMERA_BLOCKED],
   [/multiple (user|people|person)/, ERROR_LABELS.MULTI_PERSON],
   [/no face/, ERROR_LABELS.NO_FACE],
+  [/inside the frame|out of view|fully inside the frame/, ERROR_LABELS.NO_FACE],
   [/\bface too close\b/, ERROR_LABELS.FACE_TOO_CLOSE],
   [/too far/, ERROR_LABELS.MOVE_BACK],
   [/move back/, ERROR_LABELS.MOVE_BACK],

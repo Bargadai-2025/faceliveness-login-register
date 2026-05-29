@@ -14,17 +14,41 @@ from face_detection import (
     compute_brightness_histogram,
 )
 
-SUSTAINED_FRAMES = int(os.getenv("LIVENESS_SUSTAINED_FRAMES", "5"))
-TURN_SUSTAINED_FRAMES = int(os.getenv("LIVENESS_TURN_SUSTAINED_FRAMES", "2"))
-TURN_YAW_FRAC = float(os.getenv("LIVENESS_TURN_YAW_FRAC", "0.032"))
-TURN_YAW_MIN_PX = float(os.getenv("LIVENESS_TURN_YAW_MIN_PX", "3"))
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name, str(default)).strip()
+    if "#" in raw:
+        raw = raw.split("#", 1)[0].strip()
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, str(default)).strip()
+    if "#" in raw:
+        raw = raw.split("#", 1)[0].strip()
+    try:
+        return int(float(raw))
+    except (TypeError, ValueError):
+        return default
+
+
+SUSTAINED_FRAMES = _env_int("LIVENESS_SUSTAINED_FRAMES", 5)
+TURN_SUSTAINED_FRAMES = _env_int("LIVENESS_TURN_SUSTAINED_FRAMES", 2)
+TURN_YAW_FRAC = _env_float("LIVENESS_TURN_YAW_FRAC", 0.032)
+TURN_YAW_MIN_PX = _env_float("LIVENESS_TURN_YAW_MIN_PX", 3)
 # Set LIVENESS_TURN_MIRROR=1 only if left/right challenges feel reversed on your camera.
 TURN_MIRROR = os.getenv("LIVENESS_TURN_MIRROR", "0").strip().lower() in ("1", "true", "yes")
-PITCH_FRAC = float(os.getenv("LIVENESS_PITCH_FRAC", "0.028"))
-PITCH_MIN_PX = float(os.getenv("LIVENESS_PITCH_MIN_PX", "2.5"))
-HOLD_DURATION_SEC = float(os.getenv("LIVENESS_HOLD_DURATION_SEC", "0.10"))
-GESTURE_INSTRUCTION_SEC = float(os.getenv("LIVENESS_GESTURE_INSTRUCTION_SEC", "0.35"))
-HOLD_SUSTAINED_FRAMES = int(os.getenv("LIVENESS_HOLD_SUSTAINED_FRAMES", "2"))
+PITCH_FRAC = _env_float("LIVENESS_PITCH_FRAC", 0.028)
+PITCH_MIN_PX = _env_float("LIVENESS_PITCH_MIN_PX", 2.5)
+HOLD_DURATION_SEC = _env_float("LIVENESS_HOLD_DURATION_SEC", 0.10)
+GESTURE_INSTRUCTION_SEC = _env_float("LIVENESS_GESTURE_INSTRUCTION_SEC", 0.35)
+HOLD_SUSTAINED_FRAMES = _env_int("LIVENESS_HOLD_SUSTAINED_FRAMES", 2)
+FRAME_INSET_FRAC = _env_float("LIVENESS_FRAME_INSET_FRAC", 0.06)
+FRAME_INSET_MIN_PX = _env_float("LIVENESS_FRAME_INSET_MIN_PX", 10)
+SESSION_IDENTITY_MIN_SIM = _env_float("LIVENESS_SESSION_IDENTITY_MIN_SIM", 0.58)
 
 _HOLD_GESTURES = frozenset({
     "look_left_hold", "look_right_hold", "look_up_hold", "look_down_hold",
@@ -52,7 +76,7 @@ def _evaluate_turn_gesture(
     gesture_id: str,
     pts_68: List[Dict],
     ref: Dict[str, Any],
-    session: Any,
+    session: Any, 
     face_w: float,
 ) -> bool:
     """Head turns — peak tracking so a quick turn still completes."""
@@ -122,6 +146,39 @@ def _evaluate_yaw_hold(
     """Look left / look right — same yaw logic as turn_left / turn_right."""
     gid = "turn_left" if direction == "left" else "turn_right"
     return _evaluate_turn_gesture(gid, pts_68, ref, session, face_w)
+
+
+def check_face_in_frame(
+    pts_68: List[Dict],
+    frame_w: int,
+    frame_h: int,
+    *,
+    margin_frac: float = FRAME_INSET_FRAC,
+    margin_min_px: float = FRAME_INSET_MIN_PX,
+) -> Tuple[bool, str]:
+    """
+    True when the full face bbox (68 landmarks) stays inside the camera frame.
+    Used during gesture challenges — partial/out-of-frame faces must not pass.
+    """
+    if not pts_68 or frame_w < 16 or frame_h < 16:
+        return False, "No face detected — center your face in the frame"
+
+    margin_x = max(int(margin_min_px), int(frame_w * margin_frac))
+    margin_y = max(int(margin_min_px), int(frame_h * margin_frac))
+    xs = [float(p["x"]) for p in pts_68]
+    ys = [float(p["y"]) for p in pts_68]
+    x_min, x_max = min(xs), max(xs)
+    y_min, y_max = min(ys), max(ys)
+
+    if x_min < margin_x:
+        return False, "Keep your face fully inside the frame — do not move left out of view"
+    if x_max > frame_w - margin_x:
+        return False, "Keep your face fully inside the frame — do not move right out of view"
+    if y_min < margin_y:
+        return False, "Keep your face fully inside the frame — do not move up out of view"
+    if y_max > frame_h - margin_y:
+        return False, "Keep your face fully inside the frame — do not move down out of view"
+    return True, "ok"
 
 
 def build_pose_snapshot(pts_68: List[Dict], cal_baseline: Dict[str, Any]) -> Dict[str, Any]:

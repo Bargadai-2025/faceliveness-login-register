@@ -42,6 +42,7 @@ from frame_processor import process_frame, warmup_yolo
 from embedding_pipeline import (
     FACE_DETECT_MAX_SIDE,
     create_face_models,
+    extract_face_embedding,
     load_match_thresholds,
 )
 from post_selfie_security import load_post_selfie_config
@@ -164,6 +165,17 @@ def verify_identity_callback(img_bgr, target_embedding):
         return False
 
 
+def liveness_identity_embedder(img_bgr):
+    """FaceNet embedding for liveness session identity lock (calibration → gesture)."""
+    try:
+        out = extract_face_embedding(img_bgr, mtcnn, model, DEVICE)
+        if out.get("ok") and out.get("embedding") is not None:
+            return out["embedding"]
+    except Exception:
+        pass
+    return None
+
+
 @app.on_event("startup")
 async def _startup():
     from database import count_faces, get_database_dsn
@@ -185,13 +197,15 @@ async def _startup():
         face_rows = "unavailable"
     pad = load_post_selfie_config()
     from frame_processor import LIVENESS_FAST_SETUP
+    from liveness_checks import FRAME_INSET_FRAC, FRAME_INSET_MIN_PX, SESSION_IDENTITY_MIN_SIM
 
     print(
         f"🧬 Match config: device={DEVICE}, detect_max_side={FACE_DETECT_MAX_SIDE}, "
         f"FAST_MATCH={FAST_MATCH}, bargad>={MIN_CONFIDENCE_BARGAD}, lfw>={MIN_CONFIDENCE_LFW}, "
         f"top2_margin>={MATCH_MIN_TOP2_MARGIN}, yolo_conf={pad['yolo_conf']}, "
         f"hard_reject_spoof={pad['hard_reject_spoof']}, db_host={host_hint}, faces_512={face_rows}, "
-        f"torch={torch.__version__}, register_api=email-v2, liveness_fast_setup={LIVENESS_FAST_SETUP}"
+        f"torch={torch.__version__}, register_api=email-v2, liveness_fast_setup={LIVENESS_FAST_SETUP}, "
+        f"frame_inset={FRAME_INSET_FRAC}/{FRAME_INSET_MIN_PX}px, session_identity>={SESSION_IDENTITY_MIN_SIM}"
     )
     asyncio.create_task(asyncio.to_thread(warmup_yolo))
     try:
@@ -421,7 +435,7 @@ async def liveness_frame(
         raise HTTPException(status_code=400, detail=user_error("EMPTY_FRAME", retry_allowed=True))
 
     result = await run_inference_limited(
-        process_frame, sess, raw, verify_identity_callback
+        process_frame, sess, raw, verify_identity_callback, liveness_identity_embedder
     )
     if hasattr(session_manager, "touch"):
         session_manager.touch(sess)
@@ -457,6 +471,15 @@ async def complete_liveness_session(payload: Dict[str, Any] = Body(...)):
 
     if not sess.all_gestures_done:
         raise HTTPException(status_code=400, detail=user_error("SESSION_INCOMPLETE", retry_allowed=True))
+
+    if getattr(sess, "replay_device_detected", False):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Security Alert: Digital screen or phone replay detected during liveness. "
+                "Remove the phone or tablet and restart verification."
+            ),
+        )
 
     if not sess.depth_passed or not sess.light_passed or not sess.micro_passed:
         raise HTTPException(status_code=400, detail=user_error("SESSION_INCOMPLETE", retry_allowed=True))

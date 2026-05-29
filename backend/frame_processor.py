@@ -29,6 +29,10 @@ from liveness_checks import (
     evaluate_gesture,
     sustain_frames_for_gesture,
     build_pose_snapshot,
+    check_face_in_frame,
+    SESSION_IDENTITY_MIN_SIM,
+    _env_int,
+    _env_float,
     parallax_replay_risk,
     biological_motion_replay_risk,
     challenge_consistency_replay_risk,
@@ -50,13 +54,14 @@ from device_filter import (
     adjust_device_replay_score,
     filter_devices_for_attack,
     should_raise_liveness_device_alert,
+    is_phone_tablet_name,
 )
 
 # ── YOLO device detection ──
 _yolo_model = None
 _yolo_warmup_done = False
 YOLO_WEIGHTS = os.getenv("YOLO_WEIGHTS", "yolov8n.pt")
-LIVENESS_YOLO_CONF = float(os.getenv("LIVENESS_YOLO_CONF", "0.28"))
+LIVENESS_YOLO_CONF = _env_float("LIVENESS_YOLO_CONF", 0.22)
 DEVICE_NEAR_FACE_DR = float(os.getenv("LIVENESS_DEVICE_NEAR_DR", "0.12"))
 LIVENESS_FAST_SETUP = os.getenv("LIVENESS_FAST_SETUP", "0").strip().lower() in (
     "1",
@@ -68,8 +73,12 @@ DEPTH_FRAMES_REQUIRED = int(os.getenv("LIVENESS_DEPTH_FRAMES", "2"))
 LIGHT_PRE_FRAMES = int(os.getenv("LIVENESS_LIGHT_PRE_FRAMES", "2"))
 LIGHT_POST_FRAMES = int(os.getenv("LIVENESS_LIGHT_POST_FRAMES", "2"))
 MICRO_FRAMES_REQUIRED = int(os.getenv("LIVENESS_MICRO_FRAMES", "2"))
-NO_FACE_GRACE_FRAMES = int(os.getenv("LIVENESS_NO_FACE_GRACE_FRAMES", "3"))
-MULTI_FACE_GRACE_FRAMES = int(os.getenv("LIVENESS_MULTI_FACE_GRACE_FRAMES", "2"))
+NO_FACE_GRACE_FRAMES = _env_int("LIVENESS_NO_FACE_GRACE_FRAMES", 3)
+GESTURE_NO_FACE_GRACE_FRAMES = _env_int("LIVENESS_GESTURE_NO_FACE_GRACE_FRAMES", 1)
+MULTI_FACE_GRACE_FRAMES = _env_int("LIVENESS_MULTI_FACE_GRACE_FRAMES", 2)
+GESTURE_MULTI_FACE_GRACE_FRAMES = _env_int("LIVENESS_GESTURE_MULTI_FACE_GRACE_FRAMES", 1)
+FACE_OUT_OF_FRAME_GRACE_FRAMES = _env_int("LIVENESS_FACE_OUT_OF_FRAME_GRACE_FRAMES", 1)
+IDENTITY_MISMATCH_GRACE_FRAMES = _env_int("LIVENESS_IDENTITY_MISMATCH_GRACE_FRAMES", 1)
 
 DEVICE_CLASSES = {
     "cell phone": "Mobile Phone",
@@ -77,6 +86,116 @@ DEVICE_CLASSES = {
     "tv": "Television/Screen",
     "monitor": "Television/Screen",
 }
+
+
+def _reset_gesture_attempt(session: LivenessSession) -> None:
+    """Clear partial gesture progress when face leaves frame or tracking is lost."""
+    session.gesture_sustain_count = 0
+    session.gesture_turn_peak = 0.0
+    session.gesture_pitch_peak = 0.0
+    session.hold_start_time = None
+    session.shake_history = []
+    session.shake_completed = False
+    session.blink_count = 0
+    session.was_blink_closed = False
+
+
+def _reset_all_gesture_progress(session: LivenessSession) -> None:
+    """Restart all gesture challenges — used on face-swap or multi-person mid-session."""
+    session.current_gesture_idx = 0
+    session.gesture_results = []
+    session.reaction_times = []
+    _reset_gesture_attempt(session)
+    session.gesture_challenge_baseline = None
+    session.is_transitioning = True
+    session.gesture_instruction_time = time.time()
+    session.identity_mismatch_streak = 0
+    session.face_out_of_frame_streak = 0
+    try:
+        from challenge_frame_verification import clear_challenge_snapshots
+        clear_challenge_snapshots(session)
+    except Exception:
+        pass
+
+
+def _maybe_enroll_liveness_identity(session: LivenessSession, img, identity_embedder) -> None:
+    if identity_embedder is None or session.liveness_identity_embedding is not None:
+        return
+    try:
+        emb = identity_embedder(img)
+        if emb is not None:
+            session.liveness_identity_embedding = np.asarray(emb, dtype=np.float32)
+    except Exception:
+        pass
+
+
+def _verify_liveness_identity(session: LivenessSession, img, identity_embedder) -> Tuple[bool, str]:
+    if identity_embedder is None or session.liveness_identity_embedding is None:
+        return True, "ok"
+    try:
+        cur = identity_embedder(img)
+    except Exception:
+        return False, "Could not verify identity — hold still facing the camera"
+    if cur is None:
+        return False, "No face detected — center your face in the frame"
+    ref = np.asarray(session.liveness_identity_embedding, dtype=np.float32).reshape(-1)
+    cur_v = np.asarray(cur, dtype=np.float32).reshape(-1)
+    rn = float(np.linalg.norm(ref))
+    cn = float(np.linalg.norm(cur_v))
+    if rn <= 0 or cn <= 0:
+        return False, "Could not verify identity"
+    sim = float(np.dot(ref / rn, cur_v / cn))
+    if sim < SESSION_IDENTITY_MIN_SIM:
+        return (
+            False,
+            "Different person detected — only the original user may complete the challenges",
+        )
+    return True, "ok"
+
+
+def _identity_violation_response(
+    session: LivenessSession,
+    pts_68,
+    pts_478,
+    detail: str,
+    *,
+    multi_person: bool = False,
+) -> Dict[str, Any]:
+    _reset_all_gesture_progress(session)
+    return {
+        "status": "processing",
+        "error": True,
+        "step": session.step,
+        "gesture": session.current_gesture,
+        "gesture_idx": session.current_gesture_idx,
+        "detail": detail,
+        "progress": session.progress_pct,
+        "identity_mismatch": True,
+        "multi_person": multi_person,
+        "face_out_of_frame": not multi_person,
+        "landmarks": landmarks_to_serializable(pts_68) if pts_68 else None,
+        "mesh": landmarks_to_serializable(pts_478) if pts_478 else None,
+    }
+
+
+def _face_out_of_frame_response(
+    session: LivenessSession,
+    pts_68,
+    pts_478,
+    detail: str,
+) -> Dict[str, Any]:
+    _reset_gesture_attempt(session)
+    return {
+        "status": "processing",
+        "step": session.step,
+        "gesture": session.current_gesture,
+        "gesture_idx": session.current_gesture_idx,
+        "detail": detail,
+        "progress": session.progress_pct,
+        "face_out_of_frame": True,
+        "landmarks": landmarks_to_serializable(pts_68) if pts_68 else None,
+        "mesh": landmarks_to_serializable(pts_478) if pts_478 else None,
+    }
 
 
 def _begin_gesture_phase(session: LivenessSession, pts_68, pts_478) -> Dict[str, Any]:
@@ -245,7 +364,12 @@ def _device_alert_response(
     })
 
 
-def process_frame(session: LivenessSession, frame_bytes: bytes, identity_callback=None) -> Dict[str, Any]:
+def process_frame(
+    session: LivenessSession,
+    frame_bytes: bytes,
+    identity_callback=None,
+    identity_embedder=None,
+) -> Dict[str, Any]:
     """
     Process a single frame through the liveness pipeline.
     Returns status dict for the frontend.
@@ -277,7 +401,25 @@ def process_frame(session: LivenessSession, frame_bytes: bytes, identity_callbac
     if len(faces) == 0:
         session.no_face_streak += 1
         session.multi_face_streak = 0
-        if session.no_face_streak >= NO_FACE_GRACE_FRAMES:
+        grace = (
+            GESTURE_NO_FACE_GRACE_FRAMES
+            if session.step == "gesture"
+            else NO_FACE_GRACE_FRAMES
+        )
+        if session.step == "gesture" and session.no_face_streak >= grace:
+            session.face_out_of_frame_streak += 1
+            _reset_gesture_attempt(session)
+            return {
+                "status": "processing",
+                "step": session.step,
+                "gesture": session.current_gesture,
+                "gesture_idx": session.current_gesture_idx,
+                "detail": "Keep your face fully inside the frame",
+                "progress": session.progress_pct,
+                "face_out_of_frame": True,
+                "mesh": None,
+            }
+        if session.no_face_streak >= grace:
             return {
                 "status": "processing",
                 "step": session.step,
@@ -296,12 +438,24 @@ def process_frame(session: LivenessSession, frame_bytes: bytes, identity_callbac
     if len(faces) > 1:
         session.multi_face_streak += 1
         session.no_face_streak = 0
-        if session.multi_face_streak >= MULTI_FACE_GRACE_FRAMES:
+        grace = (
+            GESTURE_MULTI_FACE_GRACE_FRAMES
+            if session.step == "gesture"
+            else MULTI_FACE_GRACE_FRAMES
+        )
+        if session.step == "gesture":
+            _reset_gesture_attempt(session)
+        if session.multi_face_streak >= grace:
+            detail = "Multiple people detected — only one person may complete the challenges"
+            if session.step == "gesture":
+                return _identity_violation_response(
+                    session, None, None, detail, multi_person=True
+                )
             return {
                 "status": "processing",
                 "error": True,
                 "multi_person": True,
-                "detail": "Multiple people detected — please ensure only one person is in view",
+                "detail": detail,
                 "step": session.step,
                 "progress": session.progress_pct,
                 "mesh": None,
@@ -324,6 +478,47 @@ def process_frame(session: LivenessSession, frame_bytes: bytes, identity_callbac
     pts_68 = face["pts_68"]
     pts_478 = face["pts_478"]
     face_width = face["face_width"]
+
+    if session.step == "gesture":
+        in_frame, frame_msg = check_face_in_frame(pts_68, w, h)
+        if not in_frame:
+            session.face_out_of_frame_streak += 1
+            session.no_face_streak = 0
+            _reset_gesture_attempt(session)
+            if session.face_out_of_frame_streak >= FACE_OUT_OF_FRAME_GRACE_FRAMES:
+                return _face_out_of_frame_response(session, pts_68, pts_478, frame_msg)
+            return {
+                "status": "processing",
+                "step": session.step,
+                "gesture": session.current_gesture,
+                "gesture_idx": session.current_gesture_idx,
+                "detail": frame_msg,
+                "progress": session.progress_pct,
+                "face_out_of_frame": True,
+                "landmarks": landmarks_to_serializable(pts_68),
+                "mesh": landmarks_to_serializable(pts_478),
+            }
+        session.face_out_of_frame_streak = 0
+
+        ok_id, id_msg = _verify_liveness_identity(session, img, identity_embedder)
+        if not ok_id:
+            session.identity_mismatch_streak += 1
+            _reset_gesture_attempt(session)
+            if session.identity_mismatch_streak >= IDENTITY_MISMATCH_GRACE_FRAMES:
+                return _identity_violation_response(session, pts_68, pts_478, id_msg)
+            return {
+                "status": "processing",
+                "step": session.step,
+                "gesture": session.current_gesture,
+                "gesture_idx": session.current_gesture_idx,
+                "detail": id_msg,
+                "progress": session.progress_pct,
+                "identity_mismatch": True,
+                "face_out_of_frame": True,
+                "landmarks": landmarks_to_serializable(pts_68),
+                "mesh": landmarks_to_serializable(pts_478),
+            }
+        session.identity_mismatch_streak = 0
 
     session.landmark_history.append(pts_68)
     if len(session.landmark_history) > 30:
@@ -384,7 +579,27 @@ def process_frame(session: LivenessSession, frame_bytes: bytes, identity_callbac
                 near_face_threshold=DEVICE_NEAR_FACE_DR,
             )
             if raise_alert and alert_devices:
+                phone_tablet = [d for d in alert_devices if is_phone_tablet_name(d)]
+                if phone_tablet:
+                    session.replay_device_detected = True
+                    session.device_detected = True
+                    session.device_class = phone_tablet[0]
+                    if session.step == "gesture":
+                        _reset_all_gesture_progress(session)
+                    names = ", ".join(phone_tablet)
+                    return _device_alert_response(
+                        session,
+                        pts_68,
+                        pts_478,
+                        f"Security Alert: Phone or tablet detected ({names}) — "
+                        "remove the screen and show your live face directly to the camera",
+                        phone_tablet,
+                        dr,
+                        hard_overlap=device_hard,
+                    )
                 names = ", ".join(alert_devices)
+                session.device_detected = True
+                session.device_class = alert_devices[0]
                 return _device_alert_response(
                     session,
                     pts_68,
@@ -392,6 +607,7 @@ def process_frame(session: LivenessSession, frame_bytes: bytes, identity_callbac
                     f"Electronic device detected ({names}) — move away from camera",
                     alert_devices,
                     dr,
+                    hard_overlap=device_hard,
                 )
             devices_found = filter_devices_for_attack(devices_found, hard_overlap=device_hard)
 
@@ -572,6 +788,7 @@ def process_frame(session: LivenessSession, frame_bytes: bytes, identity_callbac
                 "left_brow_y": (last_pts[19]["y"] + last_pts[21]["y"]) / 2,
                 "right_brow_y": (last_pts[24]["y"] + last_pts[26]["y"]) / 2,
             }
+            _maybe_enroll_liveness_identity(session, img, identity_embedder)
             if LIVENESS_FAST_SETUP:
                 return _begin_gesture_phase(session, pts_68, pts_478)
             session.step = "depth"
@@ -721,7 +938,7 @@ def process_frame(session: LivenessSession, frame_bytes: bytes, identity_callbac
 
     if session.step == "gesture":
         if session.all_gestures_done:
-            session.step = "complete"
+            session.step = "complete" 
             return {
                 "status": "processing",
                 "step": "complete",

@@ -81,11 +81,17 @@ class LivenessSession:
     # Device detection
     device_detected: bool = False
     device_class: Optional[str] = None
+    replay_device_detected: bool = False
 
     # Black screen
     black_screen_count: int = 0
     no_face_streak: int = 0
     multi_face_streak: int = 0
+    face_out_of_frame_streak: int = 0
+    identity_mismatch_streak: int = 0
+
+    # FaceNet embedding of user at calibration — blocks face-swap mid-session
+    liveness_identity_embedding: Optional[Any] = None
 
     # Shake head tracking
     shake_history: List[float] = field(default_factory=list)
@@ -186,6 +192,7 @@ class LivenessSession:
         self.gesture_challenge_baseline = None
         self.gesture_turn_peak = 0.0
         self.gesture_pitch_peak = 0.0
+        self.face_out_of_frame_streak = 0
         self.gesture_instruction_time = time.time()
         self.is_transitioning = True  # Mark as transitioning
         if self.all_gestures_done:
